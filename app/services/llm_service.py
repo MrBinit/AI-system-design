@@ -4,7 +4,7 @@ from redis.exceptions import RedisError
 
 from app.infra.redis_client import redis_client
 from app.infra.azure_openai_client import client
-from app.core.config import get_settings
+from app.core.config import get_prompts, get_settings
 from app.services.guardrails_service import (
     apply_context_guardrails,
     guard_model_output,
@@ -14,6 +14,7 @@ from app.services.guardrails_service import (
 from app.services.memory_service import build_context, update_memory
 
 settings = get_settings()
+prompts = get_prompts()
 logger = logging.getLogger(__name__)
 
 SEMAPHORE = asyncio.Semaphore(settings.azure_openai.max_concurrency)
@@ -58,6 +59,10 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
 
     # Build hybrid memory context
     messages = await build_context(user_id, safe_user_prompt)
+    chat_system_prompt = prompts.get("chat", {}).get("system_prompt", "")
+    if isinstance(chat_system_prompt, str) and chat_system_prompt.strip():
+        messages = [{"role": "system", "content": chat_system_prompt.strip()}] + messages
+
     context_guard = apply_context_guardrails(messages)
     if context_guard["blocked"]:
         logger.info(

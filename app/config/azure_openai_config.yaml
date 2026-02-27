@@ -1,0 +1,7 @@
+azure_openai:
+  endpoint: "https://bsap-ml6s56gx-eastus2.cognitiveservices.azure.com/"
+  api_version: "2024-12-01-preview"
+  primary_deployment: "gpt-5.2-chat"
+  fallback_deployment: "gpt-4o-mini"
+  timeout: 30
+  max_concurrency: 50

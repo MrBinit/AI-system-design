@@ -1,9 +1,0 @@
-chat:
-  system_prompt: |
-    You are a helpful AI assistant.
-
-memory:
-  summary_system_prompt: |
-    Summarize the following conversation.
-    Preserve key facts, user goals, decisions, and important technical details.
-    Be concise but complete.

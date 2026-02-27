@@ -1,0 +1,7 @@
+security:
+  auth_enabled: true
+  jwt_secret: "change-this-in-prod-very-secret-key"
+  jwt_algorithm: "HS256"
+  jwt_issuer: "ai-system"
+  jwt_exp_minutes: 60
+  admin_roles: ["admin"]

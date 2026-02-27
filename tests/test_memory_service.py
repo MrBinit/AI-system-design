@@ -141,7 +141,8 @@ async def test_build_context_enqueues_summary_job(monkeypatch):
 
     await memory_service.build_context("user-1", "new prompt")
 
-    saved = json.loads(fake_redis.store[_memory_key("user-1")])
+    saved, ok = memory_service._deserialize_memory_payload(fake_redis.store[_memory_key("user-1")])
+    assert ok is True
     assert saved["summary_pending"] is True
     assert saved["last_summary_job_id"] == "job-123"
     assert saved["version"] == 4
@@ -206,7 +207,11 @@ async def test_update_memory_appends_messages_with_seq(monkeypatch):
     _seed_memory(fake_redis, "user-1", existing)
 
     await memory_service.update_memory("user-1", "hello", "hi there")
-    saved = json.loads(fake_redis.store[_memory_key("user-1")])
+    saved_raw = fake_redis.store[_memory_key("user-1")]
+    assert isinstance(saved_raw, str)
+    assert saved_raw.startswith("enc:v1:")
+    saved, ok = memory_service._deserialize_memory_payload(saved_raw)
+    assert ok is True
 
     assert saved["messages"] == [
         {"seq": 10, "role": "user", "content": "hello"},

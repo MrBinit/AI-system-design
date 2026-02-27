@@ -8,7 +8,10 @@ def test_guard_user_input_blocks_harmful_pattern():
 
 
 def test_guard_user_input_redacts_pii():
-    result = guardrails_service.guard_user_input("user-1", "my email is test@example.com")
+    result = guardrails_service.guard_user_input(
+        "user-1",
+        "Find university courses and contact test@example.com",
+    )
     assert result["blocked"] is False
     assert "[REDACTED_EMAIL]" in result["sanitized_text"]
 
@@ -40,3 +43,17 @@ def test_sanitize_summary_output_filters_injection():
     sanitized = guardrails_service.sanitize_summary_output(text)
     assert "[FILTERED_INJECTION_PATTERN]" in sanitized
     assert "[REDACTED_EMAIL]" in sanitized
+
+
+def test_guard_user_input_blocks_general_out_of_scope_query():
+    result = guardrails_service.guard_user_input("user-1", "What is the weather today?")
+    assert result["blocked"] is True
+    assert result["reason"] == "out_of_scope"
+
+
+def test_guard_user_input_allows_university_scope_query():
+    result = guardrails_service.guard_user_input(
+        "user-1",
+        "Find professors in AI research lab at Stanford University",
+    )
+    assert result["blocked"] is False

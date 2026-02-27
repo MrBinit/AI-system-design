@@ -5,6 +5,7 @@ from copy import deepcopy
 from redis.exceptions import RedisError, WatchError
 
 from app.core.config import get_settings, get_prompts
+from app.core.memory_crypto import decrypt_memory_payload, encrypt_memory_payload
 from app.core.token_utils import count_tokens
 from app.infra.azure_openai_client import client
 from app.infra.redis_client import redis_client
@@ -91,6 +92,17 @@ def _strip_seq(messages: list[dict]) -> list[dict]:
     return [{"role": m["role"], "content": m["content"]} for m in messages]
 
 
+def _serialize_memory_payload(memory: dict) -> str:
+    return encrypt_memory_payload(_normalize_memory(memory))
+
+
+def _deserialize_memory_payload(raw: str) -> tuple[dict, bool]:
+    parsed = decrypt_memory_payload(raw)
+    if not isinstance(parsed, dict):
+        return _empty_memory(), False
+    return _normalize_memory(parsed), True
+
+
 async def load_memory(user_id: str) -> dict:
     try:
         raw = redis_client.get(_redis_key(user_id))
@@ -101,13 +113,10 @@ async def load_memory(user_id: str) -> dict:
     if not raw:
         return _empty_memory()
 
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("Corrupted memory payload for user_id=%s; resetting memory.", user_id)
-        return _empty_memory()
-
-    return _normalize_memory(parsed)
+    parsed, ok = _deserialize_memory_payload(raw)
+    if not ok:
+        logger.warning("Corrupted encrypted memory payload for user_id=%s; resetting memory.", user_id)
+    return parsed
 
 
 def save_memory(user_id: str, memory: dict):
@@ -116,7 +125,7 @@ def save_memory(user_id: str, memory: dict):
         redis_client.setex(
             _redis_key(user_id),
             settings.memory.redis_ttl_seconds,
-            json.dumps(normalized),
+            _serialize_memory_payload(normalized),
         )
     except RedisError as exc:
         logger.warning("Redis memory write failed; skipping persistence. %s", exc)
@@ -131,7 +140,12 @@ def save_memory_if_version(user_id: str, expected_version: int, memory: dict) ->
             with redis_client.pipeline() as pipe:
                 pipe.watch(key)
                 current_raw = pipe.get(key)
-                current_memory = _normalize_memory(json.loads(current_raw)) if current_raw else _empty_memory()
+                if current_raw:
+                    current_memory, ok = _deserialize_memory_payload(current_raw)
+                    if not ok:
+                        current_memory = _empty_memory()
+                else:
+                    current_memory = _empty_memory()
 
                 if current_memory["version"] != expected_version:
                     pipe.unwatch()
@@ -141,13 +155,13 @@ def save_memory_if_version(user_id: str, expected_version: int, memory: dict) ->
                 pipe.setex(
                     key,
                     settings.memory.redis_ttl_seconds,
-                    json.dumps(normalized_target),
+                    _serialize_memory_payload(normalized_target),
                 )
                 pipe.execute()
                 return True, normalized_target
         except WatchError:
             continue
-        except (RedisError, json.JSONDecodeError) as exc:
+        except RedisError as exc:
             logger.warning("Versioned memory save failed for user=%s. %s", user_id, exc)
             return False, _empty_memory()
 

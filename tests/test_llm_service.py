@@ -1,5 +1,4 @@
 import pytest
-
 from app.services import llm_service
 
 
@@ -32,7 +31,7 @@ class FakeResponse:
 @pytest.mark.asyncio
 async def test_generate_response_returns_cache_hit(monkeypatch):
     fake_redis = FakeRedis()
-    fake_redis.store["chat:user-1:hello"] = "from-cache"
+    fake_redis.store["chat:user-1:find ai professor"] = "from-cache"
     monkeypatch.setattr(llm_service, "redis_client", fake_redis)
 
     async def should_not_run(*_args, **_kwargs):
@@ -40,7 +39,7 @@ async def test_generate_response_returns_cache_hit(monkeypatch):
 
     monkeypatch.setattr(llm_service, "build_context", should_not_run)
 
-    result = await llm_service.generate_response("user-1", "hello")
+    result = await llm_service.generate_response("user-1", "find ai professor")
     assert result == "from-cache"
 
 
@@ -51,7 +50,7 @@ async def test_generate_response_uses_primary_and_updates_memory(monkeypatch):
 
     async def fake_build_context(user_id, user_prompt):
         assert user_id == "user-1"
-        assert user_prompt == "hello"
+        assert user_prompt == "find ai professor"
         return [{"role": "user", "content": user_prompt}]
 
     async def fake_primary(_messages):
@@ -70,10 +69,10 @@ async def test_generate_response_uses_primary_and_updates_memory(monkeypatch):
     monkeypatch.setattr(llm_service, "_call_fallback", fake_fallback)
     monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
 
-    result = await llm_service.generate_response("user-1", "hello")
+    result = await llm_service.generate_response("user-1", "find ai professor")
     assert result == "primary-response"
-    assert memory_updates == [("user-1", "hello", "primary-response")]
-    assert fake_redis.store["chat:user-1:hello"] == "primary-response"
+    assert memory_updates == [("user-1", "find ai professor", "primary-response")]
+    assert fake_redis.store["chat:user-1:find ai professor"] == "primary-response"
 
 
 @pytest.mark.asyncio
@@ -98,7 +97,7 @@ async def test_generate_response_uses_fallback_when_primary_fails(monkeypatch):
     monkeypatch.setattr(llm_service, "_call_fallback", fake_fallback)
     monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
 
-    result = await llm_service.generate_response("user-1", "hello")
+    result = await llm_service.generate_response("user-1", "find university course")
     assert result == "fallback-response"
 
 
@@ -121,7 +120,7 @@ async def test_generate_response_raises_when_both_models_fail(monkeypatch):
     monkeypatch.setattr(llm_service, "_call_fallback", fake_fallback)
 
     with pytest.raises(RuntimeError, match="fallback down"):
-        await llm_service.generate_response("user-1", "hello")
+        await llm_service.generate_response("user-1", "find university course")
 
 
 @pytest.mark.asyncio
@@ -140,3 +139,31 @@ async def test_generate_response_blocks_on_input_guardrail(monkeypatch):
 
     result = await llm_service.generate_response("user-1", "bad prompt")
     assert result == llm_service.refusal_response()
+
+
+@pytest.mark.asyncio
+async def test_generate_response_injects_chat_system_prompt(monkeypatch):
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(llm_service, "redis_client", fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    def fake_apply_context_guardrails(messages):
+        assert messages[0]["role"] == "system"
+        assert "UniGraph" in messages[0]["content"]
+        return {"blocked": False, "messages": messages, "reason": ""}
+
+    async def fake_primary(_messages):
+        return FakeResponse("primary-response")
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "apply_context_guardrails", fake_apply_context_guardrails)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+
+    result = await llm_service.generate_response("user-1", "find university course")
+    assert result == "primary-response"

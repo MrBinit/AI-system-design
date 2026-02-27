@@ -28,6 +28,14 @@ def _matches_any_pattern(text: str, patterns: list[str]) -> bool:
     return False
 
 
+def _is_in_domain(text: str) -> bool:
+    if not settings.guardrails.enforce_domain_scope:
+        return True
+    if not settings.guardrails.domain_allow_patterns:
+        return True
+    return _matches_any_pattern(text, settings.guardrails.domain_allow_patterns)
+
+
 def redact_sensitive_content(text: str) -> str:
     if not isinstance(text, str):
         return ""
@@ -54,6 +62,10 @@ def guard_user_input(user_id: str, prompt: str) -> dict:
         logger.info("GuardrailBlockInput | user=%s | reason=blocked_input_pattern", user_id)
         return {"blocked": True, "sanitized_text": "", "reason": "blocked_input_pattern"}
 
+    if not _is_in_domain(prompt):
+        logger.info("GuardrailBlockInput | user=%s | reason=out_of_scope", user_id)
+        return {"blocked": True, "sanitized_text": "", "reason": "out_of_scope"}
+
     sanitized = redact_sensitive_content(prompt)
     return {"blocked": False, "sanitized_text": sanitized, "reason": ""}
 
@@ -78,6 +90,8 @@ def apply_context_guardrails(messages: list[dict]) -> dict:
         if role != "system" and _matches_any_pattern(content, settings.guardrails.injection_patterns):
             injection_detected = True
             content = "[Potential prompt-injection content removed.]"
+        elif role == "user" and not _is_in_domain(content):
+            content = "[Out-of-scope content removed.]"
 
         cleaned.append({"role": role, "content": content})
 
