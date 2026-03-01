@@ -1,10 +1,9 @@
 import yaml
-from pathlib import Path
 from functools import lru_cache
+from pathlib import Path
+
+from app.core.paths import APP_CONFIG_DIR
 from app.schemas.settings_schema import Settings
-
-
-APP_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 
 
 def _load_yaml_file(file_path: Path) -> dict:

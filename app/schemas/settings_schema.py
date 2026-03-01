@@ -2,6 +2,7 @@ from pydantic import BaseModel
 
 from app.schemas.app_config_schema import AppConfig
 from app.schemas.azure_openai_config_schema import AzureOpenAIConfig
+from app.schemas.chunking_config_schema import ChunkingConfig
 from app.schemas.circuit_config_schema import CircuitConfig
 from app.schemas.guardrails_config_schema import GuardrailsConfig
 from app.schemas.memory_config_schema import MemoryConfig, UserTokenBudgetConfig
@@ -15,6 +16,7 @@ class Settings(BaseModel):
     app: AppConfig
     redis: RedisConfig
     postgres: PostgresConfig
+    chunking: ChunkingConfig
     azure_openai: AzureOpenAIConfig
     circuit: CircuitConfig
     memory: MemoryConfig
@@ -26,6 +28,7 @@ class Settings(BaseModel):
 __all__ = [
     "AppConfig",
     "AzureOpenAIConfig",
+    "ChunkingConfig",
     "CircuitConfig",
     "GuardrailsConfig",
     "MemoryConfig",

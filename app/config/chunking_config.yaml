@@ -1,0 +1,14 @@
+chunking:
+  enabled: true
+  source_dir: "data/raw"
+  output_dir: "data/chunks"
+  glob_pattern: "*.md"
+  chunk_size_chars: 900
+  chunk_overlap_chars: 120
+  min_chunk_chars: 80
+  separators:
+    - "\n\n"
+    - "\n"
+    - ". "
+    - " "
+    - ""
