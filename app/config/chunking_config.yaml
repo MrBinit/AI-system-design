@@ -5,10 +5,11 @@ chunking:
   glob_pattern: "*.md"
   chunk_size_chars: 900
   chunk_overlap_chars: 120
-  min_chunk_chars: 80
+  min_chunk_chars: 300
+  merge_forward_below_chars: 250
+
   separators:
     - "\n\n"
     - "\n"
     - ". "
     - " "
-    - ""
