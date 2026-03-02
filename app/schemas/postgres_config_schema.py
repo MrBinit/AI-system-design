@@ -14,5 +14,6 @@ class PostgresConfig(BaseModel):
     app_name: str = "unigraph"
     schema_name: str = "unigraph"
     memory_table: str = "long_term_memory"
+    chunk_table: str = "document_chunks"
     embedding_dimensions: int = Field(default=1536, ge=1, le=16384)
     default_top_k: int = Field(default=8, ge=1, le=100)
