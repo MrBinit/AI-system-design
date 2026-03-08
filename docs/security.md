@@ -8,9 +8,10 @@ UniGraph currently applies multiple security layers:
 - user-level authorization with admin override
 - domain-scoped guardrails
 - prompt injection filtering
-- rate limiting
-- timeouts and backpressure
+- distributed rate limiting (Redis-backed with local fallback)
+- distributed backpressure admission control (Redis-backed with local fallback)
 - short-term memory encryption at rest in Redis
+- Redis TLS for in-transit encryption
 - Redis client and namespace separation for app and worker
 
 ## Authentication
@@ -34,13 +35,13 @@ Config:
 
 Secret source:
 
-- prefers `JWT_SECRET` environment variable
+- prefers `SECURITY_JWT_SECRET` (then `JWT_SECRET`) from environment
 - falls back to `app/config/security_config.yaml`
 
 Operational note:
 
-- the config fallback is acceptable for development
-- in production, use an environment secret or a secret manager
+- production startup validates secret strength and rejects placeholder/default values
+- in production, use environment secrets or a secret manager
 
 ## Authorization
 
@@ -89,9 +90,15 @@ Guardrail goal:
 
 Request-level protections:
 
-- rate limiting
+- Redis-backed distributed rate limiting
 - timeout enforcement
-- backpressure
+- Redis-backed distributed backpressure
+- trusted-proxy CIDR enforcement before accepting `X-Forwarded-For`
+
+Fallback model:
+
+- if Redis is unavailable, middleware falls back to local in-memory controls
+- this avoids total traffic outage while preserving some protection
 
 Rate limiting key:
 
@@ -102,6 +109,11 @@ This hybrid key reduces abuse by:
 - limiting anonymous IP bursts
 - limiting authenticated user bursts
 - avoiding cross-route interference
+
+Proxy trust note:
+
+- `X-Forwarded-For` is used only when the immediate peer IP belongs to `MIDDLEWARE_TRUSTED_PROXY_CIDRS`
+- this prevents direct client spoofing of source IP headers
 
 ## Data Protection
 
@@ -117,13 +129,23 @@ Current implementation:
 
 Key source:
 
-- prefers `MEMORY_ENCRYPTION_KEY`
-- falls back to `jwt_secret`
+- requires `MEMORY_ENCRYPTION_KEY` in environment
+- startup rejects missing, weak, or reused key material
+- key must be different from JWT signing secret
 
 Important note:
 
 - this protects Redis contents from casual inspection
 - for stronger production-grade cryptography, replace this with a standard AEAD library such as AES-GCM or ChaCha20-Poly1305 when dependency installation is available
+
+### Evaluation Trace Encryption
+
+Evaluation traces (including prompt/answer content) are encrypted before storage in Redis using the same `enc:v1:` envelope.
+
+Compatibility:
+
+- legacy plaintext traces remain readable for backward compatibility
+- all new trace writes are encrypted by default
 
 ### Redis Isolation
 
@@ -136,16 +158,22 @@ Each role has its own:
 
 - host/port/db credentials
 - username and password fields
+- TLS settings (`tls`, `ssl_cert_reqs`, `ssl_ca_certs`)
 - namespace prefix
 
 This reduces blast radius if one runtime is compromised.
 
+## Runtime Hardening
+
+- API docs/OpenAPI exposure is configurable via `APP_DOCS_ENABLED`
+- production health checks use `/healthz` instead of docs endpoints
+- `.env` should be owner-readable only (`chmod 600 .env`)
+
 ## Security Gaps To Track
 
-The system is in a good intermediate state, but these are still future hardening items:
+Remaining hardening items:
 
 - move secrets out of YAML in all production deployments
 - replace custom memory crypto with standard AEAD
-- add transport security and TLS for Redis if deployed remotely
 - add external audit logging and security event aggregation
 - add stricter Redis ACL command restrictions per role

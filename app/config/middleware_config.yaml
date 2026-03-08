@@ -3,6 +3,12 @@ middleware:
   max_in_flight_requests: 200
   rate_limit_requests: 120
   rate_limit_window_seconds: 60
+  enable_distributed_rate_limit: true
+  distributed_rate_limit_prefix: "ratelimit"
+  trusted_proxy_cidrs: []
+  enable_distributed_backpressure: true
+  distributed_backpressure_key: "backpressure:inflight"
+  distributed_backpressure_lease_seconds: 45
   enable_request_logging: true
   enable_rate_limit: true
   enable_timeout: true

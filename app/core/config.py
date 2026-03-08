@@ -1,9 +1,13 @@
+import os
 import yaml
 from functools import lru_cache
 from pathlib import Path
+from dotenv import load_dotenv
 
 from app.core.paths import APP_CONFIG_DIR
 from app.schemas.settings_schema import Settings
+
+load_dotenv()
 
 
 def _load_yaml_file(file_path: Path) -> dict:
@@ -13,6 +17,113 @@ def _load_yaml_file(file_path: Path) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"YAML file must contain a mapping at top-level: {file_path}")
     return data
+
+
+def _apply_env_overrides(data: dict) -> dict:
+    """Apply environment overrides on top of YAML configuration for deployments."""
+    config = data
+
+    def _set(path: list[str], env_name: str, cast=str):
+        raw = os.getenv(env_name)
+        if raw is None or raw == "":
+            return
+
+        value = raw
+        if cast is bool:
+            value = raw.strip().lower() in {"1", "true", "yes", "on"}
+        elif cast is int:
+            value = int(raw)
+        else:
+            value = cast(raw)
+
+        node = config
+        for key in path[:-1]:
+            if key not in node or not isinstance(node[key], dict):
+                node[key] = {}
+            node = node[key]
+        node[path[-1]] = value
+
+    _set(["app", "log_level"], "APP_LOG_LEVEL")
+    _set(["app", "docs_enabled"], "APP_DOCS_ENABLED", bool)
+
+    _set(["security", "auth_enabled"], "SECURITY_AUTH_ENABLED", bool)
+    _set(["security", "jwt_secret"], "SECURITY_JWT_SECRET")
+    _set(["security", "jwt_issuer"], "SECURITY_JWT_ISSUER")
+    _set(["security", "jwt_exp_minutes"], "SECURITY_JWT_EXP_MINUTES", int)
+
+    _set(["azure_openai", "endpoint"], "AZURE_OPENAI_ENDPOINT")
+    _set(["azure_openai", "api_version"], "AZURE_OPENAI_API_VERSION")
+    _set(["azure_openai", "primary_deployment"], "AZURE_OPENAI_PRIMARY_DEPLOYMENT")
+    _set(["azure_openai", "fallback_deployment"], "AZURE_OPENAI_FALLBACK_DEPLOYMENT")
+    _set(["azure_openai", "timeout"], "AZURE_OPENAI_TIMEOUT", int)
+    _set(["azure_openai", "max_concurrency"], "AZURE_OPENAI_MAX_CONCURRENCY", int)
+
+    _set(["redis", "app", "host"], "REDIS_APP_HOST")
+    _set(["redis", "app", "port"], "REDIS_APP_PORT", int)
+    _set(["redis", "app", "db"], "REDIS_APP_DB", int)
+    _set(["redis", "app", "username"], "REDIS_APP_USERNAME")
+    _set(["redis", "app", "password"], "REDIS_APP_PASSWORD")
+    _set(["redis", "app", "tls"], "REDIS_APP_TLS", bool)
+    _set(["redis", "app", "ssl_cert_reqs"], "REDIS_APP_SSL_CERT_REQS")
+    _set(["redis", "app", "ssl_ca_certs"], "REDIS_APP_SSL_CA_CERTS")
+    _set(["redis", "app", "namespace"], "REDIS_APP_NAMESPACE")
+
+    _set(["redis", "worker", "host"], "REDIS_WORKER_HOST")
+    _set(["redis", "worker", "port"], "REDIS_WORKER_PORT", int)
+    _set(["redis", "worker", "db"], "REDIS_WORKER_DB", int)
+    _set(["redis", "worker", "username"], "REDIS_WORKER_USERNAME")
+    _set(["redis", "worker", "password"], "REDIS_WORKER_PASSWORD")
+    _set(["redis", "worker", "tls"], "REDIS_WORKER_TLS", bool)
+    _set(["redis", "worker", "ssl_cert_reqs"], "REDIS_WORKER_SSL_CERT_REQS")
+    _set(["redis", "worker", "ssl_ca_certs"], "REDIS_WORKER_SSL_CA_CERTS")
+    _set(["redis", "worker", "namespace"], "REDIS_WORKER_NAMESPACE")
+
+    _set(["postgres", "enabled"], "POSTGRES_ENABLED", bool)
+    _set(["postgres", "host"], "POSTGRES_HOST")
+    _set(["postgres", "port"], "POSTGRES_PORT", int)
+    _set(["postgres", "database"], "POSTGRES_DATABASE")
+    _set(["postgres", "username"], "POSTGRES_USERNAME")
+    _set(["postgres", "ssl_mode"], "POSTGRES_SSL_MODE")
+    _set(["postgres", "min_pool_size"], "POSTGRES_MIN_POOL_SIZE", int)
+    _set(["postgres", "max_pool_size"], "POSTGRES_MAX_POOL_SIZE", int)
+    _set(["postgres", "connect_timeout_seconds"], "POSTGRES_CONNECT_TIMEOUT_SECONDS", int)
+    _set(["postgres", "app_name"], "POSTGRES_APP_NAME")
+    _set(["postgres", "schema_name"], "POSTGRES_SCHEMA_NAME")
+    _set(["postgres", "memory_table"], "POSTGRES_MEMORY_TABLE")
+    _set(["postgres", "chunk_table"], "POSTGRES_CHUNK_TABLE")
+    _set(["postgres", "evaluation_table"], "POSTGRES_EVALUATION_TABLE")
+    _set(["postgres", "default_top_k"], "POSTGRES_DEFAULT_TOP_K", int)
+    _set(["postgres", "vector_index_type"], "POSTGRES_VECTOR_INDEX_TYPE")
+    _set(["postgres", "embedding_dimensions"], "POSTGRES_EMBEDDING_DIMENSIONS", int)
+
+    _set(["memory", "summary_queue_claim_idle_ms"], "MEMORY_SUMMARY_QUEUE_CLAIM_IDLE_MS", int)
+    _set(["memory", "summary_queue_claim_batch_size"], "MEMORY_SUMMARY_QUEUE_CLAIM_BATCH_SIZE", int)
+
+    _set(["middleware", "timeout_seconds"], "MIDDLEWARE_TIMEOUT_SECONDS", int)
+    _set(["middleware", "max_in_flight_requests"], "MIDDLEWARE_MAX_IN_FLIGHT_REQUESTS", int)
+    _set(["middleware", "rate_limit_requests"], "MIDDLEWARE_RATE_LIMIT_REQUESTS", int)
+    _set(["middleware", "rate_limit_window_seconds"], "MIDDLEWARE_RATE_LIMIT_WINDOW_SECONDS", int)
+    _set(["middleware", "enable_distributed_rate_limit"], "MIDDLEWARE_ENABLE_DISTRIBUTED_RATE_LIMIT", bool)
+    _set(["middleware", "distributed_rate_limit_prefix"], "MIDDLEWARE_DISTRIBUTED_RATE_LIMIT_PREFIX")
+    _set(
+        ["middleware", "trusted_proxy_cidrs"],
+        "MIDDLEWARE_TRUSTED_PROXY_CIDRS",
+        lambda raw: [entry.strip() for entry in raw.split(",") if entry.strip()],
+    )
+    _set(["middleware", "enable_distributed_backpressure"], "MIDDLEWARE_ENABLE_DISTRIBUTED_BACKPRESSURE", bool)
+    _set(["middleware", "distributed_backpressure_key"], "MIDDLEWARE_DISTRIBUTED_BACKPRESSURE_KEY")
+    _set(
+        ["middleware", "distributed_backpressure_lease_seconds"],
+        "MIDDLEWARE_DISTRIBUTED_BACKPRESSURE_LEASE_SECONDS",
+        int,
+    )
+    _set(["middleware", "enable_request_logging"], "MIDDLEWARE_ENABLE_REQUEST_LOGGING", bool)
+    _set(["middleware", "enable_rate_limit"], "MIDDLEWARE_ENABLE_RATE_LIMIT", bool)
+    _set(["middleware", "enable_timeout"], "MIDDLEWARE_ENABLE_TIMEOUT", bool)
+    _set(["middleware", "enable_backpressure"], "MIDDLEWARE_ENABLE_BACKPRESSURE", bool)
+    _set(["middleware", "enable_route_matching"], "MIDDLEWARE_ENABLE_ROUTE_MATCHING", bool)
+
+    return config
 
 
 @lru_cache()
@@ -26,6 +137,7 @@ def get_settings() -> Settings:
     for config_file in config_files:
         data.update(_load_yaml_file(config_file))
 
+    data = _apply_env_overrides(data)
     return Settings(**data)
 
 

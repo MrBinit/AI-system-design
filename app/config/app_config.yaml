@@ -1,3 +1,4 @@
 app:
   name: "azure-openai-app"
   log_level: "INFO"
+  docs_enabled: true

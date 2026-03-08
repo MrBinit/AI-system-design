@@ -1,9 +1,21 @@
 import os
+import ssl
 
 import redis
 from app.core.config import get_settings
 
 settings = get_settings()
+
+
+def _ssl_cert_reqs(cert_reqs: str):
+    """Map app config values to ssl module verification constants."""
+    value = (cert_reqs or "required").strip().lower()
+    mapping = {
+        "required": ssl.CERT_REQUIRED,
+        "optional": ssl.CERT_OPTIONAL,
+        "none": ssl.CERT_NONE,
+    }
+    return mapping.get(value, ssl.CERT_REQUIRED)
 
 
 def _build_redis_client(config):
@@ -18,6 +30,11 @@ def _build_redis_client(config):
         kwargs["username"] = config.username
     if config.password:
         kwargs["password"] = config.password
+    if config.tls:
+        kwargs["ssl"] = True
+        kwargs["ssl_cert_reqs"] = _ssl_cert_reqs(config.ssl_cert_reqs)
+        if config.ssl_ca_certs:
+            kwargs["ssl_ca_certs"] = config.ssl_ca_certs
     return redis.Redis(**kwargs)
 
 

@@ -5,6 +5,8 @@ class FakeRedis:
     def __init__(self):
         self.store = {}
         self.streams = {}
+        self.claimed_entries = []
+        self.last_xautoclaim = None
 
     def set(self, key, value, ex=None, nx=False):
         if nx and key in self.store:
@@ -24,6 +26,25 @@ class FakeRedis:
         stream_id = f"{len(stream) + 1}-0"
         stream.append((stream_id, dict(payload)))
         return stream_id
+
+    def xautoclaim(
+        self,
+        name,
+        groupname,
+        consumername,
+        min_idle_time,
+        start_id="0-0",
+        count=None,
+    ):
+        self.last_xautoclaim = {
+            "name": name,
+            "groupname": groupname,
+            "consumername": consumername,
+            "min_idle_time": min_idle_time,
+            "start_id": start_id,
+            "count": count,
+        }
+        return ("0-0", list(self.claimed_entries), [])
 
 
 def test_monitor_summary_dlq_alerts_once_per_cooldown(monkeypatch):
@@ -99,3 +120,30 @@ def test_retry_or_dlq_summary_job_triggers_dlq_monitor(monkeypatch):
     assert dlq_entries[0][1]["job_id"] == "job-7"
     assert acked == ["7-0"]
     assert monitored == [True]
+
+
+def test_claim_stale_summary_jobs_reads_xautoclaim(monkeypatch):
+    fake_redis = FakeRedis()
+    fake_redis.claimed_entries = [
+        ("8-0", {"job_id": "job-8", "user_id": "user-8", "cutoff_seq": "12"}),
+    ]
+    monkeypatch.setattr(summary_queue_service, "worker_redis_client", fake_redis)
+    monkeypatch.setattr(summary_queue_service, "ensure_consumer_group", lambda: None)
+    monkeypatch.setattr(
+        summary_queue_service.settings.memory,
+        "summary_queue_claim_idle_ms",
+        12345,
+    )
+    monkeypatch.setattr(
+        summary_queue_service.settings.memory,
+        "summary_queue_claim_batch_size",
+        42,
+    )
+
+    jobs = summary_queue_service.claim_stale_summary_jobs("worker-a")
+
+    assert jobs == fake_redis.claimed_entries
+    assert fake_redis.last_xautoclaim is not None
+    assert fake_redis.last_xautoclaim["consumername"] == "worker-a"
+    assert fake_redis.last_xautoclaim["min_idle_time"] == 12345
+    assert fake_redis.last_xautoclaim["count"] == 42

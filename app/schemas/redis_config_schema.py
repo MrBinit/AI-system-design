@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -7,6 +9,9 @@ class RedisRoleConfig(BaseModel):
     db: int = Field(default=0, ge=0, le=15)
     username: str = ""
     password: str = ""
+    tls: bool = False
+    ssl_cert_reqs: Literal["required", "optional", "none"] = "required"
+    ssl_ca_certs: str = ""
     namespace: str = Field(min_length=1, default="app")
 
 

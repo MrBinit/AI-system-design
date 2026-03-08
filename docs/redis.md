@@ -30,6 +30,15 @@ The summary worker script sets:
 
 This allows the worker runtime to use worker credentials by default.
 
+## TLS Configuration
+
+Per-role TLS settings are available through env vars:
+
+- `REDIS_APP_TLS`, `REDIS_APP_SSL_CERT_REQS`, `REDIS_APP_SSL_CA_CERTS`
+- `REDIS_WORKER_TLS`, `REDIS_WORKER_SSL_CERT_REQS`, `REDIS_WORKER_SSL_CA_CERTS`
+
+Use `*_TLS=true` for ElastiCache with in-transit encryption enabled.
+
 ## Namespaces
 
 Two namespaces are configured:

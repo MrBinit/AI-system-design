@@ -1,0 +1,17 @@
+.git
+.gitignore
+.pytest_cache
+.pycache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+venv
+.venv
+.env
+*.pem
+*.key
+data
+tests
+docs
+dump.rdb

@@ -5,6 +5,9 @@ redis:
     db: 0
     username: ""
     password: ""
+    tls: false
+    ssl_cert_reqs: "required"
+    ssl_ca_certs: ""
     namespace: "app"
   worker:
     host: "localhost"
@@ -12,4 +15,7 @@ redis:
     db: 0
     username: ""
     password: ""
+    tls: false
+    ssl_cert_reqs: "required"
+    ssl_ca_certs: ""
     namespace: "worker"

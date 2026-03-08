@@ -1,0 +1,64 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-system:latest
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_RUNTIME_ROLE: app
+      API_WORKERS: ${API_WORKERS:-2}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    command: ["sh", "-c", "python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS}"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)\"",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 20s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-system:latest
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_RUNTIME_ROLE: worker
+    command: ["python", "-m", "app.scripts.summary_worker"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"from app.infra.redis_client import worker_redis_client as c; raise SystemExit(0 if c.ping() else 1)\"",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-system-redis
+    restart: unless-stopped
+    profiles: ["local-redis"]
+    ports:
+      - "127.0.0.1:${LOCAL_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:

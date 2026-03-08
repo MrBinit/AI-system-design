@@ -260,3 +260,80 @@ def test_save_memory_if_version_rejects_mismatch(monkeypatch):
     )
     assert ok is False
     assert current["version"] == 5
+
+
+@pytest.mark.asyncio
+async def test_update_memory_retries_on_version_conflict(monkeypatch):
+    load_snapshots = [
+        {
+            "summary": "",
+            "messages": [],
+            "version": 2,
+            "next_seq": 10,
+            "last_summarized_seq": 0,
+            "summary_pending": False,
+            "last_summary_job_id": "",
+        },
+        {
+            "summary": "",
+            "messages": [],
+            "version": 3,
+            "next_seq": 20,
+            "last_summarized_seq": 0,
+            "summary_pending": False,
+            "last_summary_job_id": "",
+        },
+    ]
+    load_calls = {"count": 0}
+    save_calls = {"count": 0}
+    saved_payload = {}
+
+    async def fake_load_memory(_user_id):
+        index = min(load_calls["count"], len(load_snapshots) - 1)
+        load_calls["count"] += 1
+        return deepcopy(load_snapshots[index])
+
+    def fake_save_memory_if_version(_user_id, expected_version, memory):
+        save_calls["count"] += 1
+        if save_calls["count"] == 1:
+            assert expected_version == 2
+            return False, {"version": 3}
+        assert expected_version == 3
+        saved_payload["memory"] = deepcopy(memory)
+        return True, memory
+
+    monkeypatch.setattr(memory_service, "load_memory", fake_load_memory)
+    monkeypatch.setattr(memory_service, "save_memory_if_version", fake_save_memory_if_version)
+
+    await memory_service.update_memory("user-1", "hello", "hi there")
+
+    assert save_calls["count"] == 2
+    assert saved_payload["memory"]["messages"] == [
+        {"seq": 20, "role": "user", "content": "hello"},
+        {"seq": 21, "role": "assistant", "content": "hi there"},
+    ]
+    assert saved_payload["memory"]["next_seq"] == 22
+    assert saved_payload["memory"]["version"] == 4
+
+
+@pytest.mark.asyncio
+async def test_update_memory_raises_after_retry_exhaustion(monkeypatch):
+    async def fake_load_memory(_user_id):
+        return {
+            "summary": "",
+            "messages": [],
+            "version": 1,
+            "next_seq": 1,
+            "last_summarized_seq": 0,
+            "summary_pending": False,
+            "last_summary_job_id": "",
+        }
+
+    def fake_save_memory_if_version(_user_id, _expected_version, _memory):
+        return False, {"version": 999}
+
+    monkeypatch.setattr(memory_service, "load_memory", fake_load_memory)
+    monkeypatch.setattr(memory_service, "save_memory_if_version", fake_save_memory_if_version)
+
+    with pytest.raises(RuntimeError):
+        await memory_service.update_memory("user-1", "hello", "hi there")

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 
@@ -106,7 +107,7 @@ async def process_summary_job(stream_id: str, fields: dict):
                     stale_update["summary_pending"] = False
                     stale_update["last_summary_job_id"] = ""
                     stale_update["version"] = memory["version"] + 1
-                    save_memory_if_version(user_id, memory["version"], stale_update)
+                    await asyncio.to_thread(save_memory_if_version, user_id, memory["version"], stale_update)
                 mark_summary_job_processed(idempotency_key, stream_id)
                 ack_summary_job(stream_id)
                 return
@@ -118,7 +119,7 @@ async def process_summary_job(stream_id: str, fields: dict):
                     stale_update["summary_pending"] = False
                     stale_update["last_summary_job_id"] = ""
                     stale_update["version"] = memory["version"] + 1
-                    save_memory_if_version(user_id, memory["version"], stale_update)
+                    await asyncio.to_thread(save_memory_if_version, user_id, memory["version"], stale_update)
                 mark_summary_job_processed(idempotency_key, stream_id)
                 ack_summary_job(stream_id)
                 return
@@ -129,7 +130,12 @@ async def process_summary_job(stream_id: str, fields: dict):
                 raise RuntimeError("empty summary generated")
 
             updated_memory, removed_messages = _build_updated_memory(memory, cutoff_seq, summary_text, job_id)
-            updated, latest = save_memory_if_version(user_id, memory["version"], updated_memory)
+            updated, latest = await asyncio.to_thread(
+                save_memory_if_version,
+                user_id,
+                memory["version"],
+                updated_memory,
+            )
             if not updated:
                 memory = latest
                 continue

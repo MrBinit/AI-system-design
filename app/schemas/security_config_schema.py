@@ -1,10 +1,19 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SecurityConfig(BaseModel):
     auth_enabled: bool = True
-    jwt_secret: str = Field(min_length=16)
+    jwt_secret: str = Field(min_length=32)
     jwt_algorithm: str = "HS256"
     jwt_issuer: str = "ai-system"
     jwt_exp_minutes: int = Field(default=60, ge=1, le=1440)
     admin_roles: list[str] = Field(default_factory=lambda: ["admin"])
+
+    @field_validator("jwt_secret")
+    @classmethod
+    def validate_jwt_secret(cls, value: str) -> str:
+        """Reject insecure placeholder defaults for JWT secret values."""
+        normalized = value.strip().lower()
+        if normalized in {"change-this-in-prod-very-secret-key", "changeme", "default"}:
+            raise ValueError("security.jwt_secret must not use a placeholder value.")
+        return value

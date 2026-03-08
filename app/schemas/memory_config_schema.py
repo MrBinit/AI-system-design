@@ -23,6 +23,8 @@ class MemoryConfig(BaseModel):
     summary_queue_read_count: int = Field(default=10, ge=1, le=1000)
     summary_queue_block_ms: int = Field(default=5000, ge=1, le=60000)
     summary_queue_max_attempts: int = Field(default=5, ge=1, le=50)
+    summary_queue_claim_idle_ms: int = Field(default=60000, ge=1, le=86400000)
+    summary_queue_claim_batch_size: int = Field(default=50, ge=1, le=1000)
     summary_queue_dlq_alert_threshold: int = Field(default=1, ge=1, le=100000)
     summary_queue_dlq_alert_cooldown_seconds: int = Field(default=300, ge=1, le=86400)
     summary_queue_dlq_monitor_interval_seconds: int = Field(default=30, ge=1, le=3600)

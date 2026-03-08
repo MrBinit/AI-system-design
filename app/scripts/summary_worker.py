@@ -3,9 +3,16 @@ import logging
 import os
 import socket
 import time
+
 os.environ.setdefault("REDIS_RUNTIME_ROLE", "worker")
 from app.core.config import get_settings
-from app.services.summary_queue_service import ensure_consumer_group, monitor_summary_dlq, read_summary_jobs
+from app.core.security import validate_security_configuration
+from app.services.summary_queue_service import (
+    claim_stale_summary_jobs,
+    ensure_consumer_group,
+    monitor_summary_dlq,
+    read_summary_jobs,
+)
 from app.services.summary_worker_service import process_summary_job
 
 logging.basicConfig(level=logging.INFO)
@@ -34,7 +41,9 @@ async def run_worker():
             monitor_summary_dlq()
             last_dlq_monitor_at = now
 
-        jobs = read_summary_jobs(consumer_name)
+        jobs = claim_stale_summary_jobs(consumer_name)
+        if not jobs:
+            jobs = read_summary_jobs(consumer_name)
         if not jobs:
             await asyncio.sleep(0.2)
             continue
@@ -45,6 +54,7 @@ async def run_worker():
 
 def main():
     """Start the summary worker event loop from the CLI entrypoint."""
+    validate_security_configuration()
     asyncio.run(run_worker())
 
 

@@ -306,6 +306,46 @@ def read_summary_jobs(consumer_name: str) -> list[tuple[str, dict]]:
     return jobs
 
 
+def claim_stale_summary_jobs(consumer_name: str) -> list[tuple[str, dict]]:
+    """Claim stale pending jobs abandoned by other consumers."""
+    ensure_consumer_group()
+    try:
+        response = worker_redis_client.xautoclaim(
+            _stream_key(),
+            settings.memory.summary_queue_group,
+            consumer_name,
+            settings.memory.summary_queue_claim_idle_ms,
+            start_id="0-0",
+            count=settings.memory.summary_queue_claim_batch_size,
+        )
+    except AttributeError:
+        logger.warning("Redis client does not support xautoclaim; stale job recovery is disabled.")
+        return []
+    except ResponseError as exc:
+        logger.warning("Failed reclaiming stale summary jobs. %s", exc)
+        return []
+    except RedisError as exc:
+        logger.warning("Failed reclaiming stale summary jobs. %s", exc)
+        return []
+
+    if not isinstance(response, (list, tuple)) or len(response) < 2:
+        return []
+
+    claimed_entries = response[1]
+    if not isinstance(claimed_entries, list):
+        return []
+
+    jobs = []
+    for entry in claimed_entries:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            continue
+        stream_id, fields = entry
+        if not isinstance(fields, dict):
+            continue
+        jobs.append((stream_id, fields))
+    return jobs
+
+
 def ack_summary_job(stream_id: str):
     """Acknowledge a processed or discarded summary job in the Redis stream."""
     try:

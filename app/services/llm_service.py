@@ -13,6 +13,7 @@ from app.services.guardrails_service import (
     guard_user_input,
     refusal_response,
 )
+from app.services.evaluation_service import store_chat_trace
 from app.services.memory_service import build_context, update_memory
 
 settings = get_settings()
@@ -22,22 +23,28 @@ logger = logging.getLogger(__name__)
 SEMAPHORE = asyncio.Semaphore(settings.azure_openai.max_concurrency)
 
 
+async def _redis_call(method, *args, **kwargs):
+    """Run a blocking Redis operation without blocking the event loop."""
+    return await asyncio.to_thread(method, *args, **kwargs)
+
+
 def _latency_metrics_key() -> str:
     """Return the Redis key used to store aggregate LLM latency metrics."""
     return app_scoped_key("metrics", "llm", "latency")
 
 
-def _record_latency_metrics(started_at: float, outcome: str):
+async def _record_latency_metrics(started_at: float, outcome: str):
     """Persist request latency metrics for observability and ops reporting."""
     latency_ms = max(0, int((time.perf_counter() - started_at) * 1000))
     key = _latency_metrics_key()
     try:
-        redis_client.hincrby(key, "count", 1)
-        redis_client.hincrby(key, "total_ms", latency_ms)
-        current_max = redis_client.hget(key, "max_ms")
+        await _redis_call(redis_client.hincrby, key, "count", 1)
+        await _redis_call(redis_client.hincrby, key, "total_ms", latency_ms)
+        current_max = await _redis_call(redis_client.hget, key, "max_ms")
         if current_max is None or latency_ms > int(current_max):
-            redis_client.hset(key, "max_ms", latency_ms)
-        redis_client.hset(
+            await _redis_call(redis_client.hset, key, "max_ms", latency_ms)
+        await _redis_call(
+            redis_client.hset,
             key,
             mapping={
                 "last_ms": latency_ms,
@@ -48,7 +55,7 @@ def _record_latency_metrics(started_at: float, outcome: str):
         logger.warning("Latency metrics persistence failed; continuing.")
 
 
-def _record_pipeline_stage_metrics(
+async def _record_pipeline_stage_metrics(
     *,
     build_context_ms: int,
     retrieval_ms: int,
@@ -59,11 +66,12 @@ def _record_pipeline_stage_metrics(
     """Persist stage-level latency metrics for successful full chat pipeline runs."""
     key = _latency_metrics_key()
     try:
-        redis_client.hincrby(key, "pipeline_count", 1)
-        redis_client.hincrby(key, "build_context_total_ms", build_context_ms)
-        redis_client.hincrby(key, "retrieval_total_ms", retrieval_ms)
-        redis_client.hincrby(key, "model_total_ms", model_ms)
-        redis_client.hset(
+        await _redis_call(redis_client.hincrby, key, "pipeline_count", 1)
+        await _redis_call(redis_client.hincrby, key, "build_context_total_ms", build_context_ms)
+        await _redis_call(redis_client.hincrby, key, "retrieval_total_ms", retrieval_ms)
+        await _redis_call(redis_client.hincrby, key, "model_total_ms", model_ms)
+        await _redis_call(
+            redis_client.hset,
             key,
             mapping={
                 "last_build_context_ms": build_context_ms,
@@ -151,7 +159,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
             user_id,
             input_guard["reason"],
         )
-        _record_latency_metrics(started_at, "blocked_input")
+        await _record_latency_metrics(started_at, "blocked_input")
         return refusal_response()
 
     safe_user_prompt = input_guard["sanitized_text"]
@@ -159,9 +167,9 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
 
     # Cache lookup
     try:
-        cached = redis_client.get(cache_key)
+        cached = await _redis_call(redis_client.get, cache_key)
         if cached:
-            _record_latency_metrics(started_at, "cache_hit")
+            await _record_latency_metrics(started_at, "cache_hit")
             return cached
     except RedisError as exc:
         logger.warning("Redis cache read failed. %s", exc)
@@ -174,6 +182,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
     retrieval_ms = 0
     retrieval_strategy = "none"
     retrieved_count = 0
+    retrieved_results: list[dict] = []
     retrieval_query = _build_retrieval_query(messages)
     if retrieval_query:
         try:
@@ -186,6 +195,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
             retrieval_strategy = str(retrieval_result.get("retrieval_strategy", "unknown"))
             results = retrieval_result.get("results", [])
             if isinstance(results, list):
+                retrieved_results = results
                 retrieved_count = len(results)
             retrieval_message = _format_retrieval_context(retrieval_result)
             if retrieval_message:
@@ -204,7 +214,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
             user_id,
             context_guard["reason"],
         )
-        _record_latency_metrics(started_at, "blocked_context")
+        await _record_latency_metrics(started_at, "blocked_context")
         return refusal_response()
     messages = context_guard["messages"]
 
@@ -250,15 +260,26 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
 
     # Cache result
     try:
-        redis_client.setex(
-            cache_key,
-            settings.memory.redis_ttl_seconds,
-            result,
-        )
+        await _redis_call(redis_client.setex, cache_key, settings.memory.redis_ttl_seconds, result)
     except RedisError as exc:
         logger.warning("Redis cache write failed. %s", exc)
 
-    _record_pipeline_stage_metrics(
+    await asyncio.to_thread(
+        store_chat_trace,
+        user_id=user_id,
+        prompt=user_prompt,
+        answer=result,
+        retrieved_results=retrieved_results,
+        retrieval_strategy=retrieval_strategy,
+        timings_ms={
+            "build_context": build_context_ms,
+            "retrieval": retrieval_ms,
+            "model": model_ms,
+        },
+        redis=redis_client,
+    )
+
+    await _record_pipeline_stage_metrics(
         build_context_ms=build_context_ms,
         retrieval_ms=retrieval_ms,
         model_ms=model_ms,
@@ -274,5 +295,5 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
         retrieval_strategy,
         retrieved_count,
     )
-    _record_latency_metrics(started_at, "success")
+    await _record_latency_metrics(started_at, "success")
     return result

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from copy import deepcopy
@@ -21,6 +22,11 @@ from app.services.token_budget_service import resolve_user_budget
 settings = get_settings()
 prompts = get_prompts()
 logger = logging.getLogger(__name__)
+
+
+async def _redis_call(method, *args, **kwargs):
+    """Run a blocking Redis operation without blocking the event loop."""
+    return await asyncio.to_thread(method, *args, **kwargs)
 
 
 def _redis_key(user_id: str) -> str:
@@ -119,14 +125,14 @@ def _deserialize_memory_payload(raw: str) -> tuple[dict, bool]:
 async def load_memory(user_id: str) -> dict:
     """Load a user's memory from Redis with fallback to the legacy key format."""
     try:
-        raw = redis_client.get(_redis_key(user_id))
+        raw = await _redis_call(redis_client.get, _redis_key(user_id))
     except RedisError as exc:
         logger.warning("Redis memory read failed; using empty memory. %s", exc)
         return _empty_memory()
 
     if not raw:
         try:
-            raw = redis_client.get(_legacy_redis_key(user_id))
+            raw = await _redis_call(redis_client.get, _legacy_redis_key(user_id))
         except RedisError as exc:
             logger.warning("Redis legacy memory read failed; using empty memory. %s", exc)
             return _empty_memory()
@@ -151,6 +157,11 @@ def save_memory(user_id: str, memory: dict):
         )
     except RedisError as exc:
         logger.warning("Redis memory write failed; skipping persistence. %s", exc)
+
+
+async def save_memory_async(user_id: str, memory: dict):
+    """Persist memory via a worker thread to avoid blocking async callers."""
+    await asyncio.to_thread(save_memory, user_id, memory)
 
 
 def save_memory_if_version(user_id: str, expected_version: int, memory: dict) -> tuple[bool, dict]:
@@ -260,7 +271,7 @@ async def build_context(user_id: str, new_user_message: str) -> list:
                 memory["summary_pending"] = True
                 memory["last_summary_job_id"] = job_id
                 memory["version"] += 1
-                save_memory(user_id, memory)
+                await save_memory_async(user_id, memory)
 
     truncation_result = truncate_context_without_summary(
         summary=summary,
@@ -292,7 +303,7 @@ async def build_context(user_id: str, new_user_message: str) -> list:
             memory["next_seq"],
             (memory["messages"][-1]["seq"] + 1) if memory["messages"] else 1,
         )
-        save_memory(user_id, memory)
+        await save_memory_async(user_id, memory)
 
     logger.info(
         "ContextBuilt | user=%s | final_tokens=%s | summary_present=%s",
@@ -305,14 +316,28 @@ async def build_context(user_id: str, new_user_message: str) -> list:
 
 
 async def update_memory(user_id: str, user_message: str, assistant_reply: str):
-    """Append the latest user and assistant messages to short-term memory."""
-    memory = await load_memory(user_id)
+    """Append latest user/assistant turns using optimistic concurrency to avoid lost writes."""
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        memory = await load_memory(user_id)
+        expected_version = memory["version"]
 
-    user_seq = memory["next_seq"]
-    assistant_seq = user_seq + 1
-    memory["messages"].append({"seq": user_seq, "role": "user", "content": user_message})
-    memory["messages"].append({"seq": assistant_seq, "role": "assistant", "content": assistant_reply})
-    memory["next_seq"] = assistant_seq + 1
-    memory["version"] += 1
+        candidate = _normalize_memory(memory)
+        user_seq = candidate["next_seq"]
+        assistant_seq = user_seq + 1
+        candidate["messages"].append({"seq": user_seq, "role": "user", "content": user_message})
+        candidate["messages"].append({"seq": assistant_seq, "role": "assistant", "content": assistant_reply})
+        candidate["next_seq"] = assistant_seq + 1
+        candidate["version"] = expected_version + 1
 
-    save_memory(user_id, memory)
+        updated, _ = await asyncio.to_thread(
+            save_memory_if_version,
+            user_id,
+            expected_version,
+            candidate,
+        )
+        if updated:
+            return
+        logger.info("MemoryUpdateConflict | user=%s | attempt=%s", user_id, attempt)
+
+    raise RuntimeError(f"Memory update failed after {max_attempts} optimistic-lock retries.")
