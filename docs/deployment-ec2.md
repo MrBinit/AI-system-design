@@ -59,6 +59,8 @@ AZURE_OPENAI_FALLBACK_DEPLOYMENT=gpt-4o-mini
 # App runtime
 APP_DOCS_ENABLED=false
 API_WORKERS=2
+APP_METRICS_JSON_ENABLED=true
+APP_METRICS_JSON_DIR=data/metrics
 
 # Postgres
 POSTGRES_ENABLED=true
@@ -108,6 +110,15 @@ MIDDLEWARE_TRUSTED_PROXY_CIDRS=172.31.0.0/16
 MEMORY_SUMMARY_QUEUE_CLAIM_IDLE_MS=60000
 MEMORY_SUMMARY_QUEUE_CLAIM_BATCH_SIZE=50
 ```
+
+Metrics JSON notes:
+
+- `APP_METRICS_JSON_ENABLED=true` writes per-request chat metrics and rolling aggregates to disk.
+- `APP_METRICS_JSON_DIR` is resolved relative to project root unless absolute.
+- Current files:
+  - `<dir>/chat_metrics_requests.jsonl`
+  - `<dir>/chat_metrics_aggregate.json`
+- `docker-compose.yml` mounts `./data/metrics:/app/data/metrics` so metrics are visible on host and survive container restarts/recreates.
 
 Proxy trust note:
 

@@ -3,6 +3,14 @@ from app.services import llm_service
 from app.infra.redis_client import app_scoped_key
 
 
+@pytest.fixture(autouse=True)
+def _stub_json_metrics(monkeypatch):
+    async def noop(_record):
+        return None
+
+    monkeypatch.setattr(llm_service, "_record_json_metrics", noop)
+
+
 class FakeRedis:
     def __init__(self):
         self.store = {}
@@ -49,6 +57,7 @@ async def test_generate_response_returns_cache_hit(monkeypatch):
 async def test_generate_response_uses_primary_and_updates_memory(monkeypatch):
     fake_redis = FakeRedis()
     monkeypatch.setattr(llm_service, "redis_client", fake_redis)
+    captured_metrics = []
 
     async def fake_build_context(user_id, user_prompt):
         assert user_id == "user-1"
@@ -81,11 +90,15 @@ async def test_generate_response_uses_primary_and_updates_memory(monkeypatch):
             ]
         }
 
+    async def fake_record_json_metrics(record):
+        captured_metrics.append(record)
+
     monkeypatch.setattr(llm_service, "build_context", fake_build_context)
     monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
     monkeypatch.setattr(llm_service, "_call_fallback", fake_fallback)
     monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
     monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+    monkeypatch.setattr(llm_service, "_record_json_metrics", fake_record_json_metrics)
 
     result = await llm_service.generate_response("user-1", "find ai professor")
     assert result == "primary-response"
@@ -93,6 +106,13 @@ async def test_generate_response_uses_primary_and_updates_memory(monkeypatch):
     assert retrieval_queries[0][0] == "find ai professor"
     cache_key = app_scoped_key("cache", "chat", "user-1", "find ai professor")
     assert fake_redis.store[cache_key] == "primary-response"
+    assert captured_metrics[-1]["question"] == "find ai professor"
+    assert captured_metrics[-1]["answer"] == "primary-response"
+    assert captured_metrics[-1]["outcome"] == "success"
+    assert captured_metrics[-1]["timings_ms"]["llm_response_ms"] is not None
+    assert captured_metrics[-1]["timings_ms"]["short_term_memory_ms"] is not None
+    assert captured_metrics[-1]["timings_ms"]["long_term_memory_ms"] is not None
+    assert "hallucination_proxy" in captured_metrics[-1]["quality"]
 
 
 @pytest.mark.asyncio

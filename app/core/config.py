@@ -45,6 +45,8 @@ def _apply_env_overrides(data: dict) -> dict:
 
     _set(["app", "log_level"], "APP_LOG_LEVEL")
     _set(["app", "docs_enabled"], "APP_DOCS_ENABLED", bool)
+    _set(["app", "metrics_json_enabled"], "APP_METRICS_JSON_ENABLED", bool)
+    _set(["app", "metrics_json_dir"], "APP_METRICS_JSON_DIR")
 
     _set(["security", "auth_enabled"], "SECURITY_AUTH_ENABLED", bool)
     _set(["security", "jwt_secret"], "SECURITY_JWT_SECRET")

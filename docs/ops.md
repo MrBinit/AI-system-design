@@ -108,3 +108,12 @@ This is useful immediately, but should later be connected to:
 - Datadog
 - CloudWatch
 - Grafana alerting
+
+## JSON Metrics Persistence
+
+When `APP_METRICS_JSON_ENABLED=true`, each chat request is persisted to JSON for offline analysis.
+
+Output files under `APP_METRICS_JSON_DIR`:
+
+- `chat_metrics_requests.jsonl`: one event per request (question, answer, latency breakdown, quality metrics, usage, outcome).
+- `chat_metrics_aggregate.json`: rolling totals and averages for latency, quality, outcomes, and token usage.
