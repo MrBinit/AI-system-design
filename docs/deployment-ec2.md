@@ -52,6 +52,10 @@ This deployment flow does not rely on `.env` files. Export runtime variables in 
 # Runtime process count (optional, defaults to 2)
 export API_WORKERS=2
 
+# ECR images
+export APP_IMAGE=<aws-account-id>.dkr.ecr.us-east-1.amazonaws.com/unigraph-app:latest
+export GRADIO_IMAGE=<aws-account-id>.dkr.ecr.us-east-1.amazonaws.com/unigraph-gradio:latest
+
 # Secrets Manager source for sensitive keys
 export AWS_SECRETS_MANAGER_SECRET_ID=unigraph/prod/app
 export AWS_SECRETS_MANAGER_REGION=us-east-1
@@ -73,7 +77,7 @@ Metrics JSON notes:
 - Current files:
   - `<dir>/chat_metrics_requests.jsonl`
   - `<dir>/chat_metrics_aggregate.json`
-- `docker-compose.yml` mounts `./data/metrics:/app/data/metrics` so metrics are visible on host and survive container restarts/recreates.
+- `docker-compose.prod.yml` mounts `./data/metrics:/app/data/metrics` so metrics are visible on host and survive container restarts/recreates.
 
 Proxy trust note:
 
@@ -82,24 +86,25 @@ Proxy trust note:
 
 ## 4) Pre-Deploy Validation
 
-Validate Compose and merged runtime config:
+Validate production Compose:
 
 ```bash
-docker compose -f docker-compose.yml config
+docker compose -f docker-compose.prod.yml config
 ```
 
 ## 5) Deploy
 
-Build and start core services:
+Pull and start core services:
 
 ```bash
-docker compose -f docker-compose.yml up -d --build api worker
+docker compose -f docker-compose.prod.yml pull api worker
+docker compose -f docker-compose.prod.yml up -d api worker
 ```
 
 Tail logs:
 
 ```bash
-docker compose -f docker-compose.yml logs -f api worker
+docker compose -f docker-compose.prod.yml logs -f api worker
 ```
 
 ## 6) Scaling Guidance
@@ -111,7 +116,7 @@ Single EC2 host API scaling (vertical process scaling):
 Worker scaling (horizontal on same host):
 
 ```bash
-docker compose -f docker-compose.yml up -d --build --scale worker=2
+docker compose -f docker-compose.prod.yml up -d --scale worker=2
 ```
 
 API horizontal scaling:
@@ -136,7 +141,7 @@ Expected response:
 Redis connectivity from API container:
 
 ```bash
-docker compose -f docker-compose.yml exec api python -c "from app.infra.redis_client import app_redis_client; print(app_redis_client.ping())"
+docker compose -f docker-compose.prod.yml exec api python -c "from app.infra.redis_client import app_redis_client; print(app_redis_client.ping())"
 ```
 
 Expected output: `True`
@@ -179,12 +184,12 @@ APP_DOCS_ENABLED=true
 If deployment is unhealthy:
 
 ```bash
-docker compose -f docker-compose.yml logs --tail 200 api worker
-docker compose -f docker-compose.yml down
+docker compose -f docker-compose.prod.yml logs --tail 200 api worker
+docker compose -f docker-compose.prod.yml down
 ```
 
 Revert to previous version and redeploy:
 
 ```bash
-docker compose -f docker-compose.yml up -d --build api worker
+docker compose -f docker-compose.prod.yml up -d api worker
 ```
