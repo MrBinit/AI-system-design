@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      SECURITY_JWT_SECRET: "ci_jwt_secret_abcdefghijklmnopqrstuvwxyz123456"
+      MEMORY_ENCRYPTION_KEY: "ci_memory_secret_abcdefghijklmnopqrstuvwxyz123"
+      POSTGRES_PASSWORD: "ci_pg_password"
+      AZURE_OPENAI_API_KEY: "ci_dummy_key"
+      MIDDLEWARE_ENABLE_TIMEOUT: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements-prod.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Shell syntax check
+        run: |
+          for script in scripts/*.sh; do
+            bash -n "${script}"
+          done
+
+      - name: Validate production compose render
+        env:
+          APP_IMAGE: "example.dkr.ecr.us-east-1.amazonaws.com/unigraph-app:ci"
+          GRADIO_IMAGE: "example.dkr.ecr.us-east-1.amazonaws.com/unigraph-gradio:ci"
+          AWS_SECRETS_MANAGER_SECRET_ID: "ci/placeholder"
+          AWS_SECRETS_MANAGER_REGION: "us-east-1"
+        run: |
+          docker compose -f docker-compose.prod.yml config >/tmp/compose.prod.rendered.yml
+
+      - name: Black
+        run: black --check .
+
+      - name: Flake8
+        run: flake8 app tests
+
+      - name: Pytest
+        run: pytest -q
+

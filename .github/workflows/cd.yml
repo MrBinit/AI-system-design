@@ -1,0 +1,142 @@
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    {}
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO_APP: unigraph-app
+  ECR_REPO_GRADIO: unigraph-gradio
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      app_image: ${{ steps.images.outputs.app_image }}
+      gradio_image: ${{ steps.images.outputs.gradio_image }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          short_sha="${GITHUB_SHA::12}"
+          echo "image_tag=sha-${short_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push app image (amd64)
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            -f Dockerfile \
+            -t "${REGISTRY}/${ECR_REPO_APP}:${IMAGE_TAG}" \
+            -t "${REGISTRY}/${ECR_REPO_APP}:latest" \
+            --push .
+
+      - name: Build and push gradio image (amd64)
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            -f Dockerfile.gradio \
+            -t "${REGISTRY}/${ECR_REPO_GRADIO}:${IMAGE_TAG}" \
+            -t "${REGISTRY}/${ECR_REPO_GRADIO}:latest" \
+            --push .
+
+      - name: Export image outputs
+        id: images
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+        run: |
+          echo "app_image=${REGISTRY}/${ECR_REPO_APP}:${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "gradio_image=${REGISTRY}/${ECR_REPO_GRADIO}:${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+
+  deploy-ec2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build-and-push
+    environment: production
+    steps:
+      - name: Deploy on EC2 via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          APP_IMAGE: ${{ needs.build-and-push.outputs.app_image }}
+          GRADIO_IMAGE: ${{ needs.build-and-push.outputs.gradio_image }}
+          AWS_REGION: ${{ vars.AWS_REGION || env.AWS_REGION }}
+          AWS_SECRETS_MANAGER_REGION: ${{ vars.AWS_SECRETS_MANAGER_REGION || vars.AWS_REGION || env.AWS_REGION }}
+          AWS_SECRETS_MANAGER_SECRET_ID: ${{ vars.AWS_SECRETS_MANAGER_SECRET_ID }}
+          API_WORKERS: ${{ vars.API_WORKERS || '1' }}
+          EC2_APP_DIR: ${{ vars.EC2_APP_DIR || '~/AI-system-design' }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          script_stop: true
+          envs: APP_IMAGE,GRADIO_IMAGE,AWS_REGION,AWS_SECRETS_MANAGER_REGION,AWS_SECRETS_MANAGER_SECRET_ID,API_WORKERS,EC2_APP_DIR
+          script: |
+            set -euo pipefail
+
+            cd "${EC2_APP_DIR}"
+            git fetch origin main
+            git checkout main
+            git pull --ff-only origin main
+
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+            export AWS_SECRETS_MANAGER_REGION="${AWS_SECRETS_MANAGER_REGION:-${AWS_REGION}}"
+            export API_WORKERS="${API_WORKERS:-1}"
+
+            if [[ -z "${AWS_SECRETS_MANAGER_SECRET_ID:-}" ]]; then
+              echo "AWS_SECRETS_MANAGER_SECRET_ID is required"
+              exit 1
+            fi
+
+            ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+            ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+            aws ecr get-login-password --region "${AWS_REGION}" \
+              | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+            mkdir -p data/metrics
+            chown "$(id -u):$(id -g)" data/metrics || true
+            chmod 775 data/metrics || true
+
+            docker compose -f docker-compose.prod.yml --profile gradio pull api worker gradio
+            docker compose -f docker-compose.prod.yml --profile gradio up -d api worker gradio
+            docker compose -f docker-compose.prod.yml --profile gradio ps
+
+            curl --max-time 15 -fsS "http://127.0.0.1:8000/healthz"
+            curl --max-time 20 -fsS "http://127.0.0.1:7860" >/dev/null
