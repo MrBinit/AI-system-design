@@ -105,7 +105,9 @@ def truncate_context_without_summary(
         removed_summary = ""
         if final_tokens > hard_limit and summary:
             removed_summary = summary
-            removed_tokens += safe_token_count(token_counter, [{"role": "assistant", "content": summary}])
+            removed_tokens += safe_token_count(
+                token_counter, [{"role": "assistant", "content": summary}]
+            )
             summary = ""
             final_context = compose_context(summary, messages, new_user_message)
             final_tokens = safe_token_count(token_counter, final_context)

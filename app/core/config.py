@@ -155,14 +155,24 @@ def _apply_env_overrides(data: dict) -> dict:
     _set(["middleware", "max_in_flight_requests"], "MIDDLEWARE_MAX_IN_FLIGHT_REQUESTS", int)
     _set(["middleware", "rate_limit_requests"], "MIDDLEWARE_RATE_LIMIT_REQUESTS", int)
     _set(["middleware", "rate_limit_window_seconds"], "MIDDLEWARE_RATE_LIMIT_WINDOW_SECONDS", int)
-    _set(["middleware", "enable_distributed_rate_limit"], "MIDDLEWARE_ENABLE_DISTRIBUTED_RATE_LIMIT", bool)
-    _set(["middleware", "distributed_rate_limit_prefix"], "MIDDLEWARE_DISTRIBUTED_RATE_LIMIT_PREFIX")
+    _set(
+        ["middleware", "enable_distributed_rate_limit"],
+        "MIDDLEWARE_ENABLE_DISTRIBUTED_RATE_LIMIT",
+        bool,
+    )
+    _set(
+        ["middleware", "distributed_rate_limit_prefix"], "MIDDLEWARE_DISTRIBUTED_RATE_LIMIT_PREFIX"
+    )
     _set(
         ["middleware", "trusted_proxy_cidrs"],
         "MIDDLEWARE_TRUSTED_PROXY_CIDRS",
         lambda raw: [entry.strip() for entry in raw.split(",") if entry.strip()],
     )
-    _set(["middleware", "enable_distributed_backpressure"], "MIDDLEWARE_ENABLE_DISTRIBUTED_BACKPRESSURE", bool)
+    _set(
+        ["middleware", "enable_distributed_backpressure"],
+        "MIDDLEWARE_ENABLE_DISTRIBUTED_BACKPRESSURE",
+        bool,
+    )
     _set(["middleware", "distributed_backpressure_key"], "MIDDLEWARE_DISTRIBUTED_BACKPRESSURE_KEY")
     _set(
         ["middleware", "distributed_backpressure_lease_seconds"],

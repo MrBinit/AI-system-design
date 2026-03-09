@@ -92,9 +92,14 @@ class BackpressureMiddleware(BaseHTTPMiddleware):
 
         if self._redis_gate is not None:
             try:
-                allowed, retry_after = await asyncio.to_thread(self._redis_gate.acquire, redis_token)
+                allowed, retry_after = await asyncio.to_thread(
+                    self._redis_gate.acquire, redis_token
+                )
             except Exception as exc:
-                logger.warning("Distributed backpressure gate unavailable; falling back to local semaphore. %s", exc)
+                logger.warning(
+                    "Distributed backpressure gate unavailable; falling back to local semaphore. %s",
+                    exc,
+                )
                 allowed, retry_after = True, 0
 
             if not allowed:
@@ -121,7 +126,9 @@ class BackpressureMiddleware(BaseHTTPMiddleware):
                 try:
                     await asyncio.to_thread(self._redis_gate.release, redis_token)
                 except Exception:
-                    logger.warning("Failed releasing distributed backpressure token after local reject.")
+                    logger.warning(
+                        "Failed releasing distributed backpressure token after local reject."
+                    )
             return JSONResponse(
                 status_code=503,
                 content={"detail": "Server is busy. Please retry shortly."},

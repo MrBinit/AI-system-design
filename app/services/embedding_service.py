@@ -172,7 +172,9 @@ async def aembed_chunk_manifest(chunk_manifest_path: Path, output_dir: Path | No
 
     semaphore = asyncio.Semaphore(settings.embedding.max_concurrency)
     chunk_entries = [
-        chunk for chunk in payload.get("chunks", []) if isinstance(chunk, dict) and isinstance(chunk.get("content", ""), str)
+        chunk
+        for chunk in payload.get("chunks", [])
+        if isinstance(chunk, dict) and isinstance(chunk.get("content", ""), str)
     ]
 
     async def _embed_one(chunk: dict) -> tuple[dict, list[float]]:
@@ -229,5 +231,8 @@ async def aembed_configured_chunk_manifests() -> list[Path]:
         for chunk_manifest_path in sorted(input_dir.glob(settings.embedding.glob_pattern))
         if chunk_manifest_path.is_file()
     ]
-    tasks = [asyncio.create_task(aembed_chunk_manifest(chunk_manifest_path, output_dir)) for chunk_manifest_path in manifest_paths]
+    tasks = [
+        asyncio.create_task(aembed_chunk_manifest(chunk_manifest_path, output_dir))
+        for chunk_manifest_path in manifest_paths
+    ]
     return await asyncio.gather(*tasks)

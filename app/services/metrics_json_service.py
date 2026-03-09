@@ -165,14 +165,33 @@ def _update_aggregate_payload(aggregate: dict, record: dict) -> dict:
     if not isinstance(timings, dict):
         timings = {}
     latency = aggregate.setdefault("latency_ms", {})
-    _update_series(latency.setdefault("overall", _series_template()), timings.get("overall_response_ms"))
-    _update_series(latency.setdefault("llm_response", _series_template()), timings.get("llm_response_ms"))
-    _update_series(latency.setdefault("short_term_memory", _series_template()), timings.get("short_term_memory_ms"))
-    _update_series(latency.setdefault("long_term_memory", _series_template()), timings.get("long_term_memory_ms"))
-    _update_series(latency.setdefault("memory_update", _series_template()), timings.get("memory_update_ms"))
-    _update_series(latency.setdefault("cache_read", _series_template()), timings.get("cache_read_ms"))
-    _update_series(latency.setdefault("cache_write", _series_template()), timings.get("cache_write_ms"))
-    _update_series(latency.setdefault("evaluation_trace", _series_template()), timings.get("evaluation_trace_ms"))
+    _update_series(
+        latency.setdefault("overall", _series_template()), timings.get("overall_response_ms")
+    )
+    _update_series(
+        latency.setdefault("llm_response", _series_template()), timings.get("llm_response_ms")
+    )
+    _update_series(
+        latency.setdefault("short_term_memory", _series_template()),
+        timings.get("short_term_memory_ms"),
+    )
+    _update_series(
+        latency.setdefault("long_term_memory", _series_template()),
+        timings.get("long_term_memory_ms"),
+    )
+    _update_series(
+        latency.setdefault("memory_update", _series_template()), timings.get("memory_update_ms")
+    )
+    _update_series(
+        latency.setdefault("cache_read", _series_template()), timings.get("cache_read_ms")
+    )
+    _update_series(
+        latency.setdefault("cache_write", _series_template()), timings.get("cache_write_ms")
+    )
+    _update_series(
+        latency.setdefault("evaluation_trace", _series_template()),
+        timings.get("evaluation_trace_ms"),
+    )
 
     quality = record.get("quality", {})
     if not isinstance(quality, dict):
@@ -200,18 +219,26 @@ def _update_aggregate_payload(aggregate: dict, record: dict) -> dict:
     usage_summary = aggregate.setdefault("token_usage", {})
     if prompt_tokens is not None and completion_tokens is not None and total_tokens is not None:
         usage_summary["requests_with_usage"] = int(usage_summary.get("requests_with_usage", 0)) + 1
-        usage_summary["prompt_tokens_total"] = int(usage_summary.get("prompt_tokens_total", 0)) + prompt_tokens
+        usage_summary["prompt_tokens_total"] = (
+            int(usage_summary.get("prompt_tokens_total", 0)) + prompt_tokens
+        )
         usage_summary["completion_tokens_total"] = (
             int(usage_summary.get("completion_tokens_total", 0)) + completion_tokens
         )
-        usage_summary["total_tokens_total"] = int(usage_summary.get("total_tokens_total", 0)) + total_tokens
+        usage_summary["total_tokens_total"] = (
+            int(usage_summary.get("total_tokens_total", 0)) + total_tokens
+        )
         count = max(1, int(usage_summary["requests_with_usage"]))
-        usage_summary["prompt_tokens_average"] = round(usage_summary["prompt_tokens_total"] / count, 3)
+        usage_summary["prompt_tokens_average"] = round(
+            usage_summary["prompt_tokens_total"] / count, 3
+        )
         usage_summary["completion_tokens_average"] = round(
             usage_summary["completion_tokens_total"] / count,
             3,
         )
-        usage_summary["total_tokens_average"] = round(usage_summary["total_tokens_total"] / count, 3)
+        usage_summary["total_tokens_average"] = round(
+            usage_summary["total_tokens_total"] / count, 3
+        )
 
     aggregate["latest_request"] = {
         "request_id": record.get("request_id", ""),

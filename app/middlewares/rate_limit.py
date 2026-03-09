@@ -49,7 +49,9 @@ class _RedisFixedWindowLimiter:
     def allow(self, key: str) -> tuple[bool, int]:
         now = time.time()
         window_start = int(now // self.window_seconds) * self.window_seconds
-        window_key = f"{self.key_prefix}:{window_start}:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
+        window_key = (
+            f"{self.key_prefix}:{window_start}:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
+        )
 
         count = int(app_redis_client.incr(window_key))
         if count == 1:
@@ -155,7 +157,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return sub if isinstance(sub, str) and sub else None
 
     def _rate_limit_key(self, request) -> str:
-        user_id = getattr(request.state, "user_id", None) or self._token_user_id(request) or "anonymous"
+        user_id = (
+            getattr(request.state, "user_id", None) or self._token_user_id(request) or "anonymous"
+        )
         client_ip = self._client_ip(request)
         return f"user:{user_id}|ip:{client_ip}|path:{request.url.path}"
 
@@ -168,7 +172,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             try:
                 allowed, retry_after = await asyncio.to_thread(self._redis_limiter.allow, key)
             except Exception as exc:
-                logger.warning("Distributed rate limit unavailable; falling back to local limiter. %s", exc)
+                logger.warning(
+                    "Distributed rate limit unavailable; falling back to local limiter. %s", exc
+                )
 
         if allowed is None:
             allowed, retry_after = self._limiter.allow(key)

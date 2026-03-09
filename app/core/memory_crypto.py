@@ -13,6 +13,7 @@ _ENC_PREFIX = "enc:v1:"
 _NONCE_LEN = 16
 _TAG_LEN = 32
 
+
 def _master_secret() -> bytes:
     """Return the base secret used to derive memory encryption keys."""
     configured = os.getenv("MEMORY_ENCRYPTION_KEY", "").strip()
@@ -25,8 +26,10 @@ def _derive_key(label: bytes) -> bytes:
     """Derive a stable sub-key for a specific memory crypto purpose."""
     return hmac.new(_master_secret(), label, hashlib.sha256).digest()
 
+
 _ENC_KEY = _derive_key(b"memory-encryption-v1")
 _MAC_KEY = _derive_key(b"memory-auth-v1")
+
 
 def _xor_stream(data: bytes, nonce: bytes) -> bytes:
     """Encrypt or decrypt bytes with the internal HMAC-derived stream cipher."""
@@ -46,6 +49,7 @@ def _xor_stream(data: bytes, nonce: bytes) -> bytes:
         counter += 1
     return bytes(out)
 
+
 def encrypt_memory_payload(payload: dict) -> str:
     """Encrypt and authenticate a memory payload for Redis storage."""
     plaintext = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -54,6 +58,7 @@ def encrypt_memory_payload(payload: dict) -> str:
     tag = hmac.new(_MAC_KEY, nonce + ciphertext, hashlib.sha256).digest()
     token = base64.urlsafe_b64encode(nonce + ciphertext + tag).decode("ascii")
     return f"{_ENC_PREFIX}{token}"
+
 
 def decrypt_memory_payload(raw: str) -> dict | None:
     """Decrypt a Redis memory payload and fall back to legacy plaintext parsing."""

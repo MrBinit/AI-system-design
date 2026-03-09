@@ -4,7 +4,11 @@ import logging
 
 from app.core.token_utils import count_tokens
 from app.services.guardrails_service import sanitize_summary_output
-from app.services.memory_compaction_service import compose_context, merge_summaries, safe_token_count
+from app.services.memory_compaction_service import (
+    compose_context,
+    merge_summaries,
+    safe_token_count,
+)
 from app.services.memory_metrics_service import record_compaction_metrics
 from app.services.memory_service import (
     _strip_seq,
@@ -33,7 +37,9 @@ def _to_int(value, default=0) -> int:
         return default
 
 
-def _build_updated_memory(memory: dict, cutoff_seq: int, summary_text: str, job_id: str) -> tuple[dict, list]:
+def _build_updated_memory(
+    memory: dict, cutoff_seq: int, summary_text: str, job_id: str
+) -> tuple[dict, list]:
     """Build the next memory snapshot after summarizing messages up to the cutoff."""
     updated = dict(memory)
     old_messages = [m for m in memory["messages"] if m.get("seq", 0) <= cutoff_seq]
@@ -107,7 +113,9 @@ async def process_summary_job(stream_id: str, fields: dict):
                     stale_update["summary_pending"] = False
                     stale_update["last_summary_job_id"] = ""
                     stale_update["version"] = memory["version"] + 1
-                    await asyncio.to_thread(save_memory_if_version, user_id, memory["version"], stale_update)
+                    await asyncio.to_thread(
+                        save_memory_if_version, user_id, memory["version"], stale_update
+                    )
                 mark_summary_job_processed(idempotency_key, stream_id)
                 ack_summary_job(stream_id)
                 return
@@ -119,7 +127,9 @@ async def process_summary_job(stream_id: str, fields: dict):
                     stale_update["summary_pending"] = False
                     stale_update["last_summary_job_id"] = ""
                     stale_update["version"] = memory["version"] + 1
-                    await asyncio.to_thread(save_memory_if_version, user_id, memory["version"], stale_update)
+                    await asyncio.to_thread(
+                        save_memory_if_version, user_id, memory["version"], stale_update
+                    )
                 mark_summary_job_processed(idempotency_key, stream_id)
                 ack_summary_job(stream_id)
                 return
@@ -129,7 +139,9 @@ async def process_summary_job(stream_id: str, fields: dict):
             if not summary_text.strip():
                 raise RuntimeError("empty summary generated")
 
-            updated_memory, removed_messages = _build_updated_memory(memory, cutoff_seq, summary_text, job_id)
+            updated_memory, removed_messages = _build_updated_memory(
+                memory, cutoff_seq, summary_text, job_id
+            )
             updated, latest = await asyncio.to_thread(
                 save_memory_if_version,
                 user_id,

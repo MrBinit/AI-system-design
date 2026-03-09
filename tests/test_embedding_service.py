@@ -176,7 +176,9 @@ def test_aembed_chunk_manifest_writes_embedding_output(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(embedding_service, "aembed_text", _fake_aembed_text)
 
-    output_path = asyncio.run(embedding_service.aembed_chunk_manifest(chunk_manifest, tmp_path / "embeddings"))
+    output_path = asyncio.run(
+        embedding_service.aembed_chunk_manifest(chunk_manifest, tmp_path / "embeddings")
+    )
     payload = json.loads(output_path.read_text(encoding="utf-8"))
 
     assert output_path.name == "sample.embeddings.json"

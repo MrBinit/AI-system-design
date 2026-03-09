@@ -17,6 +17,4 @@ class RedisRoleConfig(BaseModel):
 
 class RedisConfig(BaseModel):
     app: RedisRoleConfig = Field(default_factory=RedisRoleConfig)
-    worker: RedisRoleConfig = Field(
-        default_factory=lambda: RedisRoleConfig(namespace="worker")
-    )
+    worker: RedisRoleConfig = Field(default_factory=lambda: RedisRoleConfig(namespace="worker"))

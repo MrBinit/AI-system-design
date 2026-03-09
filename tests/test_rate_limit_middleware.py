@@ -28,7 +28,9 @@ def _request(
 
 
 def test_rate_limit_key_uses_user_id_and_ip():
-    middleware = RateLimitMiddleware(app=lambda *_args, **_kwargs: None, limit=10, window_seconds=60)
+    middleware = RateLimitMiddleware(
+        app=lambda *_args, **_kwargs: None, limit=10, window_seconds=60
+    )
 
     token_1 = create_access_token(user_id="user-1", roles=["user"])
     token_2 = create_access_token(user_id="user-2", roles=["user"])
@@ -45,7 +47,9 @@ def test_rate_limit_key_uses_user_id_and_ip():
 
 
 def test_rate_limit_key_falls_back_to_anonymous_when_token_invalid():
-    middleware = RateLimitMiddleware(app=lambda *_args, **_kwargs: None, limit=10, window_seconds=60)
+    middleware = RateLimitMiddleware(
+        app=lambda *_args, **_kwargs: None, limit=10, window_seconds=60
+    )
     req = _request("/api/v1/chat", "5.6.7.8", auth_header="Bearer invalid-token")
     key = middleware._rate_limit_key(req)
     assert "user:anonymous" in key
@@ -53,7 +57,9 @@ def test_rate_limit_key_falls_back_to_anonymous_when_token_invalid():
 
 
 def test_rate_limit_ignores_x_forwarded_for_when_proxy_not_trusted():
-    middleware = RateLimitMiddleware(app=lambda *_args, **_kwargs: None, limit=10, window_seconds=60)
+    middleware = RateLimitMiddleware(
+        app=lambda *_args, **_kwargs: None, limit=10, window_seconds=60
+    )
     req = _request(
         "/api/v1/chat",
         "10.0.0.5",

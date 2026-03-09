@@ -38,16 +38,22 @@ async def test_process_summary_job_success(monkeypatch):
     monkeypatch.setattr(summary_worker_service, "load_memory", fake_load_memory)
     monkeypatch.setattr(summary_worker_service, "summarize_messages", fake_summarize)
     monkeypatch.setattr(summary_worker_service, "save_memory_if_version", fake_save_if_version)
-    monkeypatch.setattr(summary_worker_service, "get_summary_job_idempotency_key", lambda _fields: "idem-1")
+    monkeypatch.setattr(
+        summary_worker_service, "get_summary_job_idempotency_key", lambda _fields: "idem-1"
+    )
     monkeypatch.setattr(summary_worker_service, "is_summary_job_processed", lambda _key: False)
-    monkeypatch.setattr(summary_worker_service, "claim_summary_job_processing", lambda _key, _stream_id: True)
+    monkeypatch.setattr(
+        summary_worker_service, "claim_summary_job_processing", lambda _key, _stream_id: True
+    )
     monkeypatch.setattr(
         summary_worker_service,
         "mark_summary_job_processed",
         lambda key, stream_id: marked.append((key, stream_id)),
     )
     monkeypatch.setattr(summary_worker_service, "release_summary_job_processing", lambda _key: None)
-    monkeypatch.setattr(summary_worker_service, "ack_summary_job", lambda stream_id: acked.append(stream_id))
+    monkeypatch.setattr(
+        summary_worker_service, "ack_summary_job", lambda stream_id: acked.append(stream_id)
+    )
     monkeypatch.setattr(
         summary_worker_service,
         "retry_or_dlq_summary_job",
@@ -83,16 +89,22 @@ async def test_process_summary_job_stale_acks_without_retry(monkeypatch):
         return memory
 
     monkeypatch.setattr(summary_worker_service, "load_memory", fake_load_memory)
-    monkeypatch.setattr(summary_worker_service, "get_summary_job_idempotency_key", lambda _fields: "idem-2")
+    monkeypatch.setattr(
+        summary_worker_service, "get_summary_job_idempotency_key", lambda _fields: "idem-2"
+    )
     monkeypatch.setattr(summary_worker_service, "is_summary_job_processed", lambda _key: False)
-    monkeypatch.setattr(summary_worker_service, "claim_summary_job_processing", lambda _key, _stream_id: True)
+    monkeypatch.setattr(
+        summary_worker_service, "claim_summary_job_processing", lambda _key, _stream_id: True
+    )
     monkeypatch.setattr(
         summary_worker_service,
         "mark_summary_job_processed",
         lambda key, stream_id: marked.append((key, stream_id)),
     )
     monkeypatch.setattr(summary_worker_service, "release_summary_job_processing", lambda _key: None)
-    monkeypatch.setattr(summary_worker_service, "ack_summary_job", lambda stream_id: acked.append(stream_id))
+    monkeypatch.setattr(
+        summary_worker_service, "ack_summary_job", lambda stream_id: acked.append(stream_id)
+    )
     monkeypatch.setattr(
         summary_worker_service,
         "retry_or_dlq_summary_job",
@@ -123,16 +135,24 @@ async def test_process_summary_job_retries_on_error(monkeypatch):
 
     monkeypatch.setattr(summary_worker_service, "load_memory", fake_load_memory)
     monkeypatch.setattr(summary_worker_service, "summarize_messages", fake_summarize)
-    monkeypatch.setattr(summary_worker_service, "get_summary_job_idempotency_key", lambda _fields: "idem-3")
+    monkeypatch.setattr(
+        summary_worker_service, "get_summary_job_idempotency_key", lambda _fields: "idem-3"
+    )
     monkeypatch.setattr(summary_worker_service, "is_summary_job_processed", lambda _key: False)
-    monkeypatch.setattr(summary_worker_service, "claim_summary_job_processing", lambda _key, _stream_id: True)
-    monkeypatch.setattr(summary_worker_service, "mark_summary_job_processed", lambda _key, _stream_id: None)
+    monkeypatch.setattr(
+        summary_worker_service, "claim_summary_job_processing", lambda _key, _stream_id: True
+    )
+    monkeypatch.setattr(
+        summary_worker_service, "mark_summary_job_processed", lambda _key, _stream_id: None
+    )
     monkeypatch.setattr(
         summary_worker_service,
         "release_summary_job_processing",
         lambda key: released.append(key),
     )
-    monkeypatch.setattr(summary_worker_service, "ack_summary_job", lambda stream_id: acked.append(stream_id))
+    monkeypatch.setattr(
+        summary_worker_service, "ack_summary_job", lambda stream_id: acked.append(stream_id)
+    )
     monkeypatch.setattr(
         summary_worker_service,
         "retry_or_dlq_summary_job",
@@ -158,16 +178,22 @@ async def test_process_summary_job_skips_replayed_job(monkeypatch):
         raise AssertionError("load_memory should not run for replayed jobs")
 
     monkeypatch.setattr(summary_worker_service, "load_memory", should_not_load)
-    monkeypatch.setattr(summary_worker_service, "get_summary_job_idempotency_key", lambda _fields: "idem-4")
+    monkeypatch.setattr(
+        summary_worker_service, "get_summary_job_idempotency_key", lambda _fields: "idem-4"
+    )
     monkeypatch.setattr(summary_worker_service, "is_summary_job_processed", lambda _key: True)
     monkeypatch.setattr(
         summary_worker_service,
         "claim_summary_job_processing",
         lambda _key, _stream_id: (_ for _ in ()).throw(AssertionError("should not claim")),
     )
-    monkeypatch.setattr(summary_worker_service, "mark_summary_job_processed", lambda _key, _stream_id: None)
+    monkeypatch.setattr(
+        summary_worker_service, "mark_summary_job_processed", lambda _key, _stream_id: None
+    )
     monkeypatch.setattr(summary_worker_service, "release_summary_job_processing", lambda _key: None)
-    monkeypatch.setattr(summary_worker_service, "ack_summary_job", lambda stream_id: acked.append(stream_id))
+    monkeypatch.setattr(
+        summary_worker_service, "ack_summary_job", lambda stream_id: acked.append(stream_id)
+    )
     monkeypatch.setattr(
         summary_worker_service,
         "retry_or_dlq_summary_job",

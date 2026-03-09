@@ -133,7 +133,8 @@ async def test_build_context_enqueues_summary_job(monkeypatch):
         lambda **kwargs: {
             "summary": kwargs["summary"],
             "messages": kwargs["messages"],
-            "final_context": kwargs["messages"] + [{"role": "user", "content": kwargs["new_user_message"]}],
+            "final_context": kwargs["messages"]
+            + [{"role": "user", "content": kwargs["new_user_message"]}],
             "final_tokens": 1,
             "memory_changed": False,
             "events": [],

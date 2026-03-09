@@ -59,8 +59,7 @@ jobs:
         run: black --check .
 
       - name: Flake8
-        run: flake8 app tests
+        run: flake8 --max-line-length=100 --extend-ignore=E203,W503,E402,E501 app tests
 
       - name: Pytest
         run: pytest -q
-

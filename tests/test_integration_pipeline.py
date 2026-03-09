@@ -216,7 +216,8 @@ def test_api_to_queue_to_worker_to_memory_update(monkeypatch):
         lambda **kwargs: {
             "summary": kwargs["summary"],
             "messages": kwargs["messages"],
-            "final_context": kwargs["messages"] + [{"role": "user", "content": kwargs["new_user_message"]}],
+            "final_context": kwargs["messages"]
+            + [{"role": "user", "content": kwargs["new_user_message"]}],
             "final_tokens": 10,
             "memory_changed": False,
             "events": [],

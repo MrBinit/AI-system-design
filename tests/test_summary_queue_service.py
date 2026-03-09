@@ -102,8 +102,12 @@ def test_retry_or_dlq_summary_job_triggers_dlq_monitor(monkeypatch):
 
     acked = []
     monitored = []
-    monkeypatch.setattr(summary_queue_service, "ack_summary_job", lambda stream_id: acked.append(stream_id))
-    monkeypatch.setattr(summary_queue_service, "monitor_summary_dlq", lambda: monitored.append(True))
+    monkeypatch.setattr(
+        summary_queue_service, "ack_summary_job", lambda stream_id: acked.append(stream_id)
+    )
+    monkeypatch.setattr(
+        summary_queue_service, "monitor_summary_dlq", lambda: monitored.append(True)
+    )
 
     summary_queue_service.retry_or_dlq_summary_job(
         "7-0",

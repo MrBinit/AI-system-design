@@ -47,9 +47,12 @@ def redact_sensitive_content(text: str) -> str:
     redacted = _EMAIL_RE.sub("[REDACTED_EMAIL]", redacted)
     redacted = _PHONE_RE.sub("[REDACTED_PHONE]", redacted)
     redacted = _OPENAI_KEY_RE.sub("[REDACTED_API_KEY]", redacted)
-    redacted = _AZURE_KEY_ASSIGN_RE.sub(lambda m: m.group(0).split(m.group(1))[0] + "[REDACTED_API_KEY]", redacted)
+    redacted = _AZURE_KEY_ASSIGN_RE.sub(
+        lambda m: m.group(0).split(m.group(1))[0] + "[REDACTED_API_KEY]", redacted
+    )
     redacted = _CARD_RE.sub("[REDACTED_CARD]", redacted)
     return redacted
+
 
 def guard_user_input(user_id: str, prompt: str) -> dict:
     """Validate and sanitize user input before it reaches memory or the LLM."""
@@ -93,7 +96,9 @@ def apply_context_guardrails(messages: list[dict]) -> dict:
             continue
 
         content = redact_sensitive_content(content)
-        if role != "system" and _matches_any_pattern(content, settings.guardrails.injection_patterns):
+        if role != "system" and _matches_any_pattern(
+            content, settings.guardrails.injection_patterns
+        ):
             injection_detected = True
             content = "[Potential prompt-injection content removed.]"
         elif role == "user" and not _is_in_domain(content):
@@ -119,6 +124,7 @@ def apply_context_guardrails(messages: list[dict]) -> dict:
         logger.info("GuardrailContextSanitized | reason=prompt_injection_detected")
 
     return {"blocked": False, "messages": cleaned, "reason": ""}
+
 
 def guard_model_output(text: str) -> dict:
     """Validate and sanitize model output before returning it to the caller."""

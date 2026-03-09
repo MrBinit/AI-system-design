@@ -223,9 +223,20 @@ def _infer_entity_type(chunk: str, section_heading: str, degree_level: str) -> s
         return "program"
     if "prof. dr." in lowered or heading_lower == "faculty highlights":
         return "faculty"
-    if heading_lower.endswith((" lab", " group")) or "research lab" in lowered or "research group" in lowered:
+    if (
+        heading_lower.endswith((" lab", " group"))
+        or "research lab" in lowered
+        or "research group" in lowered
+    ):
         return "lab"
-    if heading_lower in {"admission requirements", "program description", "program overview", "core courses", "electives", "thesis"}:
+    if heading_lower in {
+        "admission requirements",
+        "program description",
+        "program overview",
+        "core courses",
+        "electives",
+        "thesis",
+    }:
         return "program_section"
     return "university_section"
 
@@ -336,10 +347,7 @@ def _merge_tiny_chunks_forward(
     joiner = "\n\n"
     while index < len(chunks):
         current = chunks[index]
-        if (
-            len(current) < merge_below_chars
-            and index + 1 < len(chunks)
-        ):
+        if len(current) < merge_below_chars and index + 1 < len(chunks):
             combined = f"{current}{joiner}{chunks[index + 1]}".strip()
             if len(combined) <= chunk_size_chars:
                 merged.append(combined)

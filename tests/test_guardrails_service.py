@@ -25,7 +25,9 @@ def test_apply_context_guardrails_filters_injection_and_prepends_policy():
     assert result["blocked"] is False
     assert result["messages"][0]["role"] == "system"
     assert "safety" in result["messages"][0]["content"].lower()
-    assert any("Potential prompt-injection content removed" in m["content"] for m in result["messages"])
+    assert any(
+        "Potential prompt-injection content removed" in m["content"] for m in result["messages"]
+    )
 
 
 def test_guard_model_output_redacts_and_blocks():

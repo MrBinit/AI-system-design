@@ -81,7 +81,9 @@ def _normalize_memory(raw_memory: dict | None) -> dict:
     seq_counter = 1
     cleaned_messages = []
 
-    for msg in raw_memory.get("messages", []) if isinstance(raw_memory.get("messages"), list) else []:
+    for msg in (
+        raw_memory.get("messages", []) if isinstance(raw_memory.get("messages"), list) else []
+    ):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
@@ -142,7 +144,9 @@ async def load_memory(user_id: str) -> dict:
 
     parsed, ok = _deserialize_memory_payload(raw)
     if not ok:
-        logger.warning("Corrupted encrypted memory payload for user_id=%s; resetting memory.", user_id)
+        logger.warning(
+            "Corrupted encrypted memory payload for user_id=%s; resetting memory.", user_id
+        )
     return parsed
 
 
@@ -326,7 +330,9 @@ async def update_memory(user_id: str, user_message: str, assistant_reply: str):
         user_seq = candidate["next_seq"]
         assistant_seq = user_seq + 1
         candidate["messages"].append({"seq": user_seq, "role": "user", "content": user_message})
-        candidate["messages"].append({"seq": assistant_seq, "role": "assistant", "content": assistant_reply})
+        candidate["messages"].append(
+            {"seq": assistant_seq, "role": "assistant", "content": assistant_reply}
+        )
         candidate["next_seq"] = assistant_seq + 1
         candidate["version"] = expected_version + 1
 

@@ -15,6 +15,7 @@ if tiktoken is not None:
     except Exception as exc:  # pragma: no cover
         logger.warning("Failed to initialize tiktoken; using fallback token counter. %s", exc)
 
+
 def count_tokens(messages: list) -> int:
     """Estimate token usage for a list of chat messages."""
     total = 0

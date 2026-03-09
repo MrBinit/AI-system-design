@@ -5,7 +5,11 @@ from app.services import retrieval_service
 
 def test_retrieve_document_chunks_returns_results_with_timing(monkeypatch):
     monkeypatch.setattr(retrieval_service, "embed_text", lambda query: [0.1, 0.2, 0.3])
-    monkeypatch.setattr(retrieval_service, "resolve_document_chunk_search_strategy", lambda filters: "filtered_exact")
+    monkeypatch.setattr(
+        retrieval_service,
+        "resolve_document_chunk_search_strategy",
+        lambda filters: "filtered_exact",
+    )
     monkeypatch.setattr(
         retrieval_service,
         "search_document_chunks",
