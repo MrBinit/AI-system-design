@@ -40,27 +40,18 @@ async def _process_message(message: dict) -> None:
 
 async def run_forever() -> None:
     if not settings.queue.metrics_aggregation_queue_enabled:
-        logger.warning(
-            "MetricsAggregationWorkerDisabled | METRICS_AGGREGATION_QUEUE_ENABLED=false"
-        )
+        logger.warning("MetricsAggregationWorkerDisabled | METRICS_AGGREGATION_QUEUE_ENABLED=false")
     while True:
         if not settings.queue.metrics_aggregation_queue_enabled:
-            await asyncio.sleep(
-                max(1.0, settings.queue.metrics_aggregation_poll_sleep_seconds)
-            )
+            await asyncio.sleep(max(1.0, settings.queue.metrics_aggregation_poll_sleep_seconds))
             continue
 
         queue_url = settings.queue.metrics_aggregation_queue_url.strip()
         if not queue_url:
             logger.warning(
-                (
-                    "MetricsAggregationWorkerMisconfigured | "
-                    "METRICS_AGGREGATION_QUEUE_URL missing"
-                )
+                ("MetricsAggregationWorkerMisconfigured | " "METRICS_AGGREGATION_QUEUE_URL missing")
             )
-            await asyncio.sleep(
-                max(1.0, settings.queue.metrics_aggregation_poll_sleep_seconds)
-            )
+            await asyncio.sleep(max(1.0, settings.queue.metrics_aggregation_poll_sleep_seconds))
             continue
 
         try:
@@ -75,15 +66,11 @@ async def run_forever() -> None:
             )
         except Exception:
             logger.exception("MetricsAggregationWorkerPollFailed")
-            await asyncio.sleep(
-                max(1.0, settings.queue.metrics_aggregation_poll_sleep_seconds)
-            )
+            await asyncio.sleep(max(1.0, settings.queue.metrics_aggregation_poll_sleep_seconds))
             continue
 
         if not messages:
-            await asyncio.sleep(
-                max(0.0, settings.queue.metrics_aggregation_poll_sleep_seconds)
-            )
+            await asyncio.sleep(max(0.0, settings.queue.metrics_aggregation_poll_sleep_seconds))
             continue
 
         for message in messages:

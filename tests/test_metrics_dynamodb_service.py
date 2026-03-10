@@ -11,9 +11,7 @@ class _FakeDynamoClient:
 
 def test_persist_chat_metrics_dynamodb_writes_request_and_aggregate(monkeypatch):
     fake = _FakeDynamoClient()
-    monkeypatch.setattr(
-        metrics_dynamodb_service.settings.app, "metrics_dynamodb_enabled", True
-    )
+    monkeypatch.setattr(metrics_dynamodb_service.settings.app, "metrics_dynamodb_enabled", True)
     monkeypatch.setattr(
         metrics_dynamodb_service.settings.app,
         "metrics_dynamodb_requests_table",
@@ -74,9 +72,7 @@ def test_persist_chat_metrics_dynamodb_writes_request_and_aggregate(monkeypatch)
 
 def test_persist_chat_metrics_dynamodb_skips_when_disabled(monkeypatch):
     fake = _FakeDynamoClient()
-    monkeypatch.setattr(
-        metrics_dynamodb_service.settings.app, "metrics_dynamodb_enabled", False
-    )
+    monkeypatch.setattr(metrics_dynamodb_service.settings.app, "metrics_dynamodb_enabled", False)
     monkeypatch.setattr(metrics_dynamodb_service, "_dynamodb_client", lambda: fake)
 
     metrics_dynamodb_service.persist_chat_metrics_dynamodb(
@@ -89,9 +85,7 @@ def test_persist_chat_metrics_dynamodb_skips_when_disabled(monkeypatch):
 def test_persist_chat_metrics_dynamodb_queues_aggregate_when_enabled(monkeypatch):
     fake = _FakeDynamoClient()
     queued = []
-    monkeypatch.setattr(
-        metrics_dynamodb_service.settings.app, "metrics_dynamodb_enabled", True
-    )
+    monkeypatch.setattr(metrics_dynamodb_service.settings.app, "metrics_dynamodb_enabled", True)
     monkeypatch.setattr(
         metrics_dynamodb_service.settings.app,
         "metrics_dynamodb_requests_table",
@@ -149,9 +143,7 @@ def test_persist_chat_metrics_dynamodb_queues_aggregate_when_enabled(monkeypatch
 def test_persist_chat_metrics_dynamodb_queues_eval_event(monkeypatch):
     fake = _FakeDynamoClient()
     eval_events = []
-    monkeypatch.setattr(
-        metrics_dynamodb_service.settings.app, "metrics_dynamodb_enabled", True
-    )
+    monkeypatch.setattr(metrics_dynamodb_service.settings.app, "metrics_dynamodb_enabled", True)
     monkeypatch.setattr(
         metrics_dynamodb_service.settings.app,
         "metrics_dynamodb_requests_table",
@@ -167,9 +159,7 @@ def test_persist_chat_metrics_dynamodb_queues_eval_event(monkeypatch):
         "metrics_aggregation_queue_enabled",
         False,
     )
-    monkeypatch.setattr(
-        metrics_dynamodb_service.settings.queue, "evaluation_queue_enabled", True
-    )
+    monkeypatch.setattr(metrics_dynamodb_service.settings.queue, "evaluation_queue_enabled", True)
     monkeypatch.setattr(
         metrics_dynamodb_service.settings.queue,
         "evaluation_queue_url",

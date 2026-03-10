@@ -47,9 +47,7 @@ async def run_forever() -> None:
 
         queue_url = settings.queue.evaluation_queue_url.strip()
         if not queue_url:
-            logger.warning(
-                "EvaluationQueueWorkerMisconfigured | EVALUATION_QUEUE_URL missing"
-            )
+            logger.warning("EvaluationQueueWorkerMisconfigured | EVALUATION_QUEUE_URL missing")
             await asyncio.sleep(max(1.0, settings.queue.evaluation_poll_sleep_seconds))
             continue
 
@@ -59,9 +57,7 @@ async def run_forever() -> None:
                 queue_url=queue_url,
                 max_messages=settings.queue.evaluation_max_messages_per_poll,
                 wait_seconds=settings.queue.evaluation_receive_wait_seconds,
-                visibility_timeout_seconds=(
-                    settings.queue.evaluation_visibility_timeout_seconds
-                ),
+                visibility_timeout_seconds=(settings.queue.evaluation_visibility_timeout_seconds),
             )
         except Exception:
             logger.exception("EvaluationQueueWorkerPollFailed")

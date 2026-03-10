@@ -15,9 +15,7 @@ class QueueConfig(BaseModel):
     metrics_aggregation_queue_url: str = ""
     metrics_aggregation_receive_wait_seconds: int = Field(default=20, ge=0, le=20)
     metrics_aggregation_max_messages_per_poll: int = Field(default=10, ge=1, le=10)
-    metrics_aggregation_visibility_timeout_seconds: int = Field(
-        default=300, ge=0, le=43200
-    )
+    metrics_aggregation_visibility_timeout_seconds: int = Field(default=300, ge=0, le=43200)
     metrics_aggregation_poll_sleep_seconds: float = Field(default=1.0, ge=0.0, le=60.0)
     evaluation_queue_enabled: bool = False
     evaluation_queue_url: str = ""

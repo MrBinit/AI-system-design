@@ -58,9 +58,7 @@ def _dynamodb_client():
     try:
         import boto3
     except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
-            "boto3 is required for DynamoDB metrics persistence."
-        ) from exc
+        raise RuntimeError("boto3 is required for DynamoDB metrics persistence.") from exc
     kwargs = {"region_name": _region_name()} if _region_name() else {}
     return boto3.client("dynamodb", **kwargs)
 
@@ -94,17 +92,15 @@ def _persist_request_record(record: dict) -> None:
     timings = record.get("timings_ms", {})
     if not isinstance(timings, dict):
         timings = {}
-    retrieval = (
-        record.get("retrieval", {}) if isinstance(record.get("retrieval"), dict) else {}
-    )
-    llm_usage = (
-        record.get("llm_usage", {}) if isinstance(record.get("llm_usage"), dict) else {}
-    )
-    evidence = (
-        retrieval.get("evidence", [])
-        if isinstance(retrieval.get("evidence"), list)
-        else []
-    )
+    retrieval = record.get("retrieval", {})
+    if not isinstance(retrieval, dict):
+        retrieval = {}
+    llm_usage = record.get("llm_usage", {})
+    if not isinstance(llm_usage, dict):
+        llm_usage = {}
+    evidence = retrieval.get("evidence", [])
+    if not isinstance(evidence, list):
+        evidence = []
     item = {
         "request_id": {"S": request_id},
         "timestamp": {"S": str(record.get("timestamp", _now_iso()))},
@@ -114,9 +110,7 @@ def _persist_request_record(record: dict) -> None:
         "retrieval_strategy": {"S": str(retrieval.get("strategy", ""))},
         "retrieval_result_count": {"N": _int_str(retrieval.get("result_count"))},
         "retrieval_evidence_count": {"N": _int_str(len(evidence))},
-        "retrieval_evidence_json": {
-            "S": json.dumps(evidence, ensure_ascii=False, default=str)
-        },
+        "retrieval_evidence_json": {"S": json.dumps(evidence, ensure_ascii=False, default=str)},
         "query": {"S": str(record.get("question", ""))},
         "answer": {"S": str(record.get("answer", ""))},
         "latency_overall_ms": {"N": _int_str(timings.get("overall_response_ms"))},
@@ -128,9 +122,7 @@ def _persist_request_record(record: dict) -> None:
         "record_json": {"S": json.dumps(record, ensure_ascii=False, default=str)},
     }
     if settings.app.metrics_dynamodb_ttl_days > 0:
-        item["expires_at"] = {
-            "N": str(_ttl_epoch_seconds(settings.app.metrics_dynamodb_ttl_days))
-        }
+        item["expires_at"] = {"N": str(_ttl_epoch_seconds(settings.app.metrics_dynamodb_ttl_days))}
 
     _dynamodb_client().put_item(TableName=table_name, Item=item)
 
@@ -143,9 +135,9 @@ def _persist_aggregate_snapshot(aggregate: dict | None) -> None:
 
     latency_raw = aggregate.get("latency_ms", {})
     latency = latency_raw if isinstance(latency_raw, dict) else {}
-    overall_latency = (
-        latency.get("overall", {}) if isinstance(latency.get("overall"), dict) else {}
-    )
+    overall_latency = latency.get("overall", {})
+    if not isinstance(overall_latency, dict):
+        overall_latency = {}
     item = {
         "id": {"S": "global"},
         "updated_at": {"S": str(aggregate.get("updated_at", _now_iso()))},
@@ -154,9 +146,7 @@ def _persist_aggregate_snapshot(aggregate: dict | None) -> None:
         "aggregate_json": {"S": json.dumps(aggregate, ensure_ascii=False, default=str)},
     }
     if settings.app.metrics_dynamodb_ttl_days > 0:
-        item["expires_at"] = {
-            "N": str(_ttl_epoch_seconds(settings.app.metrics_dynamodb_ttl_days))
-        }
+        item["expires_at"] = {"N": str(_ttl_epoch_seconds(settings.app.metrics_dynamodb_ttl_days))}
 
     _dynamodb_client().put_item(TableName=table_name, Item=item)
 
