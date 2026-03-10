@@ -54,7 +54,7 @@ Per-request top-level attributes include:
 Offline evaluation results are stored in a separate table keyed by `request_id`:
 - Evaluations table: `unigraph-chat-evaluations`
 - Judge model: Amazon Nova 2 Lite (`us.amazon.nova-2-lite-v1:0`)
-- Stored fields include `clarity_score`, `relevance_score`, `hallucination_score`, `answered_question`, `failure_reason`, and `overall_score`.
+- Stored fields include `clarity_score`, `relevance_score`, `hallucination_score`, `evidence_similarity_score`, `answered_question`, `failure_reason`, and `overall_score`.
 
 ## 4) Guardrails, Security, and Scalability
 - Input/context/output guardrails enabled.
@@ -110,7 +110,28 @@ Offline evaluation results are stored in a separate table keyed by `request_id`:
 - Live request path no longer computes hallucination/clarity/relevance metrics.
 - Quality scoring now runs asynchronously from stored request records and writes results to a separate DynamoDB evaluation table by `request_id`.
 - Each request now stores a compact retrieval evidence snapshot (top retrieved chunks, ids, metadata, distances, trimmed content) and offline hallucination checks are grounded against that evidence.
+- Offline evaluation uses three separate LLM-as-judge prompts (clarity, relevance, hallucination) with Nova 2 Lite.
 - Daily reporting computes p50/p95, failure-reason distribution, and top low-score examples.
 - Evaluation can be triggered two ways:
   - on-demand API run (`POST /api/v1/eval/offline/run?force=true`)
   - scheduled background run every 24 hours (configurable) that executes only when new successful requests exist.
+
+## 8) Evaluation Pipeline (Detailed)
+
+Reference: `docs/evaluation-pipeline.md`
+
+Pipeline:
+
+`request + retrieval evidence snapshot`
+-> `DynamoDB requests table`
+-> `offline evaluator scan`
+-> `judge(clarity)`
+-> `judge(relevance)`
+-> `judge(hallucination vs retrieval evidence)`
+-> `aggregate scoring + failure reason`
+-> `DynamoDB evaluations table`
+-> `p50/p95 report`
+
+Prompts and model:
+- prompts file: `app/config/evaluation_prompt.yaml`
+- model config: `app/config/evaluation_config.yaml` (`evaluation.judge_model_id`)

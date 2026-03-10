@@ -13,6 +13,7 @@ Files in this folder:
 - `long-term-memory.md`: long-term retrieval architecture, pgvector experiments, and HNSW rationale.
 - `redis.md`: Redis topology, namespaces, clients, key patterns, and queue usage.
 - `ops.md`: operational status endpoint and the metrics it exposes.
+- `evaluation-pipeline.md`: end-to-end offline evaluation architecture (evidence capture, judge prompts, scoring, storage, reports).
 - `system-overview.md`: concise end-to-end architecture, Bedrock-based generation/retrieval flow, security/scalability, and latest performance snapshot.
 - `strategy.md`: current architecture state and the recommended next build steps.
 
@@ -26,5 +27,6 @@ Recommended reading order:
 6. `long-term-memory.md`
 7. `redis.md`
 8. `ops.md`
-9. `system-overview.md`
-10. `strategy.md`
+9. `evaluation-pipeline.md`
+10. `system-overview.md`
+11. `strategy.md`
