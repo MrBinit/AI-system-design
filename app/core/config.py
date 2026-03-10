@@ -97,6 +97,10 @@ def _apply_env_overrides(data: dict) -> dict:
     _set(["app", "docs_enabled"], "APP_DOCS_ENABLED", bool)
     _set(["app", "metrics_json_enabled"], "APP_METRICS_JSON_ENABLED", bool)
     _set(["app", "metrics_json_dir"], "APP_METRICS_JSON_DIR")
+    _set(["app", "metrics_dynamodb_enabled"], "APP_METRICS_DYNAMODB_ENABLED", bool)
+    _set(["app", "metrics_dynamodb_requests_table"], "APP_METRICS_DYNAMODB_REQUESTS_TABLE")
+    _set(["app", "metrics_dynamodb_aggregate_table"], "APP_METRICS_DYNAMODB_AGGREGATE_TABLE")
+    _set(["app", "metrics_dynamodb_ttl_days"], "APP_METRICS_DYNAMODB_TTL_DAYS", int)
 
     _set(["security", "auth_enabled"], "SECURITY_AUTH_ENABLED", bool)
     _set(["security", "jwt_secret"], "SECURITY_JWT_SECRET")

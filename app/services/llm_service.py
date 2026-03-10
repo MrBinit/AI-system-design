@@ -102,6 +102,7 @@ def _build_json_metrics_record(
     return {
         "request_id": request_id,
         "user_id": user_id,
+        "session_id": user_id,
         "question": user_prompt,
         "question_sanitized": safe_user_prompt,
         "answer": answer,

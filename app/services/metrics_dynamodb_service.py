@@ -1,0 +1,115 @@
+import json
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+
+from app.core.config import get_settings
+
+settings = get_settings()
+logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _ttl_epoch_seconds(ttl_days: int) -> int:
+    expires_at = datetime.now(timezone.utc) + timedelta(days=ttl_days)
+    return int(expires_at.timestamp())
+
+
+def _region_name() -> str | None:
+    region = (
+        os.getenv("AWS_REGION", "").strip()
+        or os.getenv("AWS_DEFAULT_REGION", "").strip()
+        or os.getenv("AWS_SECRETS_MANAGER_REGION", "").strip()
+    )
+    return region or None
+
+
+@lru_cache()
+def _dynamodb_client():
+    try:
+        import boto3
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("boto3 is required for DynamoDB metrics persistence.") from exc
+    kwargs = {"region_name": _region_name()} if _region_name() else {}
+    return boto3.client("dynamodb", **kwargs)
+
+
+def _int_str(value) -> str:
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _float_str(value) -> str:
+    try:
+        return str(float(value))
+    except (TypeError, ValueError):
+        return "0.0"
+
+
+def _persist_request_record(record: dict) -> None:
+    table_name = settings.app.metrics_dynamodb_requests_table.strip()
+    if not table_name:
+        return
+
+    request_id = str(record.get("request_id", "")).strip()
+    if not request_id:
+        return
+
+    timings = record.get("timings_ms", {}) if isinstance(record.get("timings_ms"), dict) else {}
+    item = {
+        "request_id": {"S": request_id},
+        "timestamp": {"S": str(record.get("timestamp", _now_iso()))},
+        "user_id": {"S": str(record.get("user_id", ""))},
+        "session_id": {"S": str(record.get("session_id") or record.get("user_id", ""))},
+        "outcome": {"S": str(record.get("outcome", "unknown"))},
+        "query": {"S": str(record.get("question", ""))},
+        "answer": {"S": str(record.get("answer", ""))},
+        "latency_overall_ms": {"N": _int_str(timings.get("overall_response_ms"))},
+        "latency_llm_ms": {"N": _int_str(timings.get("llm_response_ms"))},
+        "latency_short_term_ms": {"N": _int_str(timings.get("short_term_memory_ms"))},
+        "latency_long_term_ms": {"N": _int_str(timings.get("long_term_memory_ms"))},
+        "record_json": {"S": json.dumps(record, ensure_ascii=False, default=str)},
+    }
+    if settings.app.metrics_dynamodb_ttl_days > 0:
+        item["expires_at"] = {"N": str(_ttl_epoch_seconds(settings.app.metrics_dynamodb_ttl_days))}
+
+    _dynamodb_client().put_item(TableName=table_name, Item=item)
+
+
+def _persist_aggregate_snapshot(aggregate: dict | None) -> None:
+    table_name = settings.app.metrics_dynamodb_aggregate_table.strip()
+    if not table_name or not isinstance(aggregate, dict):
+        return
+
+    latency_raw = aggregate.get("latency_ms", {})
+    latency = latency_raw if isinstance(latency_raw, dict) else {}
+    overall_latency = latency.get("overall", {}) if isinstance(latency.get("overall"), dict) else {}
+    item = {
+        "id": {"S": "global"},
+        "updated_at": {"S": str(aggregate.get("updated_at", _now_iso()))},
+        "total_requests": {"N": _int_str(aggregate.get("total_requests"))},
+        "overall_avg_latency_ms": {"N": _float_str(overall_latency.get("average"))},
+        "aggregate_json": {"S": json.dumps(aggregate, ensure_ascii=False, default=str)},
+    }
+    if settings.app.metrics_dynamodb_ttl_days > 0:
+        item["expires_at"] = {"N": str(_ttl_epoch_seconds(settings.app.metrics_dynamodb_ttl_days))}
+
+    _dynamodb_client().put_item(TableName=table_name, Item=item)
+
+
+def persist_chat_metrics_dynamodb(record: dict, aggregate: dict | None = None) -> None:
+    """Persist request and aggregate metrics payloads into DynamoDB tables."""
+    if not settings.app.metrics_dynamodb_enabled:
+        return
+
+    try:
+        _persist_request_record(record)
+        _persist_aggregate_snapshot(aggregate)
+    except Exception as exc:
+        logger.warning("DynamoDB metrics persistence failed; continuing. %s", exc)

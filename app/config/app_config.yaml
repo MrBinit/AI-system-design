@@ -4,3 +4,7 @@ app:
   docs_enabled: false
   metrics_json_enabled: true
   metrics_json_dir: "data/metrics"
+  metrics_dynamodb_enabled: true
+  metrics_dynamodb_requests_table: "unigraph-chat-metrics-requests"
+  metrics_dynamodb_aggregate_table: "unigraph-chat-metrics-aggregate"
+  metrics_dynamodb_ttl_days: 30

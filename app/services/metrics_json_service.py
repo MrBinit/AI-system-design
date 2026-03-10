@@ -6,6 +6,7 @@ from pathlib import Path
 
 from app.core.config import get_settings
 from app.core.paths import resolve_project_path
+from app.services.metrics_dynamodb_service import persist_chat_metrics_dynamodb
 
 settings = get_settings()
 
@@ -145,6 +146,7 @@ def _save_aggregate(path: Path, payload: dict) -> None:
 def _normalize_request_record(record: dict) -> dict:
     payload = dict(record) if isinstance(record, dict) else {}
     payload["timestamp"] = payload.get("timestamp") or _now_iso()
+    payload["session_id"] = payload.get("session_id") or payload.get("user_id", "")
     return payload
 
 
@@ -251,15 +253,17 @@ def _update_aggregate_payload(aggregate: dict, record: dict) -> dict:
 
 
 def append_chat_metrics_json(record: dict) -> None:
-    """Persist per-request chat metrics to JSONL and update aggregate JSON summaries."""
-    if not settings.app.metrics_json_enabled:
-        return
-
+    """Persist per-request chat metrics to JSON and optionally DynamoDB."""
     normalized = _normalize_request_record(record)
-    _append_request_record(normalized)
+    aggregate = None
 
-    aggregate_path = _aggregate_json_path()
-    with _aggregate_lock():
-        aggregate = _load_aggregate(aggregate_path)
-        aggregate = _update_aggregate_payload(aggregate, normalized)
-        _save_aggregate(aggregate_path, aggregate)
+    if settings.app.metrics_json_enabled:
+        _append_request_record(normalized)
+
+        aggregate_path = _aggregate_json_path()
+        with _aggregate_lock():
+            aggregate = _load_aggregate(aggregate_path)
+            aggregate = _update_aggregate_payload(aggregate, normalized)
+            _save_aggregate(aggregate_path, aggregate)
+
+    persist_chat_metrics_dynamodb(normalized, aggregate)
