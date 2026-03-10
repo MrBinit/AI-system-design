@@ -3,9 +3,7 @@ import logging
 import time
 from typing import AsyncIterator
 from uuid import uuid4
-
 from redis.exceptions import RedisError
-
 from app.core.config import get_prompts, get_settings
 from app.infra.azure_openai_client import client
 from app.infra.redis_client import app_scoped_key, redis_client
@@ -136,7 +134,7 @@ def _build_json_metrics_record(
             "output_reason": output_guard_reason,
         },
         "model": {
-            "provider": "azure_openai",
+            "provider": "amazon_bedrock",
             "used_fallback": used_fallback_model,
             "primary_deployment": settings.azure_openai.primary_deployment,
             "fallback_deployment": settings.azure_openai.fallback_deployment,
