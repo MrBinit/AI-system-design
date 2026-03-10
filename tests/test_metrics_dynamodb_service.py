@@ -30,7 +30,11 @@ def test_persist_chat_metrics_dynamodb_writes_request_and_aggregate(monkeypatch)
         "user_id": "user-1",
         "session_id": "session-1",
         "outcome": "success",
-        "retrieval": {"strategy": "hnsw", "result_count": 3},
+        "retrieval": {
+            "strategy": "hnsw",
+            "result_count": 3,
+            "evidence": [{"chunk_id": "c-1", "content": "sample"}],
+        },
         "llm_usage": {"prompt_tokens": 120, "total_tokens": 280},
         "question": "question",
         "answer": "answer",
@@ -59,6 +63,8 @@ def test_persist_chat_metrics_dynamodb_writes_request_and_aggregate(monkeypatch)
     assert request_write["Item"]["request_id"]["S"] == "req-1"
     assert request_write["Item"]["session_id"]["S"] == "session-1"
     assert request_write["Item"]["retrieval_strategy"]["S"] == "hnsw"
+    assert request_write["Item"]["retrieval_result_count"]["N"] == "3"
+    assert request_write["Item"]["retrieval_evidence_count"]["N"] == "1"
     assert request_write["Item"]["prompt_tokens"]["N"] == "120"
     assert request_write["Item"]["total_tokens"]["N"] == "280"
     assert aggregate_write["Item"]["id"]["S"] == "global"

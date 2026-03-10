@@ -25,11 +25,6 @@ def test_append_chat_metrics_json_writes_request_and_aggregate(tmp_path, monkeyp
                 "cache_write_ms": 3,
                 "evaluation_trace_ms": 4,
             },
-            "quality": {
-                "hallucination_proxy": 0.2,
-                "context_coverage": 0.8,
-                "query_relevance": 0.9,
-            },
             "llm_usage": {
                 "prompt_tokens": 10,
                 "completion_tokens": 20,
@@ -56,7 +51,7 @@ def test_append_chat_metrics_json_writes_request_and_aggregate(tmp_path, monkeyp
     assert aggregate["latency_ms"]["overall"]["average"] == 120.0
     assert aggregate["latency_ms"]["overall"]["p95"] == 120.0
     assert aggregate["latency_ms"]["overall"]["p99"] == 120.0
-    assert aggregate["quality"]["hallucination_proxy"]["average"] == 0.2
+    assert "quality" not in aggregate
     assert aggregate["token_usage"]["requests_with_usage"] == 1
     assert aggregate["token_usage"]["total_tokens_total"] == 30
     assert aggregate["latest_request"]["request_id"] == "req-1"

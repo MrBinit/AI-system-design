@@ -14,6 +14,10 @@ from app.middlewares.route_matching import RouteMatchingMiddleware
 from app.middlewares.timeout import TimeoutMiddleware
 from app.infra.postgres_client import get_postgres_pool
 from app.infra.redis_client import app_redis_client
+from app.services.offline_evaluation_service import (
+    start_offline_eval_scheduler,
+    stop_offline_eval_scheduler,
+)
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -62,6 +66,12 @@ def create_app() -> FastAPI:
                 logger.info("StartupWarmup | postgres=ok")
             except Exception as exc:
                 logger.warning("StartupWarmup | postgres=failed | error=%s", exc)
+
+        start_offline_eval_scheduler()
+
+    @app.on_event("shutdown")
+    async def stop_background_jobs():
+        await stop_offline_eval_scheduler()
 
     if settings.middleware.enable_route_matching:
         app.add_middleware(RouteMatchingMiddleware)

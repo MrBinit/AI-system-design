@@ -101,6 +101,15 @@ def _apply_env_overrides(data: dict) -> dict:
     _set(["app", "metrics_dynamodb_requests_table"], "APP_METRICS_DYNAMODB_REQUESTS_TABLE")
     _set(["app", "metrics_dynamodb_aggregate_table"], "APP_METRICS_DYNAMODB_AGGREGATE_TABLE")
     _set(["app", "metrics_dynamodb_ttl_days"], "APP_METRICS_DYNAMODB_TTL_DAYS", int)
+    _set(["evaluation", "enabled"], "EVALUATION_ENABLED", bool)
+    _set(["evaluation", "dynamodb_table"], "EVALUATION_DYNAMODB_TABLE")
+    _set(["evaluation", "judge_model_id"], "EVALUATION_JUDGE_MODEL_ID")
+    _set(["evaluation", "batch_size"], "EVALUATION_BATCH_SIZE", int)
+    _set(["evaluation", "max_items_per_run"], "EVALUATION_MAX_ITEMS_PER_RUN", int)
+    _set(["evaluation", "lookback_hours"], "EVALUATION_LOOKBACK_HOURS", int)
+    _set(["evaluation", "ttl_days"], "EVALUATION_TTL_DAYS", int)
+    _set(["evaluation", "schedule_enabled"], "EVALUATION_SCHEDULE_ENABLED", bool)
+    _set(["evaluation", "schedule_interval_hours"], "EVALUATION_SCHEDULE_INTERVAL_HOURS", int)
 
     _set(["security", "auth_enabled"], "SECURITY_AUTH_ENABLED", bool)
     _set(["security", "jwt_secret"], "SECURITY_JWT_SECRET")
@@ -212,4 +221,11 @@ def get_settings() -> Settings:
 def get_prompts() -> dict:
     """Load and cache prompt definitions from the prompt config file."""
     prompt_path = APP_CONFIG_DIR / "prompt.yaml"
+    return _load_yaml_file(prompt_path)
+
+
+@lru_cache()
+def get_evaluation_prompts() -> dict:
+    """Load and cache offline evaluator (LLM-as-judge) prompts."""
+    prompt_path = APP_CONFIG_DIR / "evaluation_prompt.yaml"
     return _load_yaml_file(prompt_path)

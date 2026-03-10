@@ -5,7 +5,7 @@ This module stores:
 2) a singleton aggregate snapshot item (`id=global`) in the configured aggregate table.
 
 The request item includes selected top-level attributes for easy querying
-(`session_id`, `outcome`, `latency_overall_ms`, `retrieval_strategy`, token usage)
+(`session_id`, `outcome`, `latency_overall_ms`, `retrieval_strategy`, evidence counts, token usage)
 plus a full-fidelity `record_json` payload.
 """
 
@@ -81,6 +81,7 @@ def _persist_request_record(record: dict) -> None:
     timings = record.get("timings_ms", {}) if isinstance(record.get("timings_ms"), dict) else {}
     retrieval = record.get("retrieval", {}) if isinstance(record.get("retrieval"), dict) else {}
     llm_usage = record.get("llm_usage", {}) if isinstance(record.get("llm_usage"), dict) else {}
+    evidence = retrieval.get("evidence", []) if isinstance(retrieval.get("evidence"), list) else []
     item = {
         "request_id": {"S": request_id},
         "timestamp": {"S": str(record.get("timestamp", _now_iso()))},
@@ -88,6 +89,9 @@ def _persist_request_record(record: dict) -> None:
         "session_id": {"S": str(record.get("session_id") or record.get("user_id", ""))},
         "outcome": {"S": str(record.get("outcome", "unknown"))},
         "retrieval_strategy": {"S": str(retrieval.get("strategy", ""))},
+        "retrieval_result_count": {"N": _int_str(retrieval.get("result_count"))},
+        "retrieval_evidence_count": {"N": _int_str(len(evidence))},
+        "retrieval_evidence_json": {"S": json.dumps(evidence, ensure_ascii=False, default=str)},
         "query": {"S": str(record.get("question", ""))},
         "answer": {"S": str(record.get("answer", ""))},
         "latency_overall_ms": {"N": _int_str(timings.get("overall_response_ms"))},

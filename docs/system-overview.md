@@ -16,6 +16,7 @@ Verified runtime order (`app/services/llm_service.py`):
 -> `Short-Term Memory Update`
 -> `Response Cache Write`
 -> `Evaluation Trace (background async task, non-blocking)`
+-> `Offline Judge Evaluation (separate async worker, per request_id)`
 -> `Metrics Persistence (JSON + DynamoDB)`
 
 Memory-first view:
@@ -49,6 +50,11 @@ Per-request top-level attributes include:
 - `latency_overall_ms`, `latency_llm_ms`, `retrieval_strategy`
 - `prompt_tokens`, `total_tokens`
 - `record_json` (full JSON payload)
+
+Offline evaluation results are stored in a separate table keyed by `request_id`:
+- Evaluations table: `unigraph-chat-evaluations`
+- Judge model: Amazon Nova 2 Lite (`us.amazon.nova-2-lite-v1:0`)
+- Stored fields include `clarity_score`, `relevance_score`, `hallucination_score`, `answered_question`, `failure_reason`, and `overall_score`.
 
 ## 4) Guardrails, Security, and Scalability
 - Input/context/output guardrails enabled.
@@ -99,3 +105,12 @@ Per-request top-level attributes include:
 - Generation was previously run on Azure OpenAI (explored first), and was shifted to AWS Bedrock to address high response latency.
 - After migration and latency tuning, successful request latency dropped sharply versus earlier baseline runs (for example, previous successful LLM latencies in this project were often in the ~18-30s range; latest successful Bedrock sample is ~3.1s).
 - Current remaining risk is access/IAM rollout stability, not pipeline stage latency.
+
+### D) Evaluation strategy shift
+- Live request path no longer computes hallucination/clarity/relevance metrics.
+- Quality scoring now runs asynchronously from stored request records and writes results to a separate DynamoDB evaluation table by `request_id`.
+- Each request now stores a compact retrieval evidence snapshot (top retrieved chunks, ids, metadata, distances, trimmed content) and offline hallucination checks are grounded against that evidence.
+- Daily reporting computes p50/p95, failure-reason distribution, and top low-score examples.
+- Evaluation can be triggered two ways:
+  - on-demand API run (`POST /api/v1/eval/offline/run?force=true`)
+  - scheduled background run every 24 hours (configurable) that executes only when new successful requests exist.

@@ -84,11 +84,6 @@ def _default_aggregate() -> dict:
             "cache_write": _series_template(),
             "evaluation_trace": _series_template(),
         },
-        "quality": {
-            "hallucination_proxy": _series_template(),
-            "context_coverage": _series_template(),
-            "query_relevance": _series_template(),
-        },
         "token_usage": {
             "requests_with_usage": 0,
             "prompt_tokens_total": 0,
@@ -243,23 +238,6 @@ def _update_aggregate_payload(aggregate: dict, record: dict) -> dict:
     _update_series(
         latency.setdefault("evaluation_trace", _series_template()),
         timings.get("evaluation_trace_ms"),
-    )
-
-    quality = record.get("quality", {})
-    if not isinstance(quality, dict):
-        quality = {}
-    quality_summary = aggregate.setdefault("quality", {})
-    _update_series(
-        quality_summary.setdefault("hallucination_proxy", _series_template()),
-        quality.get("hallucination_proxy"),
-    )
-    _update_series(
-        quality_summary.setdefault("context_coverage", _series_template()),
-        quality.get("context_coverage"),
-    )
-    _update_series(
-        quality_summary.setdefault("query_relevance", _series_template()),
-        quality.get("query_relevance"),
     )
 
     usage = record.get("llm_usage", {})

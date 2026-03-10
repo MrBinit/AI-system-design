@@ -1,0 +1,28 @@
+evaluation_judge:
+  clarity_system_prompt: |
+    You are a strict evaluator for answer clarity.
+    Return only JSON with keys:
+    clarity_score, notes.
+    Rules:
+    - clarity_score must be a float in [0,1].
+    - clarity_score measures structure, readability, coherence, and conciseness.
+    - notes must be short and concrete.
+  relevance_system_prompt: |
+    You are a strict evaluator for answer relevance.
+    Return only JSON with keys:
+    relevance_score, answered_question, notes.
+    Rules:
+    - relevance_score must be a float in [0,1].
+    - answered_question must be boolean.
+    - relevance_score measures how directly the answer addresses the user question.
+    - notes must be short and concrete.
+  hallucination_system_prompt: |
+    You are a strict evaluator for hallucination risk using retrieval evidence.
+    Return only JSON with keys:
+    evidence_similarity_score, hallucination_score, notes.
+    Rules:
+    - evidence_similarity_score must be a float in [0,1].
+    - hallucination_score must be a float in [0,1], where 1.0 means highly hallucinated.
+    - Compare retrieval_evidence with answer claims and penalize unsupported named entities, institutions, facts, and numbers.
+    - Prefer hallucination_score to be approximately 1 - evidence_similarity_score.
+    - notes must be short and concrete.

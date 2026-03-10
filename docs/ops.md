@@ -116,8 +116,8 @@ When `APP_METRICS_JSON_ENABLED=true`, each chat request is persisted to JSON for
 
 Output files under `APP_METRICS_JSON_DIR`:
 
-- `chat_metrics_requests.jsonl`: one event per request (question, answer, latency breakdown, quality metrics, usage, outcome).
-- `chat_metrics_aggregate.json`: rolling totals and averages for latency, quality, outcomes, and token usage.
+- `chat_metrics_requests.jsonl`: one event per request (question, answer, latency breakdown, usage, outcome).
+- `chat_metrics_aggregate.json`: rolling totals and averages for latency, outcomes, and token usage.
 
 Latency percentile notes:
 
@@ -167,6 +167,70 @@ Aggregate item storage model:
 - full payload:
   - `aggregate_json` (entire aggregate snapshot as JSON string)
 
+## Offline Evaluation (Separate Table)
+
+Live request handling does not compute hallucination/clarity/relevance metrics.
+Those quality metrics are generated asynchronously and stored by `request_id` in a dedicated evaluation table.
+
+Config (`app/config/evaluation_config.yaml`):
+
+- `evaluation.enabled`
+- `evaluation.dynamodb_table`
+- `evaluation.judge_model_id`
+- `evaluation.lookback_hours`
+- `evaluation.max_items_per_run`
+- `evaluation.schedule_enabled`
+- `evaluation.schedule_interval_hours`
+- `evaluation.judge_model_id` is the LLM-as-judge model ID (default Bedrock Nova 2 Lite: `us.amazon.nova-2-lite-v1:0`)
+
+Judge prompt config:
+
+- file: `app/config/evaluation_prompt.yaml`
+- keys:
+  - `evaluation_judge.clarity_system_prompt`
+  - `evaluation_judge.relevance_system_prompt`
+  - `evaluation_judge.hallucination_system_prompt`
+
+Evaluation table shape:
+
+- table: `evaluation.dynamodb_table` (for example `unigraph-chat-evaluations`)
+- partition key: `request_id` (String)
+- one item per evaluated request
+- hallucination scoring is grounded against request-time retrieval evidence snapshot
+
+Scripts:
+
+- worker/backfill run:
+  - `python -m app.scripts.eval_dynamodb_worker --limit 200`
+- daily report:
+  - `python -m app.scripts.eval_daily_report --hours 24 --top-bad 10`
+
+API endpoints (admin):
+
+- scheduler status:
+  - `GET /api/v1/eval/offline/status`
+- run now (bypass interval/new-data guard with `force=true`):
+  - `POST /api/v1/eval/offline/run?force=true&limit=50`
+- run guarded (only if interval reached and new requests exist):
+  - `POST /api/v1/eval/offline/run`
+- on-demand report JSON:
+  - `GET /api/v1/eval/offline/report?hours=24&top_bad=10`
+
+Scheduling behavior:
+
+- background scheduler runs every `evaluation.schedule_interval_hours` (default 24h)
+- each run only evaluates when:
+  - there are new successful request records after the latest evaluated timestamp
+  - and the interval gate is reached
+- manual `force=true` always runs immediately
+
+Daily report output:
+
+- p50/p95 for `clarity_score`, `relevance_score`, `hallucination_score`, and `overall_score`
+- p50/p95 for `evidence_similarity_score`
+- failure reason distribution
+- top low-score examples
+
 TTL behavior:
 
 - if `APP_METRICS_DYNAMODB_TTL_DAYS > 0`, items include `expires_at` (epoch seconds)
@@ -178,7 +242,7 @@ Verification examples:
 aws dynamodb scan \
   --region us-east-1 \
   --table-name unigraph-chat-metrics-requests \
-  --projection-expression "request_id,timestamp,outcome,session_id,latency_overall_ms,retrieval_strategy,prompt_tokens,total_tokens" \
+  --projection-expression "request_id,timestamp,outcome,session_id,latency_overall_ms,retrieval_strategy,retrieval_evidence_count,prompt_tokens,total_tokens" \
   --max-items 5
 
 aws dynamodb get-item \

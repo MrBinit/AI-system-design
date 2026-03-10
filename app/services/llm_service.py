@@ -16,7 +16,6 @@ from app.services.guardrails_service import (
 )
 from app.services.memory_service import build_context, update_memory
 from app.services.metrics_json_service import append_chat_metrics_json
-from app.services.quality_metrics_service import generation_metrics
 from app.services.retrieval_service import aretrieve_document_chunks
 
 settings = get_settings()
@@ -29,6 +28,8 @@ _RETRIEVAL_QUERY_MAX_CHARS = 900
 _RETRIEVAL_CONTEXT_MAX_CHARS = 1500
 _RETRIEVAL_CHUNK_MAX_CHARS = 360
 _RETRIEVAL_MAX_PROMPT_RESULTS = 2
+_RETRIEVAL_EVIDENCE_MAX_ITEMS = 3
+_RETRIEVAL_EVIDENCE_CONTENT_MAX_CHARS = 700
 
 
 async def _redis_call(method, *args, **kwargs):
@@ -94,6 +95,7 @@ def _build_json_metrics_record(
     evaluation_trace_ms: int | None,
     retrieval_strategy: str,
     retrieved_count: int,
+    retrieval_evidence: list[dict] | None,
     quality: dict,
     llm_usage: dict,
     input_guard_reason: str,
@@ -124,6 +126,7 @@ def _build_json_metrics_record(
         "retrieval": {
             "strategy": retrieval_strategy,
             "result_count": retrieved_count,
+            "evidence": retrieval_evidence or [],
         },
         "quality": quality,
         "hallucination_proxy": quality.get("hallucination_proxy"),
@@ -260,6 +263,33 @@ def _format_retrieval_context(retrieval_result: dict) -> dict | None:
     return {"role": "system", "content": joined[:_RETRIEVAL_CONTEXT_MAX_CHARS]}
 
 
+def _build_retrieval_evidence(results: list[dict]) -> list[dict]:
+    """Build compact retrieval evidence for grounded hallucination evaluation."""
+    if not isinstance(results, list):
+        return []
+
+    evidence: list[dict] = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        content = str(result.get("content", "")).strip()
+        if not content:
+            continue
+        metadata = result.get("metadata")
+        evidence.append(
+            {
+                "chunk_id": str(result.get("chunk_id", "")),
+                "source_path": str(result.get("source_path", "")),
+                "distance": result.get("distance"),
+                "metadata": metadata if isinstance(metadata, dict) else {},
+                "content": " ".join(content.split())[:_RETRIEVAL_EVIDENCE_CONTENT_MAX_CHARS],
+            }
+        )
+        if len(evidence) >= _RETRIEVAL_EVIDENCE_MAX_ITEMS:
+            break
+    return evidence
+
+
 def _track_background_task(task: asyncio.Task, *, label: str) -> None:
     """Track and log fire-and-forget tasks so they are not silently lost."""
     _BACKGROUND_TASKS.add(task)
@@ -335,6 +365,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
     retrieval_strategy = "none"
     retrieved_count = 0
     retrieved_results: list[dict] = []
+    retrieval_evidence: list[dict] = []
     llm_usage: dict = {}
     quality: dict = {}
     input_guard_reason = ""
@@ -369,6 +400,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
                 evaluation_trace_ms=evaluation_trace_ms,
                 retrieval_strategy=retrieval_strategy,
                 retrieved_count=retrieved_count,
+                retrieval_evidence=retrieval_evidence,
                 quality=quality,
                 llm_usage=llm_usage,
                 input_guard_reason=input_guard_reason,
@@ -412,6 +444,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
                 evaluation_trace_ms=evaluation_trace_ms,
                 retrieval_strategy=retrieval_strategy,
                 retrieved_count=retrieved_count,
+                retrieval_evidence=retrieval_evidence,
                 quality=quality,
                 llm_usage=llm_usage,
                 input_guard_reason=input_guard_reason,
@@ -441,6 +474,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
             if isinstance(results, list):
                 retrieved_results = results
                 retrieved_count = len(results)
+                retrieval_evidence = _build_retrieval_evidence(results)
             retrieval_message = _format_retrieval_context(retrieval_result)
             if retrieval_message:
                 messages = [retrieval_message] + messages
@@ -486,6 +520,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
                 evaluation_trace_ms=evaluation_trace_ms,
                 retrieval_strategy=retrieval_strategy,
                 retrieved_count=retrieved_count,
+                retrieval_evidence=retrieval_evidence,
                 quality=quality,
                 llm_usage=llm_usage,
                 input_guard_reason=input_guard_reason,
@@ -528,6 +563,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
                         evaluation_trace_ms=evaluation_trace_ms,
                         retrieval_strategy=retrieval_strategy,
                         retrieved_count=retrieved_count,
+                        retrieval_evidence=retrieval_evidence,
                         quality=quality,
                         llm_usage=llm_usage,
                         input_guard_reason=input_guard_reason,
@@ -599,15 +635,9 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
     )
     evaluation_trace_ms = _elapsed_ms(evaluation_trace_started_at)
 
-    try:
-        quality = generation_metrics(
-            query=user_prompt,
-            answer=result,
-            retrieved_results=retrieved_results,
-        )
-    except Exception as exc:
-        quality = {}
-        logger.warning("Quality metrics computation failed; skipping metrics. %s", exc)
+    # Online path no longer computes hallucination/relevance metrics.
+    # These are evaluated asynchronously by a separate evaluator job.
+    quality = {}
 
     await _record_pipeline_stage_metrics(
         build_context_ms=build_context_ms or 0,
@@ -646,6 +676,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
             evaluation_trace_ms=evaluation_trace_ms,
             retrieval_strategy=retrieval_strategy,
             retrieved_count=retrieved_count,
+            retrieval_evidence=retrieval_evidence,
             quality=quality,
             llm_usage=llm_usage,
             input_guard_reason=input_guard_reason,

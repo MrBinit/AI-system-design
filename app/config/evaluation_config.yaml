@@ -1,0 +1,10 @@
+evaluation:
+  enabled: true
+  dynamodb_table: "unigraph-chat-evaluations"
+  judge_model_id: "us.amazon.nova-2-lite-v1:0"
+  batch_size: 25
+  max_items_per_run: 200
+  lookback_hours: 24
+  ttl_days: 30
+  schedule_enabled: true
+  schedule_interval_hours: 24

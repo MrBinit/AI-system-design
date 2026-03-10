@@ -49,3 +49,37 @@ class EvaluationReportResponse(BaseModel):
     retrieval_metrics: dict = Field(default_factory=dict)
     generation_metrics: dict = Field(default_factory=dict)
     conversations: list[EvaluationConversationItem] = Field(default_factory=list)
+
+
+class OfflineEvaluationStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    schedule_enabled: bool
+    interval_hours: int = Field(ge=1)
+    has_new_requests: bool
+    due_by_interval: bool
+    should_auto_run: bool
+    last_request_timestamp: str = ""
+    last_evaluated_timestamp: str = ""
+    reason: str = ""
+
+
+class OfflineEvaluationRunResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ran: bool
+    reason: str
+    result: dict = Field(default_factory=dict)
+    status: OfflineEvaluationStatusResponse | None = None
+
+
+class OfflineEvaluationReportResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    generated_at: str
+    window_hours: int = Field(ge=1)
+    evaluated_count: int = Field(ge=0)
+    scores: dict = Field(default_factory=dict)
+    failure_reasons: dict = Field(default_factory=dict)
+    top_bad_examples: list[dict] = Field(default_factory=list)

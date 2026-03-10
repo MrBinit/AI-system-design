@@ -112,7 +112,7 @@ async def test_generate_response_uses_primary_and_updates_memory(monkeypatch):
     assert captured_metrics[-1]["timings_ms"]["llm_response_ms"] is not None
     assert captured_metrics[-1]["timings_ms"]["short_term_memory_ms"] is not None
     assert captured_metrics[-1]["timings_ms"]["long_term_memory_ms"] is not None
-    assert "hallucination_proxy" in captured_metrics[-1]["quality"]
+    assert captured_metrics[-1]["quality"] == {}
 
 
 @pytest.mark.asyncio
