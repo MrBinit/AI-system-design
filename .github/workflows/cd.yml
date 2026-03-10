@@ -99,7 +99,7 @@ jobs:
           AWS_SECRETS_MANAGER_REGION: ${{ vars.AWS_SECRETS_MANAGER_REGION || vars.AWS_REGION || env.AWS_REGION }}
           AWS_SECRETS_MANAGER_SECRET_ID: ${{ vars.AWS_SECRETS_MANAGER_SECRET_ID }}
           API_WORKERS: ${{ vars.API_WORKERS || '1' }}
-          EC2_APP_DIR: ${{ vars.EC2_APP_DIR || '~/AI-system-design' }}
+          EC2_APP_DIR: ${{ vars.EC2_APP_DIR || '/home/ubuntu/AI-system-design' }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
@@ -109,6 +109,10 @@ jobs:
           envs: APP_IMAGE,GRADIO_IMAGE,AWS_REGION,AWS_SECRETS_MANAGER_REGION,AWS_SECRETS_MANAGER_SECRET_ID,API_WORKERS,EC2_APP_DIR
           script: |
             set -euo pipefail
+
+            if [[ "${EC2_APP_DIR}" == ~* ]]; then
+              EC2_APP_DIR="${HOME}${EC2_APP_DIR:1}"
+            fi
 
             cd "${EC2_APP_DIR}"
             git fetch origin main

@@ -28,7 +28,7 @@ Add these in `Settings -> Secrets and variables -> Actions -> Variables`:
 - `AWS_SECRETS_MANAGER_REGION` (usually same as region)
 - `AWS_SECRETS_MANAGER_SECRET_ID` (for example `unigraph/prod/app`)
 - `API_WORKERS` (for example `1`)
-- `EC2_APP_DIR` (for example `~/AI-system-design`)
+- `EC2_APP_DIR` (for example `/home/ubuntu/AI-system-design`)
 
 ## 3) GitHub Environment Protection (Recommended)
 
