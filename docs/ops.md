@@ -107,6 +107,12 @@ Local gate behavior:
 - local admission and release are atomic; there is no private semaphore pre-check
 - if a request is rejected by the local gate after distributed admission, the Redis lease token is released immediately
 
+Circuit breaker behavior:
+
+- Bedrock generation calls use per-model circuit breakers (`llm:<model_id>`)
+- Bedrock embedding calls use an embedding circuit breaker (`embedding`)
+- after repeated failures (`circuit.fail_max`), requests fail fast until reset window (`circuit.reset_timeout`) elapses
+
 ## Current Alerting
 
 DLQ alerting is log-based right now.

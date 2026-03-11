@@ -8,6 +8,7 @@ from pathlib import Path
 from app.core.config import get_settings
 from app.core.paths import resolve_project_path
 from app.infra.bedrock_client import ainvoke_model_json, get_bedrock_runtime_client
+from app.infra.circuit import get_embedding_breaker
 from app.infra.io_limiters import dependency_limiter
 from app.infra.redis_client import app_scoped_key, async_redis_client, redis_client
 
@@ -157,7 +158,8 @@ def embed_text(text: str) -> list[float]:
         return cached_embedding
 
     client = get_bedrock_runtime_client()
-    response = client.invoke_model(
+    response = get_embedding_breaker().call(
+        client.invoke_model,
         modelId=settings.embedding.model_id,
         body=json.dumps({"inputText": truncated}),
         contentType="application/json",

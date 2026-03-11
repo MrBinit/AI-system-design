@@ -72,6 +72,7 @@ Offline evaluation results are stored in a separate table keyed by `request_id`:
 - JWT authentication (`HS256`) enabled.
 - Distributed rate limiting + backpressure via Redis.
 - Local backpressure fallback uses an atomic lock+counter gate (no private semaphore internals), so local admission/rejection is race-safe under concurrency.
+- Circuit breakers are wired on Bedrock model generation (per model id) and embedding calls to fail fast during repeated downstream outages.
 - Timeout middleware enabled for request protection.
 - Secrets Manager integration for sensitive runtime values.
 - TLS for ElastiCache and hardened production containers.

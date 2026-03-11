@@ -18,6 +18,15 @@ class _FakeBedrockClient:
         }
 
 
+class _FakeBreaker:
+    def __init__(self):
+        self.calls = []
+
+    def call(self, fn, *args, **kwargs):
+        self.calls.append((fn, args, kwargs))
+        return fn(*args, **kwargs)
+
+
 class _FakeRedis:
     def __init__(self, initial=None):
         self.store = dict(initial or {})
@@ -82,6 +91,26 @@ def test_embed_text_caches_embedding_on_miss(monkeypatch):
     assert cache_key == embedding_service._embedding_cache_key("cache miss")
     assert ttl == embedding_service.settings.embedding.cache_ttl_seconds
     assert json.loads(payload) == [4.0, 5.0, 6.0]
+
+
+def test_embed_text_uses_embedding_circuit_breaker(monkeypatch):
+    fake_redis = _FakeRedis()
+    fake_breaker = _FakeBreaker()
+    monkeypatch.setattr(embedding_service, "redis_client", fake_redis)
+    monkeypatch.setattr(embedding_service, "get_embedding_breaker", lambda: fake_breaker)
+    monkeypatch.setattr(
+        embedding_service,
+        "get_bedrock_runtime_client",
+        lambda: _FakeBedrockClient([1.5, 2.5, 3.5]),
+    )
+
+    vector = embedding_service.embed_text("breaker path")
+
+    assert vector == [1.5, 2.5, 3.5]
+    assert len(fake_breaker.calls) == 1
+    _fn, _args, kwargs = fake_breaker.calls[0]
+    assert kwargs["modelId"] == embedding_service.settings.embedding.model_id
+    assert json.loads(kwargs["body"]) == {"inputText": "breaker path"}
 
 
 def test_embed_chunk_manifest_writes_embedding_output(tmp_path: Path, monkeypatch):

@@ -6,6 +6,7 @@ from typing import Any
 import boto3
 
 from app.core.config import get_settings
+from app.infra.circuit import get_embedding_breaker, get_llm_breaker
 
 settings = get_settings()
 _bedrock_runtime_client = None
@@ -40,7 +41,8 @@ async def aconverse(payload: dict[str, Any], *, timeout: int | None = None) -> d
 
     def _invoke():
         client = get_bedrock_runtime_client()
-        return client.converse(**payload)
+        model_id = str(payload.get("modelId", "")).strip() or "default"
+        return get_llm_breaker(model_id).call(client.converse, **payload)
 
     return await _run_in_bedrock_executor(_invoke, timeout=timeout)
 
@@ -54,7 +56,7 @@ async def ainvoke_model(
 
     def _invoke():
         client = get_bedrock_runtime_client()
-        return client.invoke_model(**payload)
+        return get_embedding_breaker().call(client.invoke_model, **payload)
 
     return await _run_in_bedrock_executor(_invoke, timeout=timeout)
 
@@ -68,7 +70,7 @@ async def ainvoke_model_json(
 
     def _invoke_and_decode():
         client = get_bedrock_runtime_client()
-        response = client.invoke_model(**payload)
+        response = get_embedding_breaker().call(client.invoke_model, **payload)
         raw_body = response.get("body").read()
         if isinstance(raw_body, bytes):
             raw_body = raw_body.decode("utf-8")
