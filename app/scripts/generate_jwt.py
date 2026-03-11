@@ -18,6 +18,11 @@ def main():
         default=None,
         help="Optional token expiration override in minutes.",
     )
+    parser.add_argument(
+        "--audience",
+        default=None,
+        help="Optional audience override. Defaults to SECURITY_JWT_AUDIENCE.",
+    )
     args = parser.parse_args()
 
     roles = [role.strip() for role in args.roles.split(",") if role.strip()]
@@ -25,6 +30,7 @@ def main():
         user_id=args.user_id,
         roles=roles or ["user"],
         expires_minutes=args.expires_minutes,
+        audience=args.audience,
     )
     print(token)
 

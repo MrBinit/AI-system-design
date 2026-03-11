@@ -1,6 +1,6 @@
+import hashlib
 import pytest
 from app.services import llm_service
-from app.infra.redis_client import app_scoped_key
 
 
 @pytest.fixture(autouse=True)
@@ -45,7 +45,7 @@ class FakeResponse:
 @pytest.mark.asyncio
 async def test_generate_response_returns_cache_hit(monkeypatch):
     fake_redis = FakeRedis()
-    cache_key = app_scoped_key("cache", "chat", "user-1", "find ai professor")
+    cache_key = llm_service._chat_cache_key("user-1", "find ai professor")
     fake_redis.store[cache_key] = "from-cache"
     _attach_fake_redis(monkeypatch, fake_redis)
 
@@ -109,7 +109,7 @@ async def test_generate_response_uses_primary_and_updates_memory(monkeypatch):
     assert result == "primary-response"
     assert memory_updates == [("user-1", "find ai professor", "primary-response")]
     assert retrieval_queries[0][0] == "find ai professor"
-    cache_key = app_scoped_key("cache", "chat", "user-1", "find ai professor")
+    cache_key = llm_service._chat_cache_key("user-1", "find ai professor")
     assert fake_redis.store[cache_key] == "primary-response"
     assert captured_metrics[-1]["question"] == "find ai professor"
     assert captured_metrics[-1]["answer"] == "primary-response"
@@ -291,7 +291,7 @@ async def test_generate_response_stream_primary_success(monkeypatch):
         outputs.append(partial)
 
     assert outputs == ["he", "hello"]
-    cache_key = app_scoped_key("cache", "chat", "user-1", "hello")
+    cache_key = llm_service._chat_cache_key("user-1", "hello")
     assert fake_redis.store[cache_key] == "hello"
 
 
@@ -347,3 +347,12 @@ async def test_generate_response_stream_uses_fallback_on_primary_failure(monkeyp
         outputs.append(partial)
 
     assert outputs == ["fallback"]
+
+
+def test_chat_cache_key_uses_hash_without_raw_prompt_text():
+    prompt = "my secret prompt text"
+    cache_key = llm_service._chat_cache_key("user-1", prompt)
+
+    assert prompt not in cache_key
+    assert "sha256:" in cache_key
+    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() in cache_key

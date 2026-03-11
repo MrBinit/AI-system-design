@@ -23,6 +23,7 @@ Token claims:
 - `sub`: user id
 - `roles`: role list
 - `iss`: issuer
+- `aud`: audience
 - `iat`: issued-at timestamp
 - `exp`: expiration timestamp
 
@@ -31,6 +32,7 @@ Config:
 - `jwt_secret`
 - `jwt_algorithm`
 - `jwt_issuer`
+- `jwt_audience`
 - `jwt_exp_minutes`
 
 Secret source:
@@ -41,6 +43,7 @@ Secret source:
 Operational note:
 
 - production startup validates secret strength and rejects placeholder/default values
+- token validation enforces both issuer (`iss`) and audience (`aud`) checks
 - in production, use environment secrets or a secret manager
 
 ## Authorization
@@ -124,9 +127,9 @@ Short-term memory payloads are encrypted before being written to Redis.
 
 Current implementation:
 
-- a custom stream-style encryption layer built from HMAC-SHA256-derived keystream blocks
-- HMAC-SHA256 authentication tag
-- stored payload prefix: `enc:v1:`
+- standard AEAD encryption with AES-GCM
+- stored payload prefix: `enc:v2:`
+- authenticated decryption rejects tampered payloads
 
 Key source:
 
@@ -134,14 +137,15 @@ Key source:
 - startup rejects missing, weak, or reused key material
 - key must be different from JWT signing secret
 
-Important note:
+Compatibility note:
 
-- this protects Redis contents from casual inspection
-- for stronger production-grade cryptography, replace this with a standard AEAD library such as AES-GCM or ChaCha20-Poly1305 when dependency installation is available
+- `enc:v1:` payloads remain readable during migration
+- legacy plaintext JSON payloads remain readable for backward compatibility
+- all new writes use `enc:v2:`
 
 ### Evaluation Trace Encryption
 
-Evaluation traces (including prompt/answer content) are encrypted before storage in Redis using the same `enc:v1:` envelope.
+Evaluation traces (including prompt/answer content) are encrypted before storage in Redis using the same `enc:v2:` envelope.
 
 Compatibility:
 
@@ -175,6 +179,6 @@ This reduces blast radius if one runtime is compromised.
 Remaining hardening items:
 
 - move secrets out of YAML in all production deployments
-- replace custom memory crypto with standard AEAD
+- add key rotation/versioning policy for memory encryption keys
 - add external audit logging and security event aggregation
 - add stricter Redis ACL command restrictions per role

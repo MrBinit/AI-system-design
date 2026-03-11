@@ -54,6 +54,7 @@ def create_access_token(
     user_id: str,
     roles: list[str] | None = None,
     expires_minutes: int | None = None,
+    audience: str | None = None,
 ) -> str:
     """Create a signed JWT access token for the given user and roles."""
     now = datetime.now(timezone.utc)
@@ -62,6 +63,7 @@ def create_access_token(
         "sub": user_id,
         "roles": roles or ["user"],
         "iss": settings.security.jwt_issuer,
+        "aud": audience or settings.security.jwt_audience,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=exp_minutes)).timestamp()),
     }
@@ -75,7 +77,8 @@ def decode_access_token(token: str) -> dict:
         _secret_key(),
         algorithms=[settings.security.jwt_algorithm],
         issuer=settings.security.jwt_issuer,
-        options={"verify_aud": False},
+        audience=settings.security.jwt_audience,
+        options={"verify_aud": True},
     )
 
 

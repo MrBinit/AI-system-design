@@ -3,5 +3,6 @@ security:
   jwt_secret: "change-this-in-prod-very-secret-key"
   jwt_algorithm: "HS256"
   jwt_issuer: "ai-system"
+  jwt_audience: "ai-system-clients"
   jwt_exp_minutes: 60
   admin_roles: ["admin"]

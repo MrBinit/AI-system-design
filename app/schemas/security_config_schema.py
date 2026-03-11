@@ -6,6 +6,7 @@ class SecurityConfig(BaseModel):
     jwt_secret: str = Field(min_length=32)
     jwt_algorithm: str = "HS256"
     jwt_issuer: str = "ai-system"
+    jwt_audience: str = Field(default="ai-system-clients", min_length=1)
     jwt_exp_minutes: int = Field(default=60, ge=1, le=1440)
     admin_roles: list[str] = Field(default_factory=lambda: ["admin"])
 

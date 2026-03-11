@@ -8,3 +8,4 @@ redis==7.2.0
 psycopg[binary,pool]==3.2.6
 boto3==1.42.59
 pybreaker==1.4.1
+cryptography==44.0.3

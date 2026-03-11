@@ -44,7 +44,7 @@ def test_store_and_list_chat_traces():
 
     assert conversation_id is not None
     stored_raw = redis._kv[evaluation_service._conversation_key(conversation_id)]
-    assert stored_raw.startswith("enc:v1:")
+    assert stored_raw.startswith("enc:v2:")
     traces = evaluation_service.list_chat_traces("user-1", limit=10, redis=redis)
     assert len(traces) == 1
     assert traces[0]["conversation_id"] == conversation_id

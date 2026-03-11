@@ -46,7 +46,7 @@ Interactive streaming path (direct, non-queued):
   - `unigraph-evaluation-jobs` for per-request offline judge
   - DLQs: `unigraph-llm-jobs-dlq`, `unigraph-metrics-aggregation-jobs-dlq`, `unigraph-evaluation-jobs-dlq`
 - Caching:
-  - `app:cache:chat:{user_id}:{sanitized_prompt}`
+  - `app:cache:chat:{user_id}:sha256:{sanitized_prompt_hash}`
   - embedding cache
 - Current model path: retrieval embedding + generation both run on AWS Bedrock.
 

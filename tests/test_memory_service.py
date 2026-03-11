@@ -220,7 +220,7 @@ async def test_update_memory_appends_messages_with_seq(monkeypatch):
     await memory_service.update_memory("user-1", "hello", "hi there")
     saved_raw = fake_redis.store[_memory_key("user-1")]
     assert isinstance(saved_raw, str)
-    assert saved_raw.startswith("enc:v1:")
+    assert saved_raw.startswith("enc:v2:")
     saved, ok = memory_service._deserialize_memory_payload(saved_raw)
     assert ok is True
 

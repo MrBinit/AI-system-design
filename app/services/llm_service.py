@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import inspect
 import logging
 import time
@@ -31,6 +32,12 @@ _RETRIEVAL_CHUNK_MAX_CHARS = 360
 _RETRIEVAL_MAX_PROMPT_RESULTS = 2
 _RETRIEVAL_EVIDENCE_MAX_ITEMS = 3
 _RETRIEVAL_EVIDENCE_CONTENT_MAX_CHARS = 700
+
+
+def _chat_cache_key(user_id: str, prompt: str) -> str:
+    """Build a fixed-length chat cache key without embedding raw prompt text."""
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    return app_scoped_key("cache", "chat", user_id, f"sha256:{prompt_hash}")
 
 
 async def _redis_call(method, *args, **kwargs):
@@ -440,7 +447,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
         return refusal
 
     safe_user_prompt = str(input_guard.get("sanitized_text", user_prompt))
-    cache_key = app_scoped_key("cache", "chat", user_id, safe_user_prompt)
+    cache_key = _chat_cache_key(user_id, safe_user_prompt)
 
     # Cache lookup
     cached = None
@@ -808,7 +815,7 @@ async def generate_response_stream(
         return
 
     safe_user_prompt = str(input_guard.get("sanitized_text", user_prompt))
-    cache_key = app_scoped_key("cache", "chat", user_id, safe_user_prompt)
+    cache_key = _chat_cache_key(user_id, safe_user_prompt)
 
     cached = None
     cache_read_started_at = time.perf_counter()

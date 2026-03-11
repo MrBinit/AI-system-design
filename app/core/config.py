@@ -123,6 +123,7 @@ def _apply_env_overrides(data: dict) -> dict:
     _set(["security", "auth_enabled"], "SECURITY_AUTH_ENABLED", bool)
     _set(["security", "jwt_secret"], "SECURITY_JWT_SECRET")
     _set(["security", "jwt_issuer"], "SECURITY_JWT_ISSUER")
+    _set(["security", "jwt_audience"], "SECURITY_JWT_AUDIENCE")
     _set(["security", "jwt_exp_minutes"], "SECURITY_JWT_EXP_MINUTES", int)
 
     # Backward-compatible aliases: old AZURE_OPENAI_* vars still map into bedrock config.
