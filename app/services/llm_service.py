@@ -190,7 +190,9 @@ async def _record_pipeline_stage_metrics(
     key = _latency_metrics_key()
     try:
         await _redis_call(async_redis_client.hincrby, key, "pipeline_count", 1)
-        await _redis_call(async_redis_client.hincrby, key, "build_context_total_ms", build_context_ms)
+        await _redis_call(
+            async_redis_client.hincrby, key, "build_context_total_ms", build_context_ms
+        )
         await _redis_call(async_redis_client.hincrby, key, "retrieval_total_ms", retrieval_ms)
         await _redis_call(async_redis_client.hincrby, key, "model_total_ms", model_ms)
         await _redis_call(
