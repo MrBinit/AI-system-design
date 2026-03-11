@@ -1,7 +1,11 @@
+import asyncio
+
 from fastapi.testclient import TestClient
 
+from app.api.v1 import chat as chat_api
 from app.core.security import create_access_token
 from app.main import app
+from app.middlewares import backpressure, rate_limit
 from app.services import (
     llm_service,
     memory_metrics_service,
@@ -44,6 +48,10 @@ class FakePipeline:
             key, ttl, value = self.pending_setex
             self.redis.setex(key, ttl, value)
 
+    def reset(self):
+        self.key = None
+        self.pending_setex = None
+
 
 class FakeRedis:
     def __init__(self):
@@ -78,7 +86,7 @@ class FakeRedis:
             removed += 1
         return removed
 
-    def pipeline(self):
+    def pipeline(self, transaction=True):  # noqa: ARG002
         return FakePipeline(self)
 
     def xgroup_create(self, name, groupname, id="0", mkstream=False):
@@ -151,6 +159,50 @@ class FakeRedis:
     def expire(self, key, ttl):
         return True
 
+    def incr(self, key):
+        current = int(self.store.get(key, "0")) + 1
+        self.store[key] = str(current)
+        return current
+
+    def eval(self, script, numkeys, key, now_ms, max_in_flight, lease_seconds, token):
+        _ = (script, numkeys, key, now_ms, max_in_flight, lease_seconds, token)
+        return [1, 0]
+
+    def zrem(self, key, token):
+        _ = (key, token)
+        return 1
+
+    def lpush(self, key, *values):
+        bucket = self.store.setdefault(key, [])
+        if not isinstance(bucket, list):
+            bucket = []
+            self.store[key] = bucket
+        for value in values:
+            bucket.insert(0, value)
+        return len(bucket)
+
+    def ltrim(self, key, start, end):
+        bucket = self.store.get(key, [])
+        if not isinstance(bucket, list):
+            return True
+        if end == -1:
+            self.store[key] = bucket[start:]
+        else:
+            self.store[key] = bucket[start : end + 1]
+        return True
+
+    def lrange(self, key, start, end):
+        bucket = self.store.get(key, [])
+        if not isinstance(bucket, list):
+            return []
+        if end == -1:
+            return bucket[start:]
+        return bucket[start : end + 1]
+
+
+async def _fake_noop(*_args, **_kwargs):
+    return None
+
 
 class _Message:
     def __init__(self, content):
@@ -193,6 +245,7 @@ def _base_memory():
 
 def test_api_to_queue_to_worker_to_memory_update(monkeypatch):
     fake_redis = FakeRedis()
+    jobs = {}
 
     monkeypatch.setattr(llm_service, "redis_client", fake_redis)
     monkeypatch.setattr(llm_service, "async_redis_client", fake_redis)
@@ -202,6 +255,31 @@ def test_api_to_queue_to_worker_to_memory_update(monkeypatch):
     monkeypatch.setattr(ops_status_service, "app_redis_client", fake_redis)
     monkeypatch.setattr(summary_queue_service, "app_redis_client", fake_redis)
     monkeypatch.setattr(summary_queue_service, "worker_redis_client", fake_redis)
+    monkeypatch.setattr(rate_limit, "app_redis_client", fake_redis)
+    monkeypatch.setattr(backpressure, "app_redis_client", fake_redis)
+
+    def _fake_enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None):
+        answer = asyncio.run(llm_service.generate_response(user_id, prompt))
+        job_id = "job-0001"
+        submitted_at = "2026-03-11T00:00:00+00:00"
+        jobs[job_id] = {
+            "job_id": job_id,
+            "user_id": user_id,
+            "session_id": session_id or user_id,
+            "status": "completed",
+            "created_at": submitted_at,
+            "started_at": submitted_at,
+            "completed_at": submitted_at,
+            "answer": answer,
+            "error": "",
+        }
+        return {"job_id": job_id, "status": "queued", "submitted_at": submitted_at}
+
+    def _fake_get_chat_job(job_id: str):
+        return jobs.get(job_id)
+
+    monkeypatch.setattr(chat_api, "enqueue_chat_job", _fake_enqueue_chat_job)
+    monkeypatch.setattr(chat_api, "get_chat_job", _fake_get_chat_job)
 
     async def fake_primary(_messages):
         return FakeResponse("assistant-output")
@@ -209,7 +287,16 @@ def test_api_to_queue_to_worker_to_memory_update(monkeypatch):
     async def fake_summary(_messages):
         return "condensed summary"
 
+    async def fake_retrieval(_query: str, top_k: int = 3):
+        _ = top_k
+        return {
+            "retrieval_strategy": "none",
+            "results": [],
+        }
+
     monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieval)
+    monkeypatch.setattr(llm_service, "_persist_evaluation_trace", _fake_noop)
     monkeypatch.setattr(summary_worker_service, "summarize_messages", fake_summary)
     monkeypatch.setattr(memory_service, "safe_token_count", lambda *_args: 9999)
     monkeypatch.setattr(
@@ -237,15 +324,24 @@ def test_api_to_queue_to_worker_to_memory_update(monkeypatch):
         headers={"Authorization": f"Bearer {user_token}"},
     )
 
-    assert chat_response.status_code == 200
-    assert chat_response.json() == {"response": "assistant-output"}
+    assert chat_response.status_code == 202
+    payload = chat_response.json()
+    assert payload["job_id"] == "job-0001"
+    assert payload["status"] == "queued"
+
+    chat_status_response = client.get(
+        "/api/v1/chat/job-0001",
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert chat_status_response.status_code == 200
+    status_payload = chat_status_response.json()
+    assert status_payload["status"] == "completed"
+    assert status_payload["response"] == "assistant-output"
 
     jobs = summary_queue_service.read_summary_jobs("worker-1")
     assert len(jobs) == 1
 
     stream_id, fields = jobs[0]
-    import asyncio
-
     asyncio.run(summary_worker_service.process_summary_job(stream_id, fields))
 
     final_memory = asyncio.run(memory_service.load_memory("user-1"))

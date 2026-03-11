@@ -101,6 +101,14 @@ def _persist_request_record(record: dict) -> None:
     evidence = retrieval.get("evidence", [])
     if not isinstance(evidence, list):
         evidence = []
+    outcome = str(record.get("outcome", "unknown")).strip().lower()
+    if outcome == "success":
+        eval_status = settings.evaluation.request_pending_value
+    else:
+        eval_status = settings.evaluation.request_not_applicable_value
+    eval_status_attr = settings.evaluation.request_status_attribute.strip() or "eval_status"
+    eval_status_updated_at_attr = f"{eval_status_attr}_updated_at"
+
     item = {
         "request_id": {"S": request_id},
         "timestamp": {"S": str(record.get("timestamp", _now_iso()))},
@@ -119,6 +127,8 @@ def _persist_request_record(record: dict) -> None:
         "latency_long_term_ms": {"N": _int_str(timings.get("long_term_memory_ms"))},
         "prompt_tokens": {"N": _int_str(llm_usage.get("prompt_tokens"))},
         "total_tokens": {"N": _int_str(llm_usage.get("total_tokens"))},
+        eval_status_attr: {"S": eval_status},
+        eval_status_updated_at_attr: {"S": _now_iso()},
         "record_json": {"S": json.dumps(record, ensure_ascii=False, default=str)},
     }
     if settings.app.metrics_dynamodb_ttl_days > 0:

@@ -67,7 +67,55 @@ def test_persist_chat_metrics_dynamodb_writes_request_and_aggregate(monkeypatch)
     assert request_write["Item"]["retrieval_evidence_count"]["N"] == "1"
     assert request_write["Item"]["prompt_tokens"]["N"] == "120"
     assert request_write["Item"]["total_tokens"]["N"] == "280"
+    assert (
+        request_write["Item"][
+            metrics_dynamodb_service.settings.evaluation.request_status_attribute
+        ]["S"]
+        == metrics_dynamodb_service.settings.evaluation.request_pending_value
+    )
     assert aggregate_write["Item"]["id"]["S"] == "global"
+
+
+def test_persist_chat_metrics_dynamodb_marks_non_success_request_not_applicable(monkeypatch):
+    fake = _FakeDynamoClient()
+    monkeypatch.setattr(metrics_dynamodb_service.settings.app, "metrics_dynamodb_enabled", True)
+    monkeypatch.setattr(
+        metrics_dynamodb_service.settings.app,
+        "metrics_dynamodb_requests_table",
+        "chat-metrics-requests",
+    )
+    monkeypatch.setattr(
+        metrics_dynamodb_service.settings.app,
+        "metrics_dynamodb_aggregate_table",
+        "chat-metrics-aggregate",
+    )
+    monkeypatch.setattr(metrics_dynamodb_service, "_dynamodb_client", lambda: fake)
+
+    metrics_dynamodb_service.persist_chat_metrics_dynamodb(
+        {
+            "request_id": "req-failed-1",
+            "timestamp": "2026-03-11T00:00:00+00:00",
+            "user_id": "user-1",
+            "session_id": "session-1",
+            "outcome": "model_error",
+            "retrieval": {"strategy": "", "result_count": 0, "evidence": []},
+            "llm_usage": {"prompt_tokens": 0, "total_tokens": 0},
+            "question": "q",
+            "answer": "",
+            "timings_ms": {"overall_response_ms": 10},
+        },
+        {"updated_at": "2026-03-11T00:00:00+00:00", "total_requests": 1},
+    )
+
+    request_write = next(
+        call for call in fake.calls if call["TableName"] == "chat-metrics-requests"
+    )
+    assert (
+        request_write["Item"][
+            metrics_dynamodb_service.settings.evaluation.request_status_attribute
+        ]["S"]
+        == metrics_dynamodb_service.settings.evaluation.request_not_applicable_value
+    )
 
 
 def test_persist_chat_metrics_dynamodb_skips_when_disabled(monkeypatch):

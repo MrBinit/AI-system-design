@@ -126,7 +126,7 @@ Offline evaluation results are stored in a separate table keyed by `request_id`:
 - Evaluation and metrics aggregation can run in queue-driven mode through dedicated SQS workers.
 - Evaluation can be triggered two ways:
   - on-demand API run (`POST /api/v1/eval/offline/run?force=true`)
-  - scheduled background run every 24 hours (configurable) that executes only when new successful requests exist.
+  - scheduled background run every 1 hour (configurable) that executes only when indexed `eval_status=pending` records exist.
 
 ## 8) Evaluation Pipeline (Detailed)
 
@@ -136,13 +136,16 @@ Pipeline:
 
 `request + retrieval evidence snapshot`
 -> `DynamoDB requests table`
--> `evaluation event queue (optional) OR offline evaluator scan`
+-> `evaluation event queue (optional) OR offline evaluator indexed pending query`
 -> `judge(clarity)`
 -> `judge(relevance)`
 -> `judge(hallucination vs retrieval evidence)`
 -> `aggregate scoring + failure reason`
 -> `DynamoDB evaluations table`
 -> `p50/p95 report`
+
+Queue evaluation guarantee:
+- The queue worker processes only requests with `eval_status=pending`, claims them by moving status to `in_progress`, runs evaluation, then marks them `completed`, so each request is evaluated only once.
 
 Prompts and model:
 - prompts file: `app/config/evaluation_prompt.yaml`

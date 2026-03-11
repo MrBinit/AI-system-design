@@ -19,7 +19,7 @@ and an evidence-grounding support metric:
 -> `answer generation`
 -> `request metrics persisted to DynamoDB requests table (includes retrieval evidence snapshot)`
 -> `optional SQS evaluation event enqueue (success-only request_id)`
--> `offline evaluator (queue worker by request_id OR scan worker)`
+-> `offline evaluator (queue worker by request_id OR indexed status worker)`
 -> `3 independent LLM judge calls (clarity, relevance, hallucination)`
 -> `evaluation item written to DynamoDB evaluations table by request_id`
 -> `daily/adhoc report computes p50/p95 + failure reasons + worst examples`
@@ -39,6 +39,13 @@ Used fields:
 - `question` (fallback to `query`)
 - `answer`
 - `retrieval_evidence_json` (snapshot captured at request time)
+- `eval_status` (`pending`, `in_progress`, `completed`, `not_applicable`)
+
+Required GSI for efficient evaluator pulls (no table scans):
+
+- `eval-status-timestamp-index`
+  - partition key: `eval_status`
+  - sort key: `timestamp`
 
 ### 2) Evaluations table
 
@@ -59,6 +66,13 @@ Stored output:
 - `overall_score`
 - `judge_prompt_tokens`, `judge_completion_tokens`, `judge_total_tokens`
 - `notes`
+- `status` (`completed`)
+
+Recommended GSI for status/time lookups:
+
+- `status-timestamp-index`
+  - partition key: `status`
+  - sort key: `timestamp`
 
 ## Judge Models And Prompts
 
@@ -127,8 +141,8 @@ Failure reason rules:
 
 ### Scheduled
 
-- background scheduler checks every `evaluation.schedule_interval_hours` (default 24)
-- executes only if new successful requests exist since last evaluated timestamp
+- background scheduler checks every `evaluation.schedule_interval_hours` (default 1)
+- executes only if there are indexed `eval_status=pending` requests
 
 ### Queue-driven (event mode)
 
@@ -139,8 +153,14 @@ Failure reason rules:
   - `python -m app.scripts.eval_queue_worker`
 - behavior:
   - successful requests publish one event keyed by `request_id`
-  - worker evaluates that request immediately and stores one eval row
-  - scan scheduler can remain enabled as safety net/backfill
+  - worker checks/claims only `eval_status=pending` (`pending -> in_progress`)
+  - after evaluation write, status is set to `completed`
+  - on failure, status is reset to `pending` for retry
+  - scheduler can remain enabled as safety net/backfill without full-table scans
+
+Exactly-once evaluation intent:
+
+- The queue worker processes only requests whose status is `pending`, claims them by updating status to `in_progress`, runs evaluation, then marks them `completed`, ensuring each request is evaluated only once.
 
 ## Reporting
 

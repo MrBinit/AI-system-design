@@ -42,35 +42,54 @@ def _deserialize(item: dict) -> dict:
 
 
 def _latest_timestamp_from_table(
-    table_name: str, include_outcome_filter: bool = False
+    table_name: str,
+    *,
+    index_name: str,
+    status_attr: str,
+    status_value: str,
 ) -> datetime | None:
-    if not table_name:
+    if not table_name or not index_name or not status_attr or not status_value:
         return None
 
     ddb = _dynamodb_client()
-    latest: datetime | None = None
-    last_key = None
-    while True:
-        kwargs = {
-            "TableName": table_name,
-            "ProjectionExpression": "#ts,outcome",
-            "ExpressionAttributeNames": {"#ts": "timestamp"},
-            "Limit": 200,
-        }
-        if last_key:
-            kwargs["ExclusiveStartKey"] = last_key
-        response = ddb.scan(**kwargs)
-        for raw in response.get("Items", []):
-            row = _deserialize(raw)
-            if include_outcome_filter and str(row.get("outcome", "")) != "success":
-                continue
-            parsed = _parse_iso(str(row.get("timestamp", "")))
-            if parsed and (latest is None or parsed > latest):
-                latest = parsed
-        last_key = response.get("LastEvaluatedKey")
-        if not last_key:
-            break
-    return latest
+    response = ddb.query(
+        TableName=table_name,
+        IndexName=index_name,
+        KeyConditionExpression="#status = :status_value",
+        ExpressionAttributeNames={
+            "#status": status_attr,
+            "#ts": "timestamp",
+        },
+        ExpressionAttributeValues={":status_value": {"S": status_value}},
+        ProjectionExpression="#ts",
+        Limit=1,
+        ScanIndexForward=False,
+    )
+    items = response.get("Items", [])
+    if not items:
+        return None
+    row = _deserialize(items[0])
+    return _parse_iso(str(row.get("timestamp", "")))
+
+
+def _new_requests_pending() -> bool:
+    requests_table = settings.app.metrics_dynamodb_requests_table.strip()
+    index_name = settings.evaluation.request_status_index_name.strip()
+    status_attr = settings.evaluation.request_status_attribute.strip() or "eval_status"
+    pending = settings.evaluation.request_pending_value.strip() or "pending"
+    if not requests_table or not index_name:
+        return False
+    ddb = _dynamodb_client()
+    response = ddb.query(
+        TableName=requests_table,
+        IndexName=index_name,
+        KeyConditionExpression="#status = :status_value",
+        ExpressionAttributeNames={"#status": status_attr},
+        ExpressionAttributeValues={":status_value": {"S": pending}},
+        ProjectionExpression="request_id",
+        Limit=1,
+    )
+    return bool(response.get("Items"))
 
 
 def get_offline_eval_status() -> dict:
@@ -103,11 +122,48 @@ def get_offline_eval_status() -> dict:
             "reason": "missing DynamoDB table configuration",
         }
 
-    last_request_ts = _latest_timestamp_from_table(requests_table, include_outcome_filter=True)
-    last_eval_ts = _latest_timestamp_from_table(eval_table, include_outcome_filter=False)
-    has_new_requests = bool(
-        last_request_ts and (not last_eval_ts or last_request_ts > last_eval_ts)
-    )
+    try:
+        request_index = settings.evaluation.request_status_index_name.strip()
+        request_status_attr = settings.evaluation.request_status_attribute.strip() or "eval_status"
+        eval_index = settings.evaluation.eval_status_index_name.strip()
+        eval_status_attr = settings.evaluation.eval_status_attribute.strip() or "status"
+
+        pending_requests_ts = _latest_timestamp_from_table(
+            requests_table,
+            index_name=request_index,
+            status_attr=request_status_attr,
+            status_value=settings.evaluation.request_pending_value,
+        )
+        completed_requests_ts = _latest_timestamp_from_table(
+            requests_table,
+            index_name=request_index,
+            status_attr=request_status_attr,
+            status_value=settings.evaluation.request_completed_value,
+        )
+        last_eval_ts = _latest_timestamp_from_table(
+            eval_table,
+            index_name=eval_index,
+            status_attr=eval_status_attr,
+            status_value=settings.evaluation.eval_completed_value,
+        )
+        has_new_requests = _new_requests_pending()
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "schedule_enabled": settings.evaluation.schedule_enabled,
+            "interval_hours": settings.evaluation.schedule_interval_hours,
+            "has_new_requests": False,
+            "due_by_interval": False,
+            "should_auto_run": False,
+            "last_request_timestamp": "",
+            "last_evaluated_timestamp": "",
+            "reason": f"evaluation status query failed: {exc}",
+        }
+
+    latest_candidates = [
+        ts for ts in [pending_requests_ts, completed_requests_ts] if ts is not None
+    ]
+    last_request_ts = max(latest_candidates) if latest_candidates else None
 
     now = _utc_now()
     interval_seconds = settings.evaluation.schedule_interval_hours * 3600

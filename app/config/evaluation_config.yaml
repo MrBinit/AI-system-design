@@ -7,4 +7,13 @@ evaluation:
   lookback_hours: 24
   ttl_days: 30
   schedule_enabled: true
-  schedule_interval_hours: 24
+  schedule_interval_hours: 1
+  request_status_attribute: "eval_status"
+  request_status_index_name: "eval-status-timestamp-index"
+  request_pending_value: "pending"
+  request_in_progress_value: "in_progress"
+  request_completed_value: "completed"
+  request_not_applicable_value: "not_applicable"
+  eval_status_attribute: "status"
+  eval_status_index_name: "status-timestamp-index"
+  eval_completed_value: "completed"

@@ -191,6 +191,14 @@ Config (`app/config/evaluation_config.yaml`):
 - `evaluation.max_items_per_run`
 - `evaluation.schedule_enabled`
 - `evaluation.schedule_interval_hours`
+- `evaluation.request_status_attribute`
+- `evaluation.request_status_index_name`
+- `evaluation.request_pending_value`
+- `evaluation.request_in_progress_value`
+- `evaluation.request_completed_value`
+- `evaluation.eval_status_attribute`
+- `evaluation.eval_status_index_name`
+- `evaluation.eval_completed_value`
 - `evaluation.judge_model_id` is the LLM-as-judge model ID (default Bedrock Nova 2 Lite: `us.amazon.nova-2-lite-v1:0`)
 
 Judge prompt config:
@@ -206,7 +214,20 @@ Evaluation table shape:
 - table: `evaluation.dynamodb_table` (for example `unigraph-chat-evaluations`)
 - partition key: `request_id` (String)
 - one item per evaluated request
+- `status=completed` is written for indexed status lookups
 - hallucination scoring is grounded against request-time retrieval evidence snapshot
+
+Request table eval status flow:
+
+- `pending`: successful request waiting for evaluation
+- `in_progress`: claimed by one worker
+- `completed`: evaluation stored
+- `not_applicable`: non-success request, excluded from evaluation
+
+Required GSIs (to avoid table scans):
+
+- requests table GSI: `eval-status-timestamp-index` (`eval_status`, `timestamp`)
+- evaluations table GSI: `status-timestamp-index` (`status`, `timestamp`)
 
 Scripts:
 
@@ -230,9 +251,9 @@ API endpoints (admin):
 
 Scheduling behavior:
 
-- background scheduler runs every `evaluation.schedule_interval_hours` (default 24h)
+- background scheduler runs every `evaluation.schedule_interval_hours` (default 1h)
 - each run only evaluates when:
-  - there are new successful request records after the latest evaluated timestamp
+  - there are indexed `eval_status=pending` request records
   - and the interval gate is reached
 - manual `force=true` always runs immediately
 
@@ -241,8 +262,14 @@ Optional queue-driven evaluation mode:
 - `EVALUATION_QUEUE_ENABLED=true`
 - `EVALUATION_QUEUE_URL=<sqs-url>`
 - request metrics persistence publishes one eval event per successful request
-- worker consumes by `request_id` and writes into `evaluation.dynamodb_table`
-- scheduled scan path can remain enabled as periodic backfill/safety net
+- worker consumes by `request_id`, checks/claims `pending`, then transitions:
+  - `pending -> in_progress -> completed`
+- if processing fails, worker sets status back to `pending` for retry
+- scheduler can remain enabled as periodic indexed backfill/safety net
+
+Processing guarantee:
+
+- The queue worker processes only requests whose status is `pending`, claims them by updating status to `in_progress`, runs evaluation, and marks them `completed`, so each request is evaluated only once.
 
 Daily report output:
 
