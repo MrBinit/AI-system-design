@@ -1,4 +1,4 @@
-"""SQS worker that syncs latest metrics aggregate snapshot to DynamoDB."""
+"""SQS worker that processes background metrics events."""
 
 from __future__ import annotations
 
@@ -7,7 +7,10 @@ import logging
 
 from app.core.config import get_settings
 from app.services.metrics_dynamodb_service import persist_aggregate_snapshot_dynamodb
-from app.services.metrics_json_service import load_chat_metrics_aggregate_json
+from app.services.metrics_json_service import (
+    append_chat_metrics_json,
+    load_chat_metrics_aggregate_json,
+)
 from app.services.sqs_event_queue_service import (
     delete_queue_message,
     parse_message_json,
@@ -23,6 +26,13 @@ async def _process_message(message: dict) -> None:
     payload = parse_message_json(message)
     event_type = str(payload.get("type", "")).strip().lower()
     queue_url = settings.queue.metrics_aggregation_queue_url.strip()
+
+    if event_type == "metrics_record":
+        record = payload.get("record")
+        if isinstance(record, dict) and record:
+            append_chat_metrics_json(record)
+        delete_queue_message(queue_url, receipt_handle)
+        return
 
     if event_type and event_type != "metrics_aggregation":
         delete_queue_message(queue_url, receipt_handle)

@@ -25,6 +25,7 @@ _JOB_STATUS_QUEUED = "queued"
 _JOB_STATUS_PROCESSING = "processing"
 _JOB_STATUS_COMPLETED = "completed"
 _JOB_STATUS_FAILED = "failed"
+_PUBLIC_JOB_ERROR = "Async chat job failed."
 _VALID_STATUSES = {
     _JOB_STATUS_QUEUED,
     _JOB_STATUS_PROCESSING,
@@ -84,6 +85,19 @@ def _safe_message_group_id(value: str) -> str:
     if not text:
         return "anonymous"
     return text[:128]
+
+
+def _sanitize_job_error(error_message: str) -> str:
+    """Reduce internal failure details to a client-safe, bounded message."""
+    normalized = str(error_message).strip()
+    lowered = normalized.lower()
+    if not normalized:
+        return _PUBLIC_JOB_ERROR
+    if lowered.startswith("invalid async job payload"):
+        return "Invalid async job payload."
+    if lowered.startswith("queue enqueue failed"):
+        return "Queue enqueue failed."
+    return _PUBLIC_JOB_ERROR
 
 
 def _put_initial_job(job: dict) -> None:
@@ -240,11 +254,12 @@ def mark_job_completed(job_id: str, answer: str) -> None:
 
 
 def mark_job_failed(job_id: str, error_message: str) -> None:
+    safe_error = _sanitize_job_error(error_message)
     _update_job(
         job_id,
         {
             "status": _JOB_STATUS_FAILED,
-            "error": str(error_message)[:2000],
+            "error": safe_error[:2000],
             "updated_at": _now_iso(),
         },
     )

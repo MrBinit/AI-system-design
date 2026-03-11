@@ -4,16 +4,9 @@ This module stores:
 1) one request-level item per chat call in the configured requests table, and
 2) a singleton aggregate snapshot item (`id=global`) in the configured aggregate table.
 
-The request item includes selected top-level attributes for easy querying
-(
-    `session_id`,
-    `outcome`,
-    `latency_overall_ms`,
-    `retrieval_strategy`,
-    evidence counts,
-    token usage,
-)
-plus a full-fidelity `record_json` payload.
+The request item includes selected top-level attributes for easy querying:
+`session_id`, `outcome`, latency metrics, retrieval metadata, and token usage.
+It intentionally avoids storing duplicated full JSON payloads to reduce item size.
 """
 
 import json
@@ -29,6 +22,11 @@ from app.services.sqs_event_queue_service import (
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+
+_MAX_QUERY_CHARS = 2000
+_MAX_ANSWER_CHARS = 12000
+_MAX_EVIDENCE_ITEMS = 6
+_MAX_EVIDENCE_CONTENT_CHARS = 700
 
 
 def _now_iso() -> str:
@@ -79,6 +77,38 @@ def _float_str(value) -> str:
         return "0.0"
 
 
+def _truncate_text(value, max_chars: int) -> tuple[str, int, bool]:
+    """Return a bounded string plus original length and truncation flag."""
+    text = str(value or "")
+    original_len = len(text)
+    if original_len <= max_chars:
+        return text, original_len, False
+    return text[:max_chars], original_len, True
+
+
+def _compact_evidence(evidence: list) -> list[dict]:
+    """Bound retrieval evidence payload size before writing to DynamoDB."""
+    if not isinstance(evidence, list):
+        return []
+    compact: list[dict] = []
+    for row in evidence:
+        if not isinstance(row, dict):
+            continue
+        content, _, _ = _truncate_text(row.get("content", ""), _MAX_EVIDENCE_CONTENT_CHARS)
+        compact.append(
+            {
+                "chunk_id": str(row.get("chunk_id", "")),
+                "document_id": str(row.get("document_id", "")),
+                "distance": row.get("distance"),
+                "metadata": row.get("metadata", {}),
+                "content": content,
+            }
+        )
+        if len(compact) >= _MAX_EVIDENCE_ITEMS:
+            break
+    return compact
+
+
 def _persist_request_record(record: dict) -> None:
     """Write one request-level metrics item to the configured requests table."""
     table_name = settings.app.metrics_dynamodb_requests_table.strip()
@@ -98,9 +128,14 @@ def _persist_request_record(record: dict) -> None:
     llm_usage = record.get("llm_usage", {})
     if not isinstance(llm_usage, dict):
         llm_usage = {}
-    evidence = retrieval.get("evidence", [])
-    if not isinstance(evidence, list):
-        evidence = []
+    evidence = _compact_evidence(retrieval.get("evidence", []))
+    query, query_char_count, query_truncated = _truncate_text(
+        record.get("question", ""), _MAX_QUERY_CHARS
+    )
+    answer, answer_char_count, answer_truncated = _truncate_text(
+        record.get("answer", ""),
+        _MAX_ANSWER_CHARS,
+    )
     outcome = str(record.get("outcome", "unknown")).strip().lower()
     if outcome == "success":
         eval_status = settings.evaluation.request_pending_value
@@ -119,8 +154,12 @@ def _persist_request_record(record: dict) -> None:
         "retrieval_result_count": {"N": _int_str(retrieval.get("result_count"))},
         "retrieval_evidence_count": {"N": _int_str(len(evidence))},
         "retrieval_evidence_json": {"S": json.dumps(evidence, ensure_ascii=False, default=str)},
-        "query": {"S": str(record.get("question", ""))},
-        "answer": {"S": str(record.get("answer", ""))},
+        "query": {"S": query},
+        "query_char_count": {"N": _int_str(query_char_count)},
+        "query_truncated": {"BOOL": query_truncated},
+        "answer": {"S": answer},
+        "answer_char_count": {"N": _int_str(answer_char_count)},
+        "answer_truncated": {"BOOL": answer_truncated},
         "latency_overall_ms": {"N": _int_str(timings.get("overall_response_ms"))},
         "latency_llm_ms": {"N": _int_str(timings.get("llm_response_ms"))},
         "latency_short_term_ms": {"N": _int_str(timings.get("short_term_memory_ms"))},
@@ -129,7 +168,6 @@ def _persist_request_record(record: dict) -> None:
         "total_tokens": {"N": _int_str(llm_usage.get("total_tokens"))},
         eval_status_attr: {"S": eval_status},
         eval_status_updated_at_attr: {"S": _now_iso()},
-        "record_json": {"S": json.dumps(record, ensure_ascii=False, default=str)},
     }
     if settings.app.metrics_dynamodb_ttl_days > 0:
         item["expires_at"] = {"N": str(_ttl_epoch_seconds(settings.app.metrics_dynamodb_ttl_days))}
@@ -143,17 +181,20 @@ def _persist_aggregate_snapshot(aggregate: dict | None) -> None:
     if not table_name or not isinstance(aggregate, dict):
         return
 
-    latency_raw = aggregate.get("latency_ms", {})
+    aggregate_payload = dict(aggregate)
+    aggregate_payload.pop("_latency_samples", None)
+
+    latency_raw = aggregate_payload.get("latency_ms", {})
     latency = latency_raw if isinstance(latency_raw, dict) else {}
     overall_latency = latency.get("overall", {})
     if not isinstance(overall_latency, dict):
         overall_latency = {}
     item = {
         "id": {"S": "global"},
-        "updated_at": {"S": str(aggregate.get("updated_at", _now_iso()))},
-        "total_requests": {"N": _int_str(aggregate.get("total_requests"))},
+        "updated_at": {"S": str(aggregate_payload.get("updated_at", _now_iso()))},
+        "total_requests": {"N": _int_str(aggregate_payload.get("total_requests"))},
         "overall_avg_latency_ms": {"N": _float_str(overall_latency.get("average"))},
-        "aggregate_json": {"S": json.dumps(aggregate, ensure_ascii=False, default=str)},
+        "aggregate_json": {"S": json.dumps(aggregate_payload, ensure_ascii=False, default=str)},
     }
     if settings.app.metrics_dynamodb_ttl_days > 0:
         item["expires_at"] = {"N": str(_ttl_epoch_seconds(settings.app.metrics_dynamodb_ttl_days))}

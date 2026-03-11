@@ -18,7 +18,7 @@ from app.services.guardrails_service import (
     refusal_response,
 )
 from app.services.memory_service import build_context, update_memory
-from app.services.metrics_json_service import append_chat_metrics_json
+from app.services.sqs_event_queue_service import enqueue_metrics_record_event
 from app.services.retrieval_service import aretrieve_document_chunks
 
 settings = get_settings()
@@ -34,10 +34,26 @@ _RETRIEVAL_EVIDENCE_MAX_ITEMS = 3
 _RETRIEVAL_EVIDENCE_CONTENT_MAX_CHARS = 700
 
 
-def _chat_cache_key(user_id: str, prompt: str) -> str:
+def _chat_cache_key(user_id: str, prompt: str, session_id: str | None = None) -> str:
     """Build a fixed-length chat cache key without embedding raw prompt text."""
+    normalized_session = str(session_id or user_id).strip() or str(user_id).strip()
     prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    return app_scoped_key("cache", "chat", user_id, f"sha256:{prompt_hash}")
+    return app_scoped_key("cache", "chat", user_id, normalized_session, f"sha256:{prompt_hash}")
+
+
+def _resolve_session_id(user_id: str, session_id: str | None) -> str:
+    """Resolve an effective session identifier with a safe fallback."""
+    candidate = str(session_id or "").strip()
+    return candidate or str(user_id).strip()
+
+
+def _conversation_user_id(user_id: str, session_id: str) -> str:
+    """Return memory key space id; isolate when a distinct session id is provided."""
+    normalized_user = str(user_id).strip()
+    normalized_session = str(session_id).strip()
+    if not normalized_session or normalized_session == normalized_user:
+        return normalized_user
+    return f"{normalized_user}::session::{normalized_session}"
 
 
 async def _redis_call(method, *args, **kwargs):
@@ -82,11 +98,23 @@ def _extract_llm_usage(response) -> dict:
 
 
 async def _record_json_metrics(record: dict) -> None:
-    """Persist per-request chat metrics to JSON files without blocking the event loop."""
-    try:
-        await asyncio.to_thread(append_chat_metrics_json, record)
-    except Exception:
-        logger.warning("JSON metrics persistence failed; continuing.")
+    """Enqueue per-request metrics for background persistence."""
+    if not settings.queue.metrics_aggregation_queue_enabled:
+        return
+    if not settings.queue.metrics_aggregation_queue_url.strip():
+        logger.warning("Metrics queue URL missing; dropping metrics event.")
+        return
+
+    async def _enqueue() -> None:
+        try:
+            await asyncio.to_thread(enqueue_metrics_record_event, record)
+        except Exception:
+            logger.warning("Metrics event enqueue failed; continuing.")
+
+    _track_background_task(
+        asyncio.create_task(_enqueue()),
+        label="Metrics event enqueue",
+    )
 
 
 def _build_json_metrics_record(
@@ -94,6 +122,7 @@ def _build_json_metrics_record(
     request_id: str,
     started_at: float,
     user_id: str,
+    session_id: str | None,
     user_prompt: str,
     safe_user_prompt: str,
     answer: str,
@@ -120,7 +149,7 @@ def _build_json_metrics_record(
     return {
         "request_id": request_id,
         "user_id": user_id,
-        "session_id": user_id,
+        "session_id": str(session_id or user_id),
         "question": user_prompt,
         "question_sanitized": safe_user_prompt,
         "answer": answer,
@@ -384,10 +413,12 @@ async def _stream_fallback(messages: list) -> AsyncIterator[str]:
         yield delta
 
 
-async def generate_response(user_id: str, user_prompt: str) -> str:
+async def generate_response(user_id: str, user_prompt: str, session_id: str | None = None) -> str:
     """Run the full chat pipeline: guardrails, memory, model call, cache, and persistence."""
     started_at = time.perf_counter()
     request_id = uuid4().hex
+    effective_session_id = _resolve_session_id(user_id, session_id)
+    conversation_user_id = _conversation_user_id(user_id, effective_session_id)
     safe_user_prompt = user_prompt
     build_context_ms: int | None = None
     retrieval_ms: int | None = None
@@ -421,6 +452,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
                 request_id=request_id,
                 started_at=started_at,
                 user_id=user_id,
+                session_id=effective_session_id,
                 user_prompt=user_prompt,
                 safe_user_prompt=safe_user_prompt,
                 answer=refusal,
@@ -447,7 +479,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
         return refusal
 
     safe_user_prompt = str(input_guard.get("sanitized_text", user_prompt))
-    cache_key = _chat_cache_key(user_id, safe_user_prompt)
+    cache_key = _chat_cache_key(user_id, safe_user_prompt, effective_session_id)
 
     # Cache lookup
     cached = None
@@ -465,6 +497,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
                 request_id=request_id,
                 started_at=started_at,
                 user_id=user_id,
+                session_id=effective_session_id,
                 user_prompt=user_prompt,
                 safe_user_prompt=safe_user_prompt,
                 answer=str(cached),
@@ -492,7 +525,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
 
     # Build hybrid memory context
     build_context_started_at = time.perf_counter()
-    messages = await build_context(user_id, safe_user_prompt)
+    messages = await build_context(conversation_user_id, safe_user_prompt)
     build_context_ms = _elapsed_ms(build_context_started_at)
 
     retrieval_query = _build_retrieval_query(messages)
@@ -541,6 +574,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
                 request_id=request_id,
                 started_at=started_at,
                 user_id=user_id,
+                session_id=effective_session_id,
                 user_prompt=user_prompt,
                 safe_user_prompt=safe_user_prompt,
                 answer=refusal,
@@ -583,6 +617,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
                     request_id=request_id,
                     started_at=started_at,
                     user_id=user_id,
+                    session_id=effective_session_id,
                     user_prompt=user_prompt,
                     safe_user_prompt=safe_user_prompt,
                     answer="",
@@ -635,7 +670,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
     # Update memory
     memory_update_started_at = time.perf_counter()
     try:
-        await update_memory(user_id, safe_user_prompt, result)
+        await update_memory(conversation_user_id, safe_user_prompt, result)
     except Exception as exc:
         logger.warning("Memory update failed. %s", exc)
     finally:
@@ -701,6 +736,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
             request_id=request_id,
             started_at=started_at,
             user_id=user_id,
+            session_id=effective_session_id,
             user_prompt=user_prompt,
             safe_user_prompt=safe_user_prompt,
             answer=result,
@@ -730,6 +766,7 @@ async def generate_response(user_id: str, user_prompt: str) -> str:
 async def generate_response_stream(
     user_id: str,
     user_prompt: str,
+    session_id: str | None = None,
     *,
     chunk_size: int = 120,
     chunk_delay_ms: int = 12,
@@ -755,6 +792,8 @@ async def generate_response_stream(
 
     started_at = time.perf_counter()
     request_id = uuid4().hex
+    effective_session_id = _resolve_session_id(user_id, session_id)
+    conversation_user_id = _conversation_user_id(user_id, effective_session_id)
     safe_user_prompt = user_prompt
     build_context_ms: int | None = None
     retrieval_ms: int | None = None
@@ -788,6 +827,7 @@ async def generate_response_stream(
                 request_id=request_id,
                 started_at=started_at,
                 user_id=user_id,
+                session_id=effective_session_id,
                 user_prompt=user_prompt,
                 safe_user_prompt=safe_user_prompt,
                 answer=refusal,
@@ -815,7 +855,7 @@ async def generate_response_stream(
         return
 
     safe_user_prompt = str(input_guard.get("sanitized_text", user_prompt))
-    cache_key = _chat_cache_key(user_id, safe_user_prompt)
+    cache_key = _chat_cache_key(user_id, safe_user_prompt, effective_session_id)
 
     cached = None
     cache_read_started_at = time.perf_counter()
@@ -833,6 +873,7 @@ async def generate_response_stream(
                 request_id=request_id,
                 started_at=started_at,
                 user_id=user_id,
+                session_id=effective_session_id,
                 user_prompt=user_prompt,
                 safe_user_prompt=safe_user_prompt,
                 answer=cached_text,
@@ -860,7 +901,7 @@ async def generate_response_stream(
         return
 
     build_context_started_at = time.perf_counter()
-    messages = await build_context(user_id, safe_user_prompt)
+    messages = await build_context(conversation_user_id, safe_user_prompt)
     build_context_ms = _elapsed_ms(build_context_started_at)
 
     retrieval_query = _build_retrieval_query(messages)
@@ -909,6 +950,7 @@ async def generate_response_stream(
                 request_id=request_id,
                 started_at=started_at,
                 user_id=user_id,
+                session_id=effective_session_id,
                 user_prompt=user_prompt,
                 safe_user_prompt=safe_user_prompt,
                 answer=refusal,
@@ -952,6 +994,7 @@ async def generate_response_stream(
                     request_id=request_id,
                     started_at=started_at,
                     user_id=user_id,
+                    session_id=effective_session_id,
                     user_prompt=user_prompt,
                     safe_user_prompt=safe_user_prompt,
                     answer=streamed_text,
@@ -989,6 +1032,7 @@ async def generate_response_stream(
                     request_id=request_id,
                     started_at=started_at,
                     user_id=user_id,
+                    session_id=effective_session_id,
                     user_prompt=user_prompt,
                     safe_user_prompt=safe_user_prompt,
                     answer=streamed_text,
@@ -1030,7 +1074,7 @@ async def generate_response_stream(
 
     memory_update_started_at = time.perf_counter()
     try:
-        await update_memory(user_id, safe_user_prompt, result)
+        await update_memory(conversation_user_id, safe_user_prompt, result)
     except Exception as exc:
         logger.warning("Memory update failed. %s", exc)
     finally:
@@ -1080,6 +1124,7 @@ async def generate_response_stream(
             request_id=request_id,
             started_at=started_at,
             user_id=user_id,
+            session_id=effective_session_id,
             user_prompt=user_prompt,
             safe_user_prompt=safe_user_prompt,
             answer=result,

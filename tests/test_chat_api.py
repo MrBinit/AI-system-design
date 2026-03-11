@@ -10,7 +10,7 @@ def test_chat_endpoint_success(monkeypatch):
     def fake_enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None) -> dict:
         assert user_id == "user-1"
         assert prompt == "hello"
-        assert session_id == "user-1"
+        assert session_id is None
         return {
             "job_id": "job-sync-removed-1234",
             "status": "queued",
@@ -66,11 +66,49 @@ def test_chat_endpoint_forbidden_for_different_user():
     assert response.status_code == 403
 
 
+def test_chat_endpoint_runtime_error_hides_internal_details(monkeypatch):
+    def fake_enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None) -> dict:
+        _ = user_id, prompt, session_id
+        raise RuntimeError("LLM_QUEUE_URL is not configured.")
+
+    monkeypatch.setattr(chat_api, "enqueue_chat_job", fake_enqueue_chat_job)
+
+    token = create_access_token(user_id="user-1", roles=["user"])
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/chat",
+        json={"user_id": "user-1", "prompt": "hello"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Async chat service is temporarily unavailable."
+
+
+def test_chat_endpoint_error_hides_internal_details(monkeypatch):
+    def fake_enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None) -> dict:
+        _ = user_id, prompt, session_id
+        raise ValueError("connection string leaked")
+
+    monkeypatch.setattr(chat_api, "enqueue_chat_job", fake_enqueue_chat_job)
+
+    token = create_access_token(user_id="user-1", roles=["user"])
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/chat",
+        json={"user_id": "user-1", "prompt": "hello"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to enqueue async chat job."
+
+
 def test_chat_async_enqueue_success(monkeypatch):
     def fake_enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None) -> dict:
         assert user_id == "user-1"
         assert prompt == "hello async"
-        assert session_id == "user-1"
+        assert session_id is None
         return {
             "job_id": "job-12345678",
             "status": "queued",
@@ -93,6 +131,30 @@ def test_chat_async_enqueue_success(monkeypatch):
         "status": "queued",
         "submitted_at": "2026-03-10T00:00:00+00:00",
     }
+
+
+def test_chat_async_enqueue_uses_session_id_when_provided(monkeypatch):
+    def fake_enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None) -> dict:
+        assert user_id == "user-1"
+        assert prompt == "hello async"
+        assert session_id == "session-abc"
+        return {
+            "job_id": "job-12345678",
+            "status": "queued",
+            "submitted_at": "2026-03-10T00:00:00+00:00",
+        }
+
+    monkeypatch.setattr(chat_api, "enqueue_chat_job", fake_enqueue_chat_job)
+
+    token = create_access_token(user_id="user-1", roles=["user"])
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/chat",
+        json={"user_id": "user-1", "session_id": "session-abc", "prompt": "hello async"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 202
 
 
 def test_chat_async_status_requires_owner(monkeypatch):
@@ -122,9 +184,14 @@ def test_chat_async_status_requires_owner(monkeypatch):
 
 
 def test_chat_stream_endpoint_success(monkeypatch):
-    async def fake_generate_response_stream(user_id: str, prompt: str):
+    async def fake_generate_response_stream(
+        user_id: str,
+        prompt: str,
+        session_id: str | None = None,
+    ):
         assert user_id == "user-1"
         assert prompt == "hello stream"
+        assert session_id is None
         yield "hel"
         yield "hello"
 
@@ -147,6 +214,57 @@ def test_chat_stream_endpoint_success(monkeypatch):
     assert '{"type":"done"}' in body
 
 
+def test_chat_stream_endpoint_forwards_session_id(monkeypatch):
+    async def fake_generate_response_stream(
+        user_id: str,
+        prompt: str,
+        session_id: str | None = None,
+    ):
+        assert user_id == "user-1"
+        assert prompt == "hello stream"
+        assert session_id == "session-xyz"
+        yield "hello"
+
+    monkeypatch.setattr(chat_api, "generate_response_stream", fake_generate_response_stream)
+
+    token = create_access_token(user_id="user-1", roles=["user"])
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/chat/stream",
+        json={"user_id": "user-1", "session_id": "session-xyz", "prompt": "hello stream"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_chat_stream_endpoint_hides_internal_details(monkeypatch):
+    async def fake_generate_response_stream(
+        user_id: str,
+        prompt: str,
+        session_id: str | None = None,
+    ):
+        _ = user_id, prompt, session_id
+        raise RuntimeError("provider timeout at host internal.example")
+        if False:  # pragma: no cover
+            yield ""
+
+    monkeypatch.setattr(chat_api, "generate_response_stream", fake_generate_response_stream)
+
+    token = create_access_token(user_id="user-1", roles=["user"])
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/chat/stream",
+        json={"user_id": "user-1", "prompt": "hello stream"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert '"type": "error"' in response.text
+    assert '"detail": "Failed to stream chat response."' in response.text
+    assert "internal.example" not in response.text
+
+
 def test_chat_stream_endpoint_forbidden_for_different_user():
     token = create_access_token(user_id="user-a", roles=["user"])
     client = TestClient(app)
@@ -156,6 +274,37 @@ def test_chat_stream_endpoint_forbidden_for_different_user():
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 403
+
+
+def test_chat_status_hides_internal_job_error(monkeypatch):
+    monkeypatch.setattr(
+        chat_api,
+        "get_chat_job",
+        lambda _job_id: {
+            "job_id": "job-abc-1234",
+            "user_id": "user-1",
+            "session_id": "session-1",
+            "status": "failed",
+            "created_at": "2026-03-10T00:00:00+00:00",
+            "started_at": "2026-03-10T00:00:02+00:00",
+            "completed_at": "2026-03-10T00:00:03+00:00",
+            "answer": "",
+            "error": "db host is 10.0.0.1:5432",
+        },
+    )
+
+    token = create_access_token(user_id="user-1", roles=["user"])
+    client = TestClient(app)
+    response = client.get(
+        "/api/v1/chat/job-abc-1234",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["error"] == "Async chat job failed."
+    assert "10.0.0.1" not in payload["error"]
 
 
 def test_route_matching_middleware_formats_404():

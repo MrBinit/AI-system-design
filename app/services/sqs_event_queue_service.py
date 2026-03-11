@@ -76,6 +76,22 @@ def enqueue_metrics_aggregation_event(request_id: str) -> str:
     return _send_json(queue_url, payload, message_group_id="metrics")
 
 
+def enqueue_metrics_record_event(record: dict) -> str:
+    """Publish one request metrics record for background processing."""
+    queue_url = settings.queue.metrics_aggregation_queue_url.strip()
+    if not settings.queue.metrics_aggregation_queue_enabled or not queue_url:
+        return ""
+
+    normalized = dict(record) if isinstance(record, dict) else {}
+    session_id = str(normalized.get("session_id") or normalized.get("user_id") or "").strip()
+    payload = {
+        "type": "metrics_record",
+        "record": normalized,
+        "enqueued_at": _utc_now_iso(),
+    }
+    return _send_json(queue_url, payload, message_group_id=session_id or "metrics")
+
+
 def enqueue_evaluation_event(request_id: str, session_id: str = "") -> str:
     """Publish one evaluation event keyed by request id."""
     queue_url = settings.queue.evaluation_queue_url.strip()

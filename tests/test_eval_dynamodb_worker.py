@@ -25,7 +25,6 @@ class _FakeDynamoClient:
                     "question": {"S": "What is AI?"},
                     "answer": {"S": "AI is ..."},
                     "retrieval_evidence_json": {"S": "[]"},
-                    "record_json": {"S": "{}"},
                     "eval_status": {"S": "pending"},
                 }
             ]

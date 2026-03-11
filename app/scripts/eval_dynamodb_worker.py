@@ -276,19 +276,6 @@ def _extract_retrieval_evidence(item: dict) -> list[dict]:
             return [row for row in parsed if isinstance(row, dict)]
     if isinstance(raw, list):
         return [row for row in raw if isinstance(row, dict)]
-
-    raw_record = item.get("record_json")
-    if isinstance(raw_record, str):
-        try:
-            payload = json.loads(raw_record)
-        except json.JSONDecodeError:
-            payload = {}
-        if isinstance(payload, dict):
-            retrieval = payload.get("retrieval", {})
-            if isinstance(retrieval, dict):
-                evidence = retrieval.get("evidence", [])
-                if isinstance(evidence, list):
-                    return [row for row in evidence if isinstance(row, dict)]
     return []
 
 
@@ -349,7 +336,7 @@ def _load_requests_for_eval(max_items: int, lookback_hours: int) -> list[dict]:
             },
             "ProjectionExpression": (
                 "request_id,#ts,user_id,session_id,outcome,question,query,answer,"
-                "retrieval_evidence_json,record_json,#status"
+                "retrieval_evidence_json,#status"
             ),
             "Limit": min(100, max_items - len(items)),
             "ScanIndexForward": False,

@@ -6,6 +6,7 @@ from app.services import metrics_json_service
 def test_append_chat_metrics_json_writes_request_and_aggregate(tmp_path, monkeypatch):
     monkeypatch.setattr(metrics_json_service.settings.app, "metrics_json_enabled", True)
     monkeypatch.setattr(metrics_json_service.settings.app, "metrics_json_dir", str(tmp_path))
+    monkeypatch.setattr(metrics_json_service, "persist_chat_metrics_dynamodb", lambda *_args: None)
 
     metrics_json_service.append_chat_metrics_json(
         {
@@ -60,6 +61,7 @@ def test_append_chat_metrics_json_writes_request_and_aggregate(tmp_path, monkeyp
 def test_append_chat_metrics_json_skips_when_disabled(tmp_path, monkeypatch):
     monkeypatch.setattr(metrics_json_service.settings.app, "metrics_json_enabled", False)
     monkeypatch.setattr(metrics_json_service.settings.app, "metrics_json_dir", str(tmp_path))
+    monkeypatch.setattr(metrics_json_service, "persist_chat_metrics_dynamodb", lambda *_args: None)
 
     metrics_json_service.append_chat_metrics_json(
         {

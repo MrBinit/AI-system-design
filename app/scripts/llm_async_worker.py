@@ -36,6 +36,7 @@ async def _process_message(message: dict) -> None:
     payload = _parse_message_body(str(message.get("Body", "")))
     job_id = str(payload.get("job_id", "")).strip()
     user_id = str(payload.get("user_id", "")).strip()
+    session_id = str(payload.get("session_id", user_id)).strip() or user_id
     prompt = str(payload.get("prompt", "")).strip()
 
     if not job_id or not user_id or not prompt:
@@ -51,7 +52,7 @@ async def _process_message(message: dict) -> None:
 
     mark_job_processing(job_id)
     try:
-        answer = await generate_response(user_id, prompt)
+        answer = await generate_response(user_id, prompt, session_id=session_id)
         mark_job_completed(job_id, answer)
         delete_llm_job_message(receipt_handle)
     except Exception as exc:

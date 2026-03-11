@@ -59,10 +59,11 @@ Request and aggregate metrics are persisted to DynamoDB in addition to JSON file
 
 Per-request top-level attributes include:
 - `request_id`, `timestamp`, `user_id`, `session_id`
-- `query`, `outcome`
+- `query`, `answer`, `outcome`
 - `latency_overall_ms`, `latency_llm_ms`, `retrieval_strategy`
 - `prompt_tokens`, `total_tokens`
-- `record_json` (full JSON payload)
+- `query_char_count`, `query_truncated`, `answer_char_count`, `answer_truncated`
+- `retrieval_evidence_json` (bounded evidence snapshot for offline evaluation)
 
 Offline evaluation results are stored in a separate table keyed by `request_id`:
 - Evaluations table: `unigraph-chat-evaluations`

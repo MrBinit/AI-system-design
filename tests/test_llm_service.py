@@ -59,6 +59,38 @@ async def test_generate_response_returns_cache_hit(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_generate_response_cache_is_session_scoped(monkeypatch):
+    fake_redis = FakeRedis()
+    session_a_key = llm_service._chat_cache_key("user-1", "find ai professor", "session-a")
+    fake_redis.store[session_a_key] = "from-cache-session-a"
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    async def fake_primary(_messages):
+        return FakeResponse("fresh-session-b")
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {"results": []}
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+
+    result = await llm_service.generate_response(
+        "user-1",
+        "find ai professor",
+        session_id="session-b",
+    )
+    assert result == "fresh-session-b"
+
+
+@pytest.mark.asyncio
 async def test_generate_response_uses_primary_and_updates_memory(monkeypatch):
     fake_redis = FakeRedis()
     _attach_fake_redis(monkeypatch, fake_redis)
@@ -356,3 +388,11 @@ def test_chat_cache_key_uses_hash_without_raw_prompt_text():
     assert prompt not in cache_key
     assert "sha256:" in cache_key
     assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() in cache_key
+
+
+def test_chat_cache_key_changes_across_sessions():
+    prompt = "same prompt"
+    key_a = llm_service._chat_cache_key("user-1", prompt, "session-a")
+    key_b = llm_service._chat_cache_key("user-1", prompt, "session-b")
+
+    assert key_a != key_b

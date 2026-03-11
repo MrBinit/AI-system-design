@@ -185,8 +185,11 @@ Request item storage model:
   - `latency_overall_ms`
   - `prompt_tokens`
   - `total_tokens`
-- full payload:
-  - `record_json` (entire metrics record as JSON string)
+  - `query_char_count`
+  - `query_truncated`
+  - `answer_char_count`
+  - `answer_truncated`
+  - `retrieval_evidence_json` (bounded list used by offline evaluator)
 
 Aggregate item storage model:
 
