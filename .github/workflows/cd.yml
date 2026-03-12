@@ -91,19 +91,21 @@ jobs:
     timeout-minutes: 30
     needs: build-and-push
     environment: production
+    env:
+      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
     steps:
       - name: Configure AWS credentials (OIDC) for deploy host resolution
-        if: ${{ secrets.EC2_INSTANCE_ID != '' }}
+        if: ${{ env.EC2_INSTANCE_ID != '' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ vars.AWS_REGION || env.AWS_REGION }}
           role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
 
       - name: Resolve EC2 SSH host from instance id
-        if: ${{ secrets.EC2_INSTANCE_ID != '' }}
+        if: ${{ env.EC2_INSTANCE_ID != '' }}
         id: resolve-ec2-host
         env:
-          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          EC2_INSTANCE_ID: ${{ env.EC2_INSTANCE_ID }}
         run: |
           set -euo pipefail
 
