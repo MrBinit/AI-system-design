@@ -39,8 +39,7 @@ def test_decrypt_rejects_tampered_v2_payload():
     decoded = bytearray(base64.urlsafe_b64decode(token.encode("ascii")))
     decoded[-1] ^= 0x01
     tampered = (
-        f"{memory_crypto._ENC_PREFIX}"
-        f"{base64.urlsafe_b64encode(bytes(decoded)).decode('ascii')}"
+        f"{memory_crypto._ENC_PREFIX}" f"{base64.urlsafe_b64encode(bytes(decoded)).decode('ascii')}"
     )
 
     assert memory_crypto.decrypt_memory_payload(tampered) is None
