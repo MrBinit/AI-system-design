@@ -92,6 +92,49 @@ jobs:
     needs: build-and-push
     environment: production
     steps:
+      - name: Validate deploy SSH inputs
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_PORT: ${{ secrets.EC2_PORT || 22 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${EC2_HOST}" ]]; then
+            echo "::error::Missing required secret: EC2_HOST"
+            exit 1
+          fi
+          if [[ -z "${EC2_USER}" ]]; then
+            echo "::error::Missing required secret: EC2_USER"
+            exit 1
+          fi
+          if [[ -z "${EC2_SSH_KEY}" ]]; then
+            echo "::error::Missing required secret: EC2_SSH_KEY"
+            exit 1
+          fi
+          if [[ -z "${EC2_PORT}" ]]; then
+            echo "::error::EC2_PORT is empty"
+            exit 1
+          fi
+
+      - name: Preflight SSH connectivity
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_PORT: ${{ secrets.EC2_PORT || 22 }}
+        run: |
+          set -euo pipefail
+          echo "Checking SSH TCP reachability to ${EC2_HOST}:${EC2_PORT}"
+          for attempt in 1 2 3; do
+            if timeout 8 bash -c "cat < /dev/null > /dev/tcp/${EC2_HOST}/${EC2_PORT}" 2>/dev/null; then
+              echo "SSH TCP connectivity OK"
+              exit 0
+            fi
+            echo "Attempt ${attempt}/3 failed; retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Runner cannot reach ${EC2_HOST}:${EC2_PORT}. Check EC2 public IP/EIP, SG ingress, NACL, and route table."
+          exit 1
+
       - name: Deploy on EC2 via SSH
         uses: appleboy/ssh-action@v1.2.0
         env:
@@ -107,6 +150,8 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_PORT || 22 }}
+          timeout: 120s
+          command_timeout: 40m
           script_stop: true
           envs: APP_IMAGE,GRADIO_IMAGE,AWS_REGION,AWS_SECRETS_MANAGER_REGION,AWS_SECRETS_MANAGER_SECRET_ID,API_WORKERS,EC2_APP_DIR
           script: |
