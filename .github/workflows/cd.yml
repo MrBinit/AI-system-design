@@ -92,9 +92,57 @@ jobs:
     needs: build-and-push
     environment: production
     steps:
+      - name: Configure AWS credentials (OIDC) for deploy host resolution
+        if: ${{ secrets.EC2_INSTANCE_ID != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION || env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+
+      - name: Resolve EC2 SSH host from instance id
+        if: ${{ secrets.EC2_INSTANCE_ID != '' }}
+        id: resolve-ec2-host
+        env:
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+
+          state="$(aws ec2 describe-instances \
+            --instance-ids "${EC2_INSTANCE_ID}" \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text)"
+          if [[ "${state}" != "running" ]]; then
+            echo "::error::Instance ${EC2_INSTANCE_ID} is not running (state=${state})"
+            exit 1
+          fi
+
+          public_ip="$(aws ec2 describe-instances \
+            --instance-ids "${EC2_INSTANCE_ID}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)"
+          public_dns="$(aws ec2 describe-instances \
+            --instance-ids "${EC2_INSTANCE_ID}" \
+            --query 'Reservations[0].Instances[0].PublicDnsName' \
+            --output text)"
+
+          host=""
+          if [[ -n "${public_dns}" && "${public_dns}" != "None" ]]; then
+            host="${public_dns}"
+          elif [[ -n "${public_ip}" && "${public_ip}" != "None" ]]; then
+            host="${public_ip}"
+          fi
+
+          if [[ -z "${host}" ]]; then
+            echo "::error::No public DNS/IP found for ${EC2_INSTANCE_ID}; cannot SSH from GitHub-hosted runner."
+            exit 1
+          fi
+
+          echo "host=${host}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved deploy host: ${host}"
+
       - name: Validate deploy SSH inputs
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_HOST: ${{ steps.resolve-ec2-host.outputs.host || secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_PORT: ${{ secrets.EC2_PORT || 22 }}
@@ -116,10 +164,14 @@ jobs:
             echo "::error::EC2_PORT is empty"
             exit 1
           fi
+          if [[ "${EC2_HOST}" == *:* ]]; then
+            echo "::error::EC2_HOST must be only hostname/IP, without port"
+            exit 1
+          fi
 
       - name: Preflight SSH connectivity
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_HOST: ${{ steps.resolve-ec2-host.outputs.host || secrets.EC2_HOST }}
           EC2_PORT: ${{ secrets.EC2_PORT || 22 }}
         run: |
           set -euo pipefail
@@ -146,7 +198,7 @@ jobs:
           API_WORKERS: ${{ vars.API_WORKERS || '1' }}
           EC2_APP_DIR: ${{ vars.EC2_APP_DIR || '/home/ubuntu/AI-system-design' }}
         with:
-          host: ${{ secrets.EC2_HOST }}
+          host: ${{ steps.resolve-ec2-host.outputs.host || secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_PORT || 22 }}
