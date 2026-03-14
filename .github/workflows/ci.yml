@@ -2,9 +2,13 @@ name: CI
 
 on:
   pull_request:
+    branches:
+      - dev
+      - main
   push:
     branches:
-      - [dev, main]
+      - dev
+      - main
   workflow_dispatch:
   schedule:
     - cron: "30 2 * * *"
@@ -130,6 +134,9 @@ jobs:
     needs:
       - lint
       - unit-tests
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -155,22 +162,17 @@ jobs:
           pytest -q --cov=. --cov-report=xml:coverage.xml
 
       - name: Scan with SonarQube (if configured)
-        if: ${{ secrets.SONAR_TOKEN != '' && vars.SONAR_HOST_URL != '' }}
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         run: |
+          if [[ -z "${SONAR_TOKEN}" || -z "${SONAR_HOST_URL}" ]]; then
+            echo "Skipping SonarQube scan."
+            echo "Set repository secret SONAR_TOKEN and variable SONAR_HOST_URL to enable quality-gate scanning."
+            exit 0
+          fi
           docker run --rm \
             -e SONAR_HOST_URL \
             -e SONAR_TOKEN \
             -v "${GITHUB_WORKSPACE}:/usr/src" \
             sonarsource/sonar-scanner-cli:latest
-
-      - name: SonarQube skipped (missing config)
-        if: ${{ secrets.SONAR_TOKEN == '' || vars.SONAR_HOST_URL == '' }}
-        run: |
-          echo "Skipping SonarQube scan."
-          echo "Set repository secret SONAR_TOKEN and variable SONAR_HOST_URL to enable quality-gate scanning."
 
   integration-tests:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
