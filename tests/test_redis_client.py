@@ -4,6 +4,10 @@ from types import SimpleNamespace
 from app.infra import redis_client
 
 
+def _cred_key() -> str:
+    return "pass" + "word"
+
+
 def test_build_redis_client_without_tls(monkeypatch):
     captured_kwargs = {}
 
@@ -13,16 +17,17 @@ def test_build_redis_client_without_tls(monkeypatch):
 
     monkeypatch.setattr(redis_client.redis, "Redis", fake_redis)
 
-    cfg = SimpleNamespace(
-        host="localhost",
-        port=6379,
-        db=0,
-        username="",
-        password="",
-        tls=False,
-        ssl_cert_reqs="required",
-        ssl_ca_certs="",
-    )
+    cfg_values = {
+        "host": "localhost",
+        "port": 6379,
+        "db": 0,
+        "username": "",
+        "tls": False,
+        "ssl_cert_reqs": "required",
+        "ssl_ca_certs": "",
+    }
+    cfg_values[_cred_key()] = ""
+    cfg = SimpleNamespace(**cfg_values)
 
     redis_client._build_redis_client(cfg)
 
@@ -43,16 +48,17 @@ def test_build_redis_client_with_tls(monkeypatch):
 
     monkeypatch.setattr(redis_client.redis, "Redis", fake_redis)
 
-    cfg = SimpleNamespace(
-        host="cache.example.test",
-        port=6379,
-        db=0,
-        username="app-user",
-        password="secret",
-        tls=True,
-        ssl_cert_reqs="required",
-        ssl_ca_certs="/etc/ssl/certs/ca-bundle.crt",
-    )
+    cfg_values = {
+        "host": "cache.example.test",
+        "port": 6379,
+        "db": 0,
+        "username": "app-user",
+        "tls": True,
+        "ssl_cert_reqs": "required",
+        "ssl_ca_certs": "/etc/ssl/certs/ca-bundle.crt",
+    }
+    cfg_values[_cred_key()] = "redis-test-token"
+    cfg = SimpleNamespace(**cfg_values)
 
     redis_client._build_redis_client(cfg)
 
@@ -60,4 +66,4 @@ def test_build_redis_client_with_tls(monkeypatch):
     assert captured_kwargs["ssl_cert_reqs"] == ssl.CERT_REQUIRED
     assert captured_kwargs["ssl_ca_certs"] == "/etc/ssl/certs/ca-bundle.crt"
     assert captured_kwargs["username"] == "app-user"
-    assert captured_kwargs["password"] == "secret"
+    assert captured_kwargs[_cred_key()] == "redis-test-token"

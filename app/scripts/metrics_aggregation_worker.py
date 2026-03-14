@@ -22,7 +22,7 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
-async def _process_message(message: dict) -> None:
+def _process_message_sync(message: dict) -> None:
     receipt_handle = str(message.get("ReceiptHandle", ""))
     payload = parse_message_json(message)
     event_type = str(payload.get("type", "")).strip().lower()
@@ -49,6 +49,10 @@ async def _process_message(message: dict) -> None:
     delete_queue_message(queue_url, receipt_handle)
 
 
+async def _process_message(message: dict) -> None:
+    await asyncio.to_thread(_process_message_sync, message)
+
+
 async def run_forever() -> None:
     if not settings.queue.metrics_aggregation_queue_enabled:
         logger.warning("MetricsAggregationWorkerDisabled | METRICS_AGGREGATION_QUEUE_ENABLED=false")
@@ -59,9 +63,7 @@ async def run_forever() -> None:
 
         queue_url = settings.queue.metrics_aggregation_queue_url.strip()
         if not queue_url:
-            logger.warning(
-                ("MetricsAggregationWorkerMisconfigured | " "METRICS_AGGREGATION_QUEUE_URL missing")
-            )
+            logger.warning("MetricsAggregationWorkerMisconfigured | METRICS_AGGREGATION_QUEUE_URL missing")
             await asyncio.sleep(max(1.0, settings.queue.metrics_aggregation_poll_sleep_seconds))
             continue
 

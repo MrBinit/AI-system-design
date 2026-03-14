@@ -6,6 +6,7 @@ Files in this folder:
 
 - `deployment-ec2.md`: production deployment runbook for Docker Compose on EC2 (security, scaling, health checks).
 - `cicd-github-actions.md`: GitHub Actions CI/CD setup (OIDC, ECR push, EC2 deploy, required secrets/vars).
+- `sonarqube.md`: local SonarQube setup, scan commands, CI quality-gate integration, and troubleshooting.
 - `openapi.md`: HTTP API surface, routes, request and response contracts, and OpenAPI usage.
 - `security.md`: authentication, authorization, guardrails, rate limiting, and data protection.
 - `caching.md`: response cache behavior, key structure, and operational considerations.
@@ -24,15 +25,16 @@ Recommended reading order:
 
 1. `deployment-ec2.md`
 2. `cicd-github-actions.md`
-3. `openapi.md`
-4. `security.md`
-5. `short-term-memory.md`
-6. `long-term-memory.md`
-7. `redis.md`
-8. `ops.md`
-9. `async-io-path.md`
-10. `evaluation-pipeline.md`
-11. `async-chat-sqs.md`
-12. `load-testing-aws.md`
-13. `system-overview.md`
-14. `strategy.md`
+3. `sonarqube.md`
+4. `openapi.md`
+5. `security.md`
+6. `short-term-memory.md`
+7. `long-term-memory.md`
+8. `redis.md`
+9. `ops.md`
+10. `async-io-path.md`
+11. `evaluation-pipeline.md`
+12. `async-chat-sqs.md`
+13. `load-testing-aws.md`
+14. `system-overview.md`
+15. `strategy.md`

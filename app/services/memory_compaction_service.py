@@ -48,6 +48,48 @@ def select_summary_cutoff(messages: list, summary_ratio: float) -> tuple[list, i
     return candidates, cutoff_seq
 
 
+def _truncate_messages_to_limit(
+    *,
+    summary: str,
+    messages: list,
+    new_user_message: str,
+    limit: int,
+    min_remaining_messages: int,
+    token_counter,
+) -> tuple[list, int, int, int]:
+    """Drop oldest messages until token count is at or below the given limit."""
+    final_context = compose_context(summary, messages, new_user_message)
+    final_tokens = safe_token_count(token_counter, final_context)
+    removed_messages = 0
+    removed_tokens = 0
+    while final_tokens > limit and len(messages) > min_remaining_messages:
+        removed = messages.pop(0)
+        removed_messages += 1
+        removed_tokens += safe_token_count(token_counter, [removed])
+        final_context = compose_context(summary, messages, new_user_message)
+        final_tokens = safe_token_count(token_counter, final_context)
+    return final_context, final_tokens, removed_messages, removed_tokens
+
+
+def _truncate_event(
+    *,
+    trigger: str,
+    removed_messages: int,
+    removed_tokens: int,
+    before_tokens: int,
+    after_tokens: int,
+    summary_text: str,
+) -> dict:
+    return {
+        "trigger": trigger,
+        "removed_messages": removed_messages,
+        "removed_tokens": removed_tokens,
+        "before_tokens": before_tokens,
+        "after_tokens": after_tokens,
+        "summary_text": summary_text,
+    }
+
+
 def truncate_context_without_summary(
     *,
     summary: str,
@@ -66,41 +108,39 @@ def truncate_context_without_summary(
     final_tokens = safe_token_count(token_counter, final_context)
 
     if final_tokens > soft_limit and len(messages) > min_recent:
-        removed_messages = 0
-        removed_tokens = 0
         before_tokens = final_tokens
-
-        while final_tokens > soft_limit and len(messages) > min_recent:
-            removed = messages.pop(0)
-            removed_messages += 1
-            removed_tokens += safe_token_count(token_counter, [removed])
-            final_context = compose_context(summary, messages, new_user_message)
-            final_tokens = safe_token_count(token_counter, final_context)
+        final_context, final_tokens, removed_messages, removed_tokens = _truncate_messages_to_limit(
+            summary=summary,
+            messages=messages,
+            new_user_message=new_user_message,
+            limit=soft_limit,
+            min_remaining_messages=min_recent,
+            token_counter=token_counter,
+        )
 
         if removed_messages:
             memory_changed = True
             events.append(
-                {
-                    "trigger": "soft_budget_truncate",
-                    "removed_messages": removed_messages,
-                    "removed_tokens": removed_tokens,
-                    "before_tokens": before_tokens,
-                    "after_tokens": final_tokens,
-                    "summary_text": "",
-                }
+                _truncate_event(
+                    trigger="soft_budget_truncate",
+                    removed_messages=removed_messages,
+                    removed_tokens=removed_tokens,
+                    before_tokens=before_tokens,
+                    after_tokens=final_tokens,
+                    summary_text="",
+                )
             )
 
     if final_tokens > hard_limit:
-        removed_messages = 0
-        removed_tokens = 0
         before_tokens = final_tokens
-
-        while final_tokens > hard_limit and messages:
-            removed = messages.pop(0)
-            removed_messages += 1
-            removed_tokens += safe_token_count(token_counter, [removed])
-            final_context = compose_context(summary, messages, new_user_message)
-            final_tokens = safe_token_count(token_counter, final_context)
+        final_context, final_tokens, removed_messages, removed_tokens = _truncate_messages_to_limit(
+            summary=summary,
+            messages=messages,
+            new_user_message=new_user_message,
+            limit=hard_limit,
+            min_remaining_messages=0,
+            token_counter=token_counter,
+        )
 
         removed_summary = ""
         if final_tokens > hard_limit and summary:
@@ -115,14 +155,14 @@ def truncate_context_without_summary(
         if removed_messages or removed_summary:
             memory_changed = True
             events.append(
-                {
-                    "trigger": "hard_budget_truncate",
-                    "removed_messages": removed_messages,
-                    "removed_tokens": removed_tokens,
-                    "before_tokens": before_tokens,
-                    "after_tokens": final_tokens,
-                    "summary_text": removed_summary,
-                }
+                _truncate_event(
+                    trigger="hard_budget_truncate",
+                    removed_messages=removed_messages,
+                    removed_tokens=removed_tokens,
+                    before_tokens=before_tokens,
+                    after_tokens=final_tokens,
+                    summary_text=removed_summary,
+                )
             )
 
     return {

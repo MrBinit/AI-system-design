@@ -59,6 +59,36 @@ def _build_updated_memory(
     return updated, old_messages
 
 
+def _log_summary_job_skipped(*, stream_id: str, job_id: str, user_id: str, reason: str) -> None:
+    logger.info(
+        "SummaryJobSkipped | %s",
+        json.dumps(
+            {
+                "stream_id": stream_id,
+                "job_id": job_id,
+                "user_id": user_id,
+                "reason": reason,
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+async def _clear_stale_summary_pending(memory: dict, *, user_id: str, job_id: str) -> None:
+    if memory.get("last_summary_job_id") != job_id or not memory.get("summary_pending"):
+        return
+    stale_update = dict(memory)
+    stale_update["summary_pending"] = False
+    stale_update["last_summary_job_id"] = ""
+    stale_update["version"] = memory["version"] + 1
+    await asyncio.to_thread(save_memory_if_version, user_id, memory["version"], stale_update)
+
+
+def _mark_processed_and_ack(idempotency_key: str, stream_id: str) -> None:
+    mark_summary_job_processed(idempotency_key, stream_id)
+    ack_summary_job(stream_id)
+
+
 async def process_summary_job(stream_id: str, fields: dict):
     """Process one queued summary job and update short-term memory asynchronously."""
     user_id = fields.get("user_id", "")
@@ -72,33 +102,21 @@ async def process_summary_job(stream_id: str, fields: dict):
         return
 
     if is_summary_job_processed(idempotency_key):
-        logger.info(
-            "SummaryJobSkipped | %s",
-            json.dumps(
-                {
-                    "stream_id": stream_id,
-                    "job_id": job_id,
-                    "user_id": user_id,
-                    "reason": "already_processed",
-                },
-                sort_keys=True,
-            ),
+        _log_summary_job_skipped(
+            stream_id=stream_id,
+            job_id=job_id,
+            user_id=user_id,
+            reason="already_processed",
         )
         ack_summary_job(stream_id)
         return
 
     if not claim_summary_job_processing(idempotency_key, stream_id):
-        logger.info(
-            "SummaryJobSkipped | %s",
-            json.dumps(
-                {
-                    "stream_id": stream_id,
-                    "job_id": job_id,
-                    "user_id": user_id,
-                    "reason": "already_in_progress",
-                },
-                sort_keys=True,
-            ),
+        _log_summary_job_skipped(
+            stream_id=stream_id,
+            job_id=job_id,
+            user_id=user_id,
+            reason="already_in_progress",
         )
         ack_summary_job(stream_id)
         return
@@ -108,30 +126,14 @@ async def process_summary_job(stream_id: str, fields: dict):
             memory = await load_memory(user_id)
 
             if memory["last_summarized_seq"] >= cutoff_seq:
-                if memory.get("last_summary_job_id") == job_id and memory.get("summary_pending"):
-                    stale_update = dict(memory)
-                    stale_update["summary_pending"] = False
-                    stale_update["last_summary_job_id"] = ""
-                    stale_update["version"] = memory["version"] + 1
-                    await asyncio.to_thread(
-                        save_memory_if_version, user_id, memory["version"], stale_update
-                    )
-                mark_summary_job_processed(idempotency_key, stream_id)
-                ack_summary_job(stream_id)
+                await _clear_stale_summary_pending(memory, user_id=user_id, job_id=job_id)
+                _mark_processed_and_ack(idempotency_key, stream_id)
                 return
 
             old_messages = [m for m in memory["messages"] if m.get("seq", 0) <= cutoff_seq]
             if not old_messages:
-                if memory.get("last_summary_job_id") == job_id and memory.get("summary_pending"):
-                    stale_update = dict(memory)
-                    stale_update["summary_pending"] = False
-                    stale_update["last_summary_job_id"] = ""
-                    stale_update["version"] = memory["version"] + 1
-                    await asyncio.to_thread(
-                        save_memory_if_version, user_id, memory["version"], stale_update
-                    )
-                mark_summary_job_processed(idempotency_key, stream_id)
-                ack_summary_job(stream_id)
+                await _clear_stale_summary_pending(memory, user_id=user_id, job_id=job_id)
+                _mark_processed_and_ack(idempotency_key, stream_id)
                 return
 
             summary_text = await summarize_messages(_strip_seq(old_messages))
@@ -185,8 +187,7 @@ async def process_summary_job(stream_id: str, fields: dict):
                     sort_keys=True,
                 ),
             )
-            mark_summary_job_processed(idempotency_key, stream_id)
-            ack_summary_job(stream_id)
+            _mark_processed_and_ack(idempotency_key, stream_id)
             return
 
         raise RuntimeError("version conflict while updating memory")

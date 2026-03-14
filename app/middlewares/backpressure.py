@@ -88,6 +88,15 @@ class BackpressureMiddleware(BaseHTTPMiddleware):
             else None
         )
 
+    @staticmethod
+    def _busy_response(*, retry_after: int | None = None) -> JSONResponse:
+        headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Server is busy. Please retry shortly."},
+            headers=headers,
+        )
+
     async def _try_acquire_local_slot(self) -> bool:
         """Atomically reserve one local in-flight slot without private semaphore internals."""
         async with self._local_gate_lock:
@@ -101,35 +110,40 @@ class BackpressureMiddleware(BaseHTTPMiddleware):
         async with self._local_gate_lock:
             self._local_in_flight = max(0, self._local_in_flight - 1)
 
+    async def _try_acquire_distributed_slot(self, redis_token: str) -> tuple[bool, int]:
+        if self._redis_gate is None:
+            return True, 0
+        try:
+            return await asyncio.to_thread(self._redis_gate.acquire, redis_token)
+        except Exception as exc:
+            logger.warning(
+                "Distributed backpressure gate unavailable; falling back to local semaphore. %s",
+                exc,
+            )
+            return True, 0
+
+    async def _release_distributed_slot(self, redis_token: str, *, warning_message: str):
+        if self._redis_gate is None:
+            return
+        try:
+            await asyncio.to_thread(self._redis_gate.release, redis_token)
+        except Exception:
+            logger.warning(warning_message)
+
     async def dispatch(self, request, call_next):
         redis_token = uuid.uuid4().hex
         acquired_distributed = False
 
-        if self._redis_gate is not None:
-            try:
-                allowed, retry_after = await asyncio.to_thread(
-                    self._redis_gate.acquire, redis_token
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Distributed backpressure gate unavailable; falling back to local semaphore. %s",
-                    exc,
-                )
-                allowed, retry_after = True, 0
-
-            if not allowed:
-                logger.warning(
-                    "BackpressureRejectDistributed | method=%s path=%s retry_after=%s",
-                    request.method,
-                    request.url.path,
-                    retry_after,
-                )
-                return JSONResponse(
-                    status_code=503,
-                    content={"detail": "Server is busy. Please retry shortly."},
-                    headers={"Retry-After": str(retry_after)},
-                )
-            acquired_distributed = True
+        allowed, retry_after = await self._try_acquire_distributed_slot(redis_token)
+        if self._redis_gate is not None and not allowed:
+            logger.warning(
+                "BackpressureRejectDistributed | method=%s path=%s retry_after=%s",
+                request.method,
+                request.url.path,
+                retry_after,
+            )
+            return self._busy_response(retry_after=retry_after)
+        acquired_distributed = self._redis_gate is not None and allowed
 
         acquired_local = await self._try_acquire_local_slot()
         if not acquired_local:
@@ -138,24 +152,21 @@ class BackpressureMiddleware(BaseHTTPMiddleware):
                 request.method,
                 request.url.path,
             )
-            if acquired_distributed and self._redis_gate is not None:
-                try:
-                    await asyncio.to_thread(self._redis_gate.release, redis_token)
-                except Exception:
-                    logger.warning(
-                        "Failed releasing distributed backpressure token after local reject."
-                    )
-            return JSONResponse(
-                status_code=503,
-                content={"detail": "Server is busy. Please retry shortly."},
+            if acquired_distributed:
+                await self._release_distributed_slot(
+                    redis_token,
+                    warning_message="Failed releasing distributed backpressure token after local reject.",
+                )
+            return self._busy_response(
+                retry_after=retry_after if self._redis_gate is not None else None
             )
 
         try:
             return await call_next(request)
         finally:
             await self._release_local_slot()
-            if acquired_distributed and self._redis_gate is not None:
-                try:
-                    await asyncio.to_thread(self._redis_gate.release, redis_token)
-                except Exception:
-                    logger.warning("Failed releasing distributed backpressure token.")
+            if acquired_distributed:
+                await self._release_distributed_slot(
+                    redis_token,
+                    warning_message="Failed releasing distributed backpressure token.",
+                )

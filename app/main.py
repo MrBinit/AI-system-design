@@ -21,6 +21,7 @@ from app.services.offline_evaluation_service import (
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+API_V1_PREFIX = "/api/v1"
 
 
 def _configure_logging():
@@ -100,9 +101,9 @@ def create_app() -> FastAPI:
     if settings.middleware.enable_request_logging:
         app.add_middleware(RequestLoggingMiddleware)
 
-    app.include_router(chat_router, prefix="/api/v1")
-    app.include_router(evaluation_router, prefix="/api/v1")
-    app.include_router(ops_router, prefix="/api/v1")
+    app.include_router(chat_router, prefix=API_V1_PREFIX)
+    app.include_router(evaluation_router, prefix=API_V1_PREFIX)
+    app.include_router(ops_router, prefix=API_V1_PREFIX)
     return app
 
 

@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches:
-      - main
+      - [dev, main]
   workflow_dispatch:
   schedule:
     - cron: "30 2 * * *"
@@ -123,6 +123,54 @@ jobs:
 
           echo "Shard ${{ matrix.shard }} running ${#selected_tests[@]} test files"
           pytest -q --durations=25 --maxfail=1 --timeout=120 "${selected_tests[@]}"
+
+  sonar-quality-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs:
+      - lint
+      - unit-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_ACTIONS_PAT || github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements-prod.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Generate coverage report for SonarQube
+        run: |
+          pytest -q --cov=. --cov-report=xml:coverage.xml
+
+      - name: Scan with SonarQube (if configured)
+        if: ${{ secrets.SONAR_TOKEN != '' && vars.SONAR_HOST_URL != '' }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        run: |
+          docker run --rm \
+            -e SONAR_HOST_URL \
+            -e SONAR_TOKEN \
+            -v "${GITHUB_WORKSPACE}:/usr/src" \
+            sonarsource/sonar-scanner-cli:latest
+
+      - name: SonarQube skipped (missing config)
+        if: ${{ secrets.SONAR_TOKEN == '' || vars.SONAR_HOST_URL == '' }}
+        run: |
+          echo "Skipping SonarQube scan."
+          echo "Set repository secret SONAR_TOKEN and variable SONAR_HOST_URL to enable quality-gate scanning."
 
   integration-tests:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'

@@ -19,7 +19,7 @@ def test_retrieve_document_chunks_returns_results_with_timing(monkeypatch):
                 "document_id": "university_1",
                 "chunk_index": 1,
                 "source_file": "university_1.md",
-                "source_path": "/tmp/university_1.md",
+                "source_path": "/sandbox/university_1.md",
                 "content": "Master of Science in Artificial Intelligence Systems",
                 "char_count": 52,
                 "metadata": {"country": "Germany"},

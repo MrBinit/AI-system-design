@@ -157,3 +157,17 @@ Queue evaluation guarantee:
 Prompts and model:
 - prompts file: `app/config/evaluation_prompt.yaml`
 - model config: `app/config/evaluation_config.yaml` (`evaluation.judge_model_id`)
+
+## 9) Code Quality Gate (SonarQube)
+- Static analysis and quality-gate checks run in CI through `.github/workflows/ci.yml` (`sonar-quality-gate` job).
+- CI generates `coverage.xml` from `pytest --cov` and submits analysis using `sonar-project.properties`.
+- Required repository CI settings:
+  - secret: `SONAR_TOKEN`
+  - variable: `SONAR_HOST_URL` (for example `https://sonarqube.company.com`)
+- Local scan command:
+  - `sonar-scanner "-Dsonar.host.url=http://localhost:9000" "-Dsonar.token=$SONAR_TOKEN"`
+- Latest local quality-gate snapshot (March 14, 2026):
+  - Security: A, Reliability: A, Maintainability: A
+  - Coverage: 80.6%
+  - Duplications: 0.0%
+  - Security Hotspots: 0 (review rating A)

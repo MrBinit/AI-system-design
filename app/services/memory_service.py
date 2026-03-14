@@ -289,7 +289,6 @@ async def summarize_messages(messages: list) -> str:
                 "content": json.dumps(messages),
             },
         ],
-        timeout=settings.bedrock.timeout,
     )
 
     content = response.choices[0].message.content

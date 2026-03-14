@@ -40,7 +40,7 @@ class _FakeBedrockRuntimeClient:
         }
 
 
-async def _run_inline(fn, *, timeout=None):  # noqa: ARG001
+async def _run_inline(fn):
     return fn()
 
 
@@ -55,7 +55,7 @@ def test_aconverse_uses_model_scoped_circuit_breaker(monkeypatch):
         "modelId": "test-model",
         "messages": [{"role": "user", "content": [{"text": "hi"}]}],
     }
-    response = asyncio.run(bedrock_client.aconverse(payload, timeout=3))
+    response = asyncio.run(bedrock_client.aconverse(payload))
 
     assert response["output"]["message"]["content"][0]["text"] == "ok"
     assert len(fake_breaker.calls) == 1
@@ -76,7 +76,7 @@ def test_ainvoke_model_json_uses_embedding_circuit_breaker(monkeypatch):
         "contentType": "application/json",
         "accept": "application/json",
     }
-    response = asyncio.run(bedrock_client.ainvoke_model_json(payload, timeout=4))
+    response = asyncio.run(bedrock_client.ainvoke_model_json(payload))
 
     assert response == {"embedding": [0.1, 0.2]}
     assert len(fake_breaker.calls) == 1
@@ -98,7 +98,7 @@ def test_ainvoke_model_json_propagates_open_circuit(monkeypatch):
         "accept": "application/json",
     }
     with pytest.raises(CircuitBreakerError):
-        asyncio.run(bedrock_client.ainvoke_model_json(payload, timeout=4))
+        asyncio.run(bedrock_client.ainvoke_model_json(payload))
 
 
 def test_aconverse_stream_text_yields_deltas(monkeypatch):

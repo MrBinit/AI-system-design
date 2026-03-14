@@ -1,3 +1,5 @@
+from typing import Annotated
+
 from fastapi import APIRouter, Depends
 
 from app.api.dependencies.security import authorize_admin_access, get_current_principal
@@ -10,7 +12,7 @@ router = APIRouter()
 
 @router.get("/ops/status", response_model=OpsStatusResponse)
 async def ops_status(
-    principal: Principal = Depends(get_current_principal),
+    principal: Annotated[Principal, Depends(get_current_principal)],
 ):
     """Return the current operational status snapshot for admin users."""
     authorize_admin_access(principal)

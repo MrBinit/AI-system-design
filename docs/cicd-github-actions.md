@@ -2,7 +2,7 @@
 
 This project now includes:
 
-- `.github/workflows/ci.yml` (lint + tests on PR/push)
+- `.github/workflows/ci.yml` (lint + tests on PR/push + optional SonarQube quality-gate scan)
 - `.github/workflows/cd.yml` (build/push Docker images to ECR + direct deploy to EC2)
 
 ## 1) GitHub Secrets (Repository)
@@ -19,6 +19,8 @@ Add these in `Settings -> Secrets and variables -> Actions -> Secrets`:
   Private key content for the EC2 key pair (full PEM text).
 - `EC2_PORT` (optional)  
   Default is `22`.
+- `SONAR_TOKEN` (optional but recommended for CI quality gate)  
+  SonarQube project token used by CI scanner.
 
 ## 2) GitHub Variables (Repository)
 
@@ -29,6 +31,7 @@ Add these in `Settings -> Secrets and variables -> Actions -> Variables`:
 - `AWS_SECRETS_MANAGER_SECRET_ID` (for example `unigraph/prod/app`)
 - `API_WORKERS` (for example `1`)
 - `EC2_APP_DIR` (for example `/home/ubuntu/AI-system-design`)
+- `SONAR_HOST_URL` (for example `https://sonarqube.company.com`)
 
 ## 3) GitHub Environment Protection (Recommended)
 
@@ -90,3 +93,15 @@ On push to `main`:
 Manual trigger:
 
 - `Run workflow` for CD (same full deployment flow as push-to-main).
+
+## 8) SonarQube in CI
+
+The CI workflow runs SonarQube as a separate job after lint and unit tests:
+
+1. Run full test suite and generate `coverage.xml`
+2. Run `sonarsource/sonar-scanner-cli` in Docker
+3. Upload analysis to your SonarQube server
+
+Behavior:
+- If `SONAR_TOKEN` and `SONAR_HOST_URL` are present, scan runs and quality-gate status appears in SonarQube.
+- If either is missing, the Sonar step is skipped with an explicit message (CI still completes lint/tests).

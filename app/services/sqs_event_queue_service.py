@@ -50,16 +50,13 @@ def _send_json(queue_url: str, payload: dict, message_group_id: str = "global") 
         "MessageGroupId": _safe_message_group_id(message_group_id),
     }
     try:
-        try:
-            response = _sqs_client().send_message(**send_kwargs)
-        except ClientError as exc:
-            error_code = exc.response.get("Error", {}).get("Code")
-            if error_code not in {"InvalidParameterValue", "UnsupportedOperation"}:
-                raise
-            send_kwargs.pop("MessageGroupId", None)
-            response = _sqs_client().send_message(**send_kwargs)
-    except Exception:
-        raise
+        response = _sqs_client().send_message(**send_kwargs)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        if error_code not in {"InvalidParameterValue", "UnsupportedOperation"}:
+            raise
+        send_kwargs.pop("MessageGroupId", None)
+        response = _sqs_client().send_message(**send_kwargs)
     return str(response.get("MessageId", ""))
 
 

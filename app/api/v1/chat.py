@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from app.api.dependencies.security import authorize_user_access, get_current_principal
@@ -38,7 +39,7 @@ def _public_job_error(status: str, error: str) -> str:
 )
 async def chat(
     request: ChatRequest,
-    principal: Principal = Depends(get_current_principal),
+    principal: Annotated[Principal, Depends(get_current_principal)],
 ):
     """Enqueue an async chat job and return a job id immediately."""
     authorize_user_access(principal, request.user_id)
@@ -70,7 +71,7 @@ async def chat(
 @router.post("/chat/stream")
 async def chat_stream(
     request: ChatRequest,
-    principal: Principal = Depends(get_current_principal),
+    principal: Annotated[Principal, Depends(get_current_principal)],
 ):
     """Stream one chat completion over Server-Sent Events."""
     authorize_user_access(principal, request.user_id)
@@ -104,7 +105,7 @@ async def chat_stream(
 @router.get("/chat/{job_id}", response_model=AsyncChatStatusResponse)
 async def chat_status(
     job_id: str,
-    principal: Principal = Depends(get_current_principal),
+    principal: Annotated[Principal, Depends(get_current_principal)],
 ):
     """Return status/result for one async chat job."""
     record = await asyncio.to_thread(get_chat_job, job_id)

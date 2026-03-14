@@ -335,14 +335,13 @@ async def stop_offline_eval_scheduler() -> None:
     """Stop the background offline evaluation scheduler."""
     global _scheduler_task, _scheduler_lock_token
     lock_token = _scheduler_lock_token
-    if _scheduler_task is not None:
-        _scheduler_task.cancel()
-        try:
+    try:
+        if _scheduler_task is not None:
+            _scheduler_task.cancel()
             await _scheduler_task
-        except asyncio.CancelledError:
-            pass
-    if lock_token:
-        _release_scheduler_lock(lock_token)
-        if _scheduler_lock_token == lock_token:
-            _scheduler_lock_token = None
-    _scheduler_task = None
+    finally:
+        if lock_token:
+            _release_scheduler_lock(lock_token)
+            if _scheduler_lock_token == lock_token:
+                _scheduler_lock_token = None
+        _scheduler_task = None

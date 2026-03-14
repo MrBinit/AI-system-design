@@ -93,9 +93,7 @@ def _from_bedrock_response(response: dict[str, Any]) -> _CompatResponse:
 
 
 class _BedrockCompatCompletions:
-    async def create(
-        self, *, model: str, messages: list[dict[str, Any]], timeout: int | None = None
-    ):
+    async def create(self, *, model: str, messages: list[dict[str, Any]]):
         """Async chat completion entrypoint backed by Bedrock Converse."""
         system_blocks, convo_messages = _to_bedrock_payload(messages)
         payload: dict[str, Any] = {
@@ -106,12 +104,10 @@ class _BedrockCompatCompletions:
             payload["system"] = system_blocks
 
         async with dependency_limiter("llm"):
-            response = await aconverse(payload, timeout=timeout)
+            response = await aconverse(payload)
         return _from_bedrock_response(response)
 
-    async def stream(
-        self, *, model: str, messages: list[dict[str, Any]], timeout: int | None = None
-    ) -> AsyncIterator[str]:
+    async def stream(self, *, model: str, messages: list[dict[str, Any]]) -> AsyncIterator[str]:
         """Yield true Bedrock token deltas for chat responses."""
         system_blocks, convo_messages = _to_bedrock_payload(messages)
         payload: dict[str, Any] = {
@@ -122,7 +118,7 @@ class _BedrockCompatCompletions:
             payload["system"] = system_blocks
 
         async with dependency_limiter("llm"):
-            async for delta in aconverse_stream_text(payload, timeout=timeout):
+            async for delta in aconverse_stream_text(payload):
                 if delta:
                     yield delta
 

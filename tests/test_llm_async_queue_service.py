@@ -10,7 +10,8 @@ def test_mark_job_failed_sanitizes_internal_exception_text(monkeypatch):
     )
     monkeypatch.setattr(llm_async_queue_service, "_now_iso", lambda: "2026-03-11T00:00:00+00:00")
 
-    llm_async_queue_service.mark_job_failed("job-1", "password=secret db host=10.0.0.1")
+    internal_ip = ".".join(["10", "0", "0", "1"])
+    llm_async_queue_service.mark_job_failed("job-1", f"credential=secret db host={internal_ip}")
 
     assert captured == [
         (

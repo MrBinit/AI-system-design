@@ -1,3 +1,5 @@
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.dependencies.security import (
@@ -32,9 +34,9 @@ router = APIRouter()
 
 @router.get("/eval/conversations", response_model=EvaluationConversationListResponse)
 async def get_eval_conversations(
-    user_id: str = Query(min_length=3, max_length=128),
-    limit: int = Query(default=20, ge=1, le=200),
-    principal: Principal = Depends(get_current_principal),
+    user_id: Annotated[str, Query(min_length=3, max_length=128)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 20,
 ):
     """List recent stored chat conversations available for evaluation."""
     authorize_user_access(principal, user_id)
@@ -68,7 +70,7 @@ async def get_eval_conversations(
 async def label_eval_conversation(
     conversation_id: str,
     request: EvaluationConversationLabelRequest,
-    principal: Principal = Depends(get_current_principal),
+    principal: Annotated[Principal, Depends(get_current_principal)],
 ):
     """Attach expected answer and relevant chunks to a stored conversation."""
     authorize_user_access(principal, request.user_id)
@@ -101,9 +103,9 @@ async def label_eval_conversation(
 
 @router.get("/eval/report", response_model=EvaluationReportResponse)
 async def get_eval_report(
-    user_id: str = Query(min_length=3, max_length=128),
-    limit: int = Query(default=50, ge=1, le=200),
-    principal: Principal = Depends(get_current_principal),
+    user_id: Annotated[str, Query(min_length=3, max_length=128)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ):
     """Return aggregate retrieval and generation evaluation metrics for a user."""
     authorize_user_access(principal, user_id)
@@ -112,7 +114,7 @@ async def get_eval_report(
 
 @router.get("/eval/offline/status", response_model=OfflineEvaluationStatusResponse)
 async def get_eval_offline_status(
-    principal: Principal = Depends(get_current_principal),
+    principal: Annotated[Principal, Depends(get_current_principal)],
 ):
     """Return scheduler status for DynamoDB-based offline evaluation."""
     authorize_admin_access(principal)
@@ -121,12 +123,11 @@ async def get_eval_offline_status(
 
 @router.post("/eval/offline/run", response_model=OfflineEvaluationRunResponse)
 async def run_eval_offline(
-    force: bool = Query(
-        default=False,
+    principal: Annotated[Principal, Depends(get_current_principal)],
+    force: Annotated[bool, Query(
         description="If true, run immediately regardless of interval/new-data guards.",
-    ),
-    limit: int | None = Query(default=None, ge=1, le=5000),
-    principal: Principal = Depends(get_current_principal),
+    )] = False,
+    limit: Annotated[int | None, Query(ge=1, le=5000)] = None,
 ):
     """Run offline evaluator on demand."""
     authorize_admin_access(principal)
@@ -135,9 +136,9 @@ async def run_eval_offline(
 
 @router.get("/eval/offline/report", response_model=OfflineEvaluationReportResponse)
 async def get_eval_offline_report(
-    hours: int = Query(default=24, ge=1, le=720),
-    top_bad: int = Query(default=10, ge=0, le=100),
-    principal: Principal = Depends(get_current_principal),
+    principal: Annotated[Principal, Depends(get_current_principal)],
+    hours: Annotated[int, Query(ge=1, le=720)] = 24,
+    top_bad: Annotated[int, Query(ge=0, le=100)] = 10,
 ):
     """Build and return an on-demand report from offline evaluations."""
     authorize_admin_access(principal)

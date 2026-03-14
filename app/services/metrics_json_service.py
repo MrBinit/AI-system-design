@@ -1,6 +1,6 @@
 import json
 import math
-import random
+import secrets
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -147,24 +147,23 @@ def _percentile(values: list[float], p: int) -> float:
     return float(ordered[rank - 1])
 
 
+def _clean_latency_values(values) -> list[float]:
+    if not isinstance(values, list):
+        return []
+    cleaned: list[float] = []
+    for value in values[:_PERCENTILE_RESERVOIR_SIZE]:
+        numeric = _to_float(value)
+        if numeric is not None:
+            cleaned.append(numeric)
+    return cleaned
+
+
 def _latency_samples_store(aggregate: dict) -> dict[str, list[float]]:
     raw = aggregate.get("_latency_samples")
-    store: dict[str, list[float]] = {}
-    if isinstance(raw, dict):
-        for series in _LATENCY_TIMING_KEYS:
-            values = raw.get(series, [])
-            if isinstance(values, list):
-                cleaned = []
-                for value in values[:_PERCENTILE_RESERVOIR_SIZE]:
-                    numeric = _to_float(value)
-                    if numeric is not None:
-                        cleaned.append(numeric)
-                store[series] = cleaned
-            else:
-                store[series] = []
-    else:
-        for series in _LATENCY_TIMING_KEYS:
-            store[series] = []
+    source = raw if isinstance(raw, dict) else {}
+    store: dict[str, list[float]] = {
+        series: _clean_latency_values(source.get(series, [])) for series in _LATENCY_TIMING_KEYS
+    }
     aggregate["_latency_samples"] = store
     return store
 
@@ -175,7 +174,7 @@ def _update_reservoir_sample(samples: list[float], numeric: float, total_count: 
         return
     if total_count <= _PERCENTILE_RESERVOIR_SIZE:
         return
-    replace_index = random.randint(0, total_count - 1)
+    replace_index = secrets.randbelow(total_count)
     if replace_index < _PERCENTILE_RESERVOIR_SIZE:
         samples[replace_index] = numeric
 

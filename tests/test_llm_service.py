@@ -525,3 +525,74 @@ def test_chat_cache_key_changes_across_sessions():
     key_b = llm_service._chat_cache_key("user-1", prompt, "session-b")
 
     assert key_a != key_b
+
+
+def test_build_json_metrics_record_uses_metrics_state_and_legacy_kwargs():
+    record = llm_service._build_json_metrics_record(
+        request_id="req-1",
+        started_at=0.0,
+        user_id="user-1",
+        session_id="session-1",
+        user_prompt="prompt",
+        safe_user_prompt="prompt",
+        answer="answer",
+        outcome="success",
+        metrics_state={
+            "model_ms": 11,
+            "build_context_ms": 12,
+            "retrieval_ms": 13,
+            "retrieved_count": 2,
+            "retrieval_strategy": "hybrid",
+            "quality": {"hallucination_proxy": 0.1},
+        },
+        llm_usage={"total_tokens": 5},
+        used_fallback_model=True,
+    )
+
+    assert record["timings_ms"]["llm_response_ms"] == 11
+    assert record["timings_ms"]["short_term_memory_ms"] == 12
+    assert record["timings_ms"]["long_term_memory_ms"] == 13
+    assert record["retrieval"]["strategy"] == "hybrid"
+    assert record["retrieval"]["result_count"] == 2
+    assert record["llm_usage"] == {"total_tokens": 5}
+    assert record["model"]["used_fallback"] is True
+    assert record["hallucination_proxy"] == 0.1
+
+
+def test_retrieval_helpers_handle_invalid_and_valid_inputs():
+    assert llm_service._retrieval_result_label(None, 3) == "Result 3"
+    assert llm_service._retrieval_result_label(
+        {"university": "Uni", "section_heading": "Programs"}, 1
+    ) == "Uni | Programs"
+    assert llm_service._retrieval_content_and_metadata(None) == ("", {})
+    assert llm_service._retrieval_content_and_metadata({"content": "   "}) == ("", {})
+    assert llm_service._retrieval_content_and_metadata(
+        {"content": "Chunk text", "metadata": {"country": "DE"}}
+    ) == ("Chunk text", {"country": "DE"})
+
+
+def test_format_retrieval_context_dedupes_and_limits_results():
+    payload = {
+        "results": [
+            {
+                "content": "Alpha program details",
+                "metadata": {"university": "A", "section_heading": "Programs"},
+            },
+            {
+                "content": "Alpha   program   details",
+                "metadata": {"university": "A2", "section_heading": "Programs 2"},
+            },
+            {
+                "content": "Beta research details",
+                "metadata": {"university": "B", "section_heading": "Research"},
+            },
+        ]
+    }
+    message = llm_service._format_retrieval_context(payload)
+
+    assert message is not None
+    assert message["role"] == "system"
+    content = message["content"]
+    assert "1. A | Programs: Alpha program details" in content
+    assert "2. B | Research: Beta research details" in content
+    assert "A2 | Programs 2" not in content

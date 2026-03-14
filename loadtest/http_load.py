@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 import time
 import urllib.error
@@ -13,20 +12,10 @@ import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
-
-def _percentile(values: list[float], pct: float) -> float:
-    if not values:
-        return 0.0
-    sorted_values = sorted(values)
-    rank = (pct / 100.0) * (len(sorted_values) - 1)
-    lower = math.floor(rank)
-    upper = math.ceil(rank)
-    if lower == upper:
-        return sorted_values[lower]
-    lower_value = sorted_values[lower]
-    upper_value = sorted_values[upper]
-    fraction = rank - lower
-    return lower_value + (upper_value - lower_value) * fraction
+try:
+    from loadtest.common_stats import percentile
+except ModuleNotFoundError:
+    from common_stats import percentile
 
 
 def _parse_args() -> argparse.Namespace:
@@ -139,9 +128,9 @@ def main() -> int:
     print(f"success_count:    {success_count}")
     print(f"error_count:      {error_count}")
     print(f"error_rate:       {error_rate:.4f}")
-    print(f"latency_p50_ms:   {_percentile(latencies, 50):.2f}")
-    print(f"latency_p95_ms:   {_percentile(latencies, 95):.2f}")
-    print(f"latency_p99_ms:   {_percentile(latencies, 99):.2f}")
+    print(f"latency_p50_ms:   {percentile(latencies, 50):.2f}")
+    print(f"latency_p95_ms:   {percentile(latencies, 95):.2f}")
+    print(f"latency_p99_ms:   {percentile(latencies, 99):.2f}")
     print(f"latency_max_ms:   {max(latencies) if latencies else 0.0:.2f}")
     print(f"status_counts:    {dict(status_counts)}")
     if error_counts:

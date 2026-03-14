@@ -12,6 +12,7 @@ from app.infra.bedrock_chat_client import client
 settings = get_settings()
 evaluation_prompts = get_evaluation_prompts()
 _deserializer = TypeDeserializer()
+_STATUS_TOKEN = "#status"
 
 
 def _utc_now() -> datetime:
@@ -166,7 +167,6 @@ async def _evaluate_one(record: dict) -> dict:
         response = await client.chat.completions.create(
             model=settings.evaluation.judge_model_id,
             messages=_judge_prompt(system_prompt, payload),
-            timeout=settings.bedrock.timeout,
         )
         content = response.choices[0].message.content if response.choices else ""
         judged = _extract_json_block(content)
@@ -318,6 +318,7 @@ def _load_requests_for_eval(max_items: int, lookback_hours: int) -> list[dict]:
     cutoff_iso = _safe_iso(_utc_now() - timedelta(hours=lookback_hours))
     status_attr = _request_status_attr()
     pending_value = _request_pending_value()
+    status_token = _STATUS_TOKEN
     ddb = _dynamodb_client()
     items: list[dict] = []
     last_key: dict | None = None
@@ -325,9 +326,9 @@ def _load_requests_for_eval(max_items: int, lookback_hours: int) -> list[dict]:
         kwargs = {
             "TableName": requests_table,
             "IndexName": index_name,
-            "KeyConditionExpression": "#status = :status_value AND #ts >= :cutoff_iso",
+            "KeyConditionExpression": f"{status_token} = :status_value AND #ts >= :cutoff_iso",
             "ExpressionAttributeNames": {
-                "#status": status_attr,
+                status_token: status_attr,
                 "#ts": "timestamp",
             },
             "ExpressionAttributeValues": {
@@ -336,7 +337,7 @@ def _load_requests_for_eval(max_items: int, lookback_hours: int) -> list[dict]:
             },
             "ProjectionExpression": (
                 "request_id,#ts,user_id,session_id,outcome,question,query,answer,"
-                "retrieval_evidence_json,#status"
+                f"retrieval_evidence_json,{status_token}"
             ),
             "Limit": min(100, max_items - len(items)),
             "ScanIndexForward": False,
@@ -370,15 +371,15 @@ def _claim_request_for_eval(request_id: str) -> bool:
         ddb.update_item(
             TableName=requests_table,
             Key={"request_id": {"S": request_id}},
-            UpdateExpression="SET #status = :in_progress, #status_updated = :now_iso",
+            UpdateExpression=f"SET {_STATUS_TOKEN} = :in_progress, #status_updated = :now_iso",
             ConditionExpression=(
                 "attribute_exists(request_id) "
                 "AND #outcome = :success "
-                "AND (attribute_not_exists(#status) OR #status = :pending)"
+                f"AND (attribute_not_exists({_STATUS_TOKEN}) OR {_STATUS_TOKEN} = :pending)"
             ),
             ExpressionAttributeNames={
                 "#outcome": "outcome",
-                "#status": status_attr,
+                _STATUS_TOKEN: status_attr,
                 "#status_updated": status_updated_attr,
             },
             ExpressionAttributeValues={
@@ -402,9 +403,9 @@ def _mark_request_eval_status(request_id: str, status: str) -> None:
     _dynamodb_client().update_item(
         TableName=requests_table,
         Key={"request_id": {"S": request_id}},
-        UpdateExpression="SET #status = :status, #status_updated = :now_iso",
+        UpdateExpression=f"SET {_STATUS_TOKEN} = :status, #status_updated = :now_iso",
         ExpressionAttributeNames={
-            "#status": status_attr,
+            _STATUS_TOKEN: status_attr,
             "#status_updated": status_updated_attr,
         },
         ExpressionAttributeValues={

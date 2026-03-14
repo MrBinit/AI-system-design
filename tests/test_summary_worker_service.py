@@ -122,6 +122,61 @@ async def test_process_summary_job_stale_acks_without_retry(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_process_summary_job_stale_clears_pending_for_matching_job(monkeypatch):
+    acked = []
+    marked = []
+    stale_updates = []
+
+    async def fake_load_memory(_user_id):
+        memory = _base_memory()
+        memory["last_summarized_seq"] = 10
+        memory["last_summary_job_id"] = "job-2"
+        memory["summary_pending"] = True
+        return memory
+
+    def fake_save_if_version(_user_id, _expected_version, memory):
+        stale_updates.append(memory)
+        return True, memory
+
+    monkeypatch.setattr(summary_worker_service, "load_memory", fake_load_memory)
+    monkeypatch.setattr(summary_worker_service, "save_memory_if_version", fake_save_if_version)
+    monkeypatch.setattr(
+        summary_worker_service, "get_summary_job_idempotency_key", lambda _fields: "idem-2b"
+    )
+    monkeypatch.setattr(summary_worker_service, "is_summary_job_processed", lambda _key: False)
+    monkeypatch.setattr(
+        summary_worker_service, "claim_summary_job_processing", lambda _key, _stream_id: True
+    )
+    monkeypatch.setattr(
+        summary_worker_service,
+        "mark_summary_job_processed",
+        lambda key, stream_id: marked.append((key, stream_id)),
+    )
+    monkeypatch.setattr(summary_worker_service, "release_summary_job_processing", lambda _key: None)
+    monkeypatch.setattr(
+        summary_worker_service, "ack_summary_job", lambda stream_id: acked.append(stream_id)
+    )
+    monkeypatch.setattr(
+        summary_worker_service,
+        "retry_or_dlq_summary_job",
+        lambda _stream_id, _fields, _error: (_ for _ in ()).throw(
+            AssertionError("should not retry")
+        ),
+    )
+
+    await summary_worker_service.process_summary_job(
+        "2-1",
+        {"job_id": "job-2", "user_id": "user-1", "cutoff_seq": "2", "trigger": "summary_trigger"},
+    )
+
+    assert acked == ["2-1"]
+    assert marked == [("idem-2b", "2-1")]
+    assert len(stale_updates) == 1
+    assert stale_updates[0]["summary_pending"] is False
+    assert stale_updates[0]["last_summary_job_id"] == ""
+
+
+@pytest.mark.asyncio
 async def test_process_summary_job_retries_on_error(monkeypatch):
     acked = []
     retried = []

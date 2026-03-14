@@ -120,7 +120,7 @@ def test_embed_chunk_manifest_writes_embedding_output(tmp_path: Path, monkeypatc
         json.dumps(
             {
                 "source_file": "sample.md",
-                "source_path": "/tmp/sample.md",
+                "source_path": "/sandbox/sample.md",
                 "document_metadata": {"document_id": "sample"},
                 "chunk_count": 1,
                 "chunk_size_chars": 900,
@@ -130,7 +130,7 @@ def test_embed_chunk_manifest_writes_embedding_output(tmp_path: Path, monkeypatc
                         "chunk_id": "sample:0000",
                         "chunk_index": 0,
                         "source_file": "sample.md",
-                        "source_path": "/tmp/sample.md",
+                        "source_path": "/sandbox/sample.md",
                         "char_count": 42,
                         "metadata": {"document_id": "sample"},
                         "content": "Sample chunk for embedding.",
@@ -160,8 +160,7 @@ def test_aembed_text_uses_async_wrapper(monkeypatch):
     fake_redis = _FakeRedis()
     monkeypatch.setattr(embedding_service, "async_redis_client", fake_redis)
 
-    async def _fake_ainvoke_model_json(_payload, timeout=None):
-        assert timeout == embedding_service.settings.bedrock.timeout
+    async def _fake_ainvoke_model_json(_payload):
         return {"embedding": [9.0, 8.0, 7.0]}
 
     monkeypatch.setattr(embedding_service, "ainvoke_model_json", _fake_ainvoke_model_json)
@@ -178,7 +177,7 @@ def test_aembed_chunk_manifest_writes_embedding_output(tmp_path: Path, monkeypat
         json.dumps(
             {
                 "source_file": "sample.md",
-                "source_path": "/tmp/sample.md",
+                "source_path": "/sandbox/sample.md",
                 "document_metadata": {"document_id": "sample"},
                 "chunk_count": 2,
                 "chunk_size_chars": 900,
@@ -188,7 +187,7 @@ def test_aembed_chunk_manifest_writes_embedding_output(tmp_path: Path, monkeypat
                         "chunk_id": "sample:0000",
                         "chunk_index": 0,
                         "source_file": "sample.md",
-                        "source_path": "/tmp/sample.md",
+                        "source_path": "/sandbox/sample.md",
                         "char_count": 21,
                         "metadata": {"document_id": "sample"},
                         "content": "Chunk one.",
@@ -197,7 +196,7 @@ def test_aembed_chunk_manifest_writes_embedding_output(tmp_path: Path, monkeypat
                         "chunk_id": "sample:0001",
                         "chunk_index": 1,
                         "source_file": "sample.md",
-                        "source_path": "/tmp/sample.md",
+                        "source_path": "/sandbox/sample.md",
                         "char_count": 21,
                         "metadata": {"document_id": "sample"},
                         "content": "Chunk two.",

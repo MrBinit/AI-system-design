@@ -62,6 +62,35 @@ def _normalize_separators(separators: list[str]) -> list[str]:
     return cleaned or [""]
 
 
+def _window_end_at_boundary(text: str, start: int, chunk_size: int) -> int:
+    """Pick a chunk end point that prefers whitespace boundaries."""
+    end = min(start + chunk_size, len(text))
+    if end >= len(text):
+        return end
+    boundary = max(
+        text.rfind("\n", start + 1, end),
+        text.rfind(" ", start + 1, end),
+    )
+    return boundary if boundary > start else end
+
+
+def _next_window_start(text: str, end: int, overlap: int) -> int:
+    """Compute next chunk start and avoid starting mid-word."""
+    next_start = max(0, end - overlap)
+    if (
+        next_start <= 0
+        or next_start >= len(text)
+        or text[next_start - 1].isspace()
+        or text[next_start].isspace()
+    ):
+        return next_start
+    while next_start < len(text) and not text[next_start].isspace():
+        next_start += 1
+    while next_start < len(text) and text[next_start].isspace():
+        next_start += 1
+    return next_start
+
+
 def _fixed_window_split(text: str, chunk_size: int, overlap: int) -> list[str]:
     """Split text into overlapping windows, snapping cuts to whitespace when possible."""
     stripped = text.strip()
@@ -74,14 +103,7 @@ def _fixed_window_split(text: str, chunk_size: int, overlap: int) -> list[str]:
     chunks = []
     start = 0
     while start < len(stripped):
-        end = min(start + chunk_size, len(stripped))
-        if end < len(stripped):
-            boundary = max(
-                stripped.rfind("\n", start + 1, end),
-                stripped.rfind(" ", start + 1, end),
-            )
-            if boundary > start:
-                end = boundary
+        end = _window_end_at_boundary(stripped, start, chunk_size)
 
         chunk = stripped[start:end].strip()
         if chunk:
@@ -89,19 +111,62 @@ def _fixed_window_split(text: str, chunk_size: int, overlap: int) -> list[str]:
         if end >= len(stripped):
             break
 
-        next_start = max(0, end - overlap)
-        if (
-            next_start > 0
-            and next_start < len(stripped)
-            and not stripped[next_start - 1].isspace()
-            and not stripped[next_start].isspace()
-        ):
-            while next_start < len(stripped) and not stripped[next_start].isspace():
-                next_start += 1
-            while next_start < len(stripped) and stripped[next_start].isspace():
-                next_start += 1
-        start = next_start
+        start = _next_window_start(stripped, end, overlap)
     return chunks
+
+
+def _append_recursive_segment(
+    segment: str,
+    *,
+    target: list[str],
+    separators: list[str],
+    chunk_size: int,
+    overlap: int,
+) -> None:
+    if not segment:
+        return
+    target.extend(_recursive_split(segment, separators, chunk_size, overlap))
+
+
+def _split_parts_recursively(
+    parts: list[str],
+    *,
+    separator: str,
+    next_separators: list[str],
+    chunk_size: int,
+    overlap: int,
+) -> list[str]:
+    segments: list[str] = []
+    current = ""
+    for part in parts:
+        candidate = part if not current else f"{current}{separator}{part}"
+        if len(candidate) <= chunk_size:
+            current = candidate
+            continue
+        _append_recursive_segment(
+            current,
+            target=segments,
+            separators=next_separators,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
+        current = part if len(part) <= chunk_size else ""
+        if not current:
+            _append_recursive_segment(
+                part,
+                target=segments,
+                separators=next_separators,
+                chunk_size=chunk_size,
+                overlap=overlap,
+            )
+    _append_recursive_segment(
+        current,
+        target=segments,
+        separators=next_separators,
+        chunk_size=chunk_size,
+        overlap=overlap,
+    )
+    return segments
 
 
 def _recursive_split(text: str, separators: list[str], chunk_size: int, overlap: int) -> list[str]:
@@ -124,26 +189,13 @@ def _recursive_split(text: str, separators: list[str], chunk_size: int, overlap:
     if len(parts) <= 1:
         return _recursive_split(stripped, separators[1:], chunk_size, overlap)
 
-    segments: list[str] = []
-    current = ""
-    for part in parts:
-        candidate = part if not current else f"{current}{separator}{part}"
-        if len(candidate) <= chunk_size:
-            current = candidate
-            continue
-
-        if current:
-            segments.extend(_recursive_split(current, separators[1:], chunk_size, overlap))
-        current = ""
-
-        if len(part) <= chunk_size:
-            current = part
-        else:
-            segments.extend(_recursive_split(part, separators[1:], chunk_size, overlap))
-
-    if current:
-        segments.extend(_recursive_split(current, separators[1:], chunk_size, overlap))
-    return segments
+    return _split_parts_recursively(
+        parts,
+        separator=separator,
+        next_separators=separators[1:],
+        chunk_size=chunk_size,
+        overlap=overlap,
+    )
 
 
 def _is_heading_marker(paragraph: str) -> bool:

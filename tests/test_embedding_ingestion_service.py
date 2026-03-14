@@ -14,7 +14,7 @@ def test_ingest_configured_embedding_manifests_reads_embedding_files(tmp_path: P
                         "chunk_id": "sample:0000",
                         "chunk_index": 0,
                         "source_file": "sample.md",
-                        "source_path": "/tmp/sample.md",
+                        "source_path": "/sandbox/sample.md",
                         "content": "sample",
                         "char_count": 6,
                         "metadata": {"document_id": "sample"},

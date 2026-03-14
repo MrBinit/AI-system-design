@@ -18,7 +18,7 @@ def _roles_from_claim(claim) -> list[str]:
     return []
 
 
-async def get_current_principal(
+def get_current_principal(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(http_bearer),
 ) -> Principal:

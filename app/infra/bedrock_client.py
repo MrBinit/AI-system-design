@@ -1,9 +1,11 @@
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 import boto3
+from anyio import fail_after
 
 from app.core.config import get_settings
 from app.infra.circuit import get_embedding_breaker, get_llm_breaker
@@ -27,16 +29,35 @@ def get_bedrock_runtime_client():
     return _bedrock_runtime_client
 
 
-async def _run_in_bedrock_executor(fn, *, timeout: int | None = None):
+def _normalized_timeout_seconds(timeout_value: int | float | None) -> float | None:
+    """Normalize timeout config into positive seconds or None when disabled."""
+    if timeout_value is None:
+        return None
+    try:
+        seconds = float(timeout_value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
+@asynccontextmanager
+async def _timeout_scope(timeout_value: int | float | None):
+    """Apply asyncio timeout only when a positive timeout is configured."""
+    seconds = _normalized_timeout_seconds(timeout_value)
+    if seconds is None:
+        yield
+        return
+    with fail_after(seconds):
+        yield
+
+
+async def _run_in_bedrock_executor(fn):
     """Run one blocking Bedrock SDK operation on the dedicated Bedrock thread pool."""
     loop = asyncio.get_running_loop()
-    result = loop.run_in_executor(_BEDROCK_EXECUTOR, fn)
-    if timeout and int(timeout) > 0:
-        return await asyncio.wait_for(result, timeout=float(timeout))
-    return await result
+    return await loop.run_in_executor(_BEDROCK_EXECUTOR, fn)
 
 
-async def aconverse(payload: dict[str, Any], *, timeout: int | None = None) -> dict[str, Any]:
+async def aconverse(payload: dict[str, Any]) -> dict[str, Any]:
     """Invoke Bedrock Converse asynchronously using the dedicated Bedrock executor."""
 
     def _invoke():
@@ -44,13 +65,12 @@ async def aconverse(payload: dict[str, Any], *, timeout: int | None = None) -> d
         model_id = str(payload.get("modelId", "")).strip() or "default"
         return get_llm_breaker(model_id).call(client.converse, **payload)
 
-    return await _run_in_bedrock_executor(_invoke, timeout=timeout)
+    async with _timeout_scope(settings.bedrock.timeout):
+        return await _run_in_bedrock_executor(_invoke)
 
 
 async def ainvoke_model(
     payload: dict[str, Any],
-    *,
-    timeout: int | None = None,
 ) -> dict[str, Any]:
     """Invoke Bedrock invoke_model asynchronously using the dedicated Bedrock executor."""
 
@@ -58,13 +78,12 @@ async def ainvoke_model(
         client = get_bedrock_runtime_client()
         return get_embedding_breaker().call(client.invoke_model, **payload)
 
-    return await _run_in_bedrock_executor(_invoke, timeout=timeout)
+    async with _timeout_scope(settings.bedrock.timeout):
+        return await _run_in_bedrock_executor(_invoke)
 
 
 async def ainvoke_model_json(
     payload: dict[str, Any],
-    *,
-    timeout: int | None = None,
 ) -> dict[str, Any]:
     """Invoke Bedrock and decode the model body into a JSON object in one async call."""
 
@@ -79,7 +98,8 @@ async def ainvoke_model_json(
             raise ValueError("Bedrock response body must decode to a JSON object.")
         return payload_obj
 
-    return await _run_in_bedrock_executor(_invoke_and_decode, timeout=timeout)
+    async with _timeout_scope(settings.bedrock.timeout):
+        return await _run_in_bedrock_executor(_invoke_and_decode)
 
 
 def _parse_converse_stream_event(event: dict[str, Any]) -> tuple[str, Exception | None]:
@@ -114,43 +134,66 @@ def _parse_converse_stream_event(event: dict[str, Any]) -> tuple[str, Exception 
     return "", None
 
 
+def _put_stream_item(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, item: object) -> None:
+    """Push one stream item into the async queue from a worker thread."""
+    loop.call_soon_threadsafe(queue.put_nowait, item)
+
+
+def _produce_converse_stream(
+    payload: dict[str, Any],
+    loop: asyncio.AbstractEventLoop,
+    queue: asyncio.Queue,
+    sentinel: object,
+) -> None:
+    """Pull Bedrock stream events in a worker thread and publish parsed deltas/errors."""
+    try:
+        client = get_bedrock_runtime_client()
+        model_id = str(payload.get("modelId", "")).strip() or "default"
+        response = get_llm_breaker(model_id).call(client.converse_stream, **payload)
+        for event in response.get("stream", []):
+            text, stream_error = _parse_converse_stream_event(event)
+            if stream_error is not None:
+                _put_stream_item(loop, queue, stream_error)
+                return
+            if text:
+                _put_stream_item(loop, queue, text)
+    except Exception as exc:
+        _put_stream_item(loop, queue, exc)
+    finally:
+        _put_stream_item(loop, queue, sentinel)
+
+
+def _consume_stream_item(item: object, sentinel: object) -> tuple[bool, str]:
+    """Translate queue payloads into stream control signals and text output."""
+    if item is sentinel:
+        return True, ""
+    if isinstance(item, Exception):
+        raise item
+    return False, str(item)
+
+
 async def aconverse_stream_text(
     payload: dict[str, Any],
-    *,
-    timeout: int | None = None,  # noqa: ARG001 - reserved for future stream timeout control
 ) -> AsyncIterator[str]:
     """Yield incremental text deltas from Bedrock ConverseStream."""
-    del timeout
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     sentinel = object()
 
-    def _produce():
-        try:
-            client = get_bedrock_runtime_client()
-            model_id = str(payload.get("modelId", "")).strip() or "default"
-            response = get_llm_breaker(model_id).call(client.converse_stream, **payload)
-            stream = response.get("stream", [])
-            for event in stream:
-                text, stream_error = _parse_converse_stream_event(event)
-                if stream_error is not None:
-                    loop.call_soon_threadsafe(queue.put_nowait, stream_error)
-                    return
-                if text:
-                    loop.call_soon_threadsafe(queue.put_nowait, text)
-        except Exception as exc:
-            loop.call_soon_threadsafe(queue.put_nowait, exc)
-        finally:
-            loop.call_soon_threadsafe(queue.put_nowait, sentinel)
-
-    producer_task = loop.run_in_executor(_BEDROCK_EXECUTOR, _produce)
+    producer_task = loop.run_in_executor(
+        _BEDROCK_EXECUTOR,
+        _produce_converse_stream,
+        payload,
+        loop,
+        queue,
+        sentinel,
+    )
     try:
         while True:
             item = await queue.get()
-            if item is sentinel:
+            is_done, text = _consume_stream_item(item, sentinel)
+            if is_done:
                 break
-            if isinstance(item, Exception):
-                raise item
-            yield str(item)
+            yield text
     finally:
         await producer_task

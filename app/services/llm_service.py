@@ -188,6 +188,8 @@ async def _record_json_metrics(record: dict) -> None:
         asyncio.create_task(_enqueue()),
         label="Metrics event enqueue",
     )
+    # Yield control so this helper actually uses async semantics while remaining fire-and-forget.
+    await asyncio.sleep(0)
 
 
 def _build_json_metrics_record(
@@ -200,25 +202,15 @@ def _build_json_metrics_record(
     safe_user_prompt: str,
     answer: str,
     outcome: str,
-    build_context_ms: int | None,
-    retrieval_ms: int | None,
-    model_ms: int | None,
-    memory_update_ms: int | None,
-    cache_read_ms: int | None,
-    cache_write_ms: int | None,
-    evaluation_trace_ms: int | None,
-    retrieval_strategy: str,
-    retrieved_count: int,
-    retrieval_evidence: list[dict] | None,
-    quality: dict,
-    llm_usage: dict,
-    input_guard_reason: str,
-    context_guard_reason: str,
-    output_guard_reason: str,
-    used_fallback_model: bool,
+    metrics_state: dict | None = None,
     error_message: str = "",
+    **legacy_state,
 ) -> dict:
     """Build the per-request metrics payload persisted to JSON."""
+    state: dict = dict(legacy_state)
+    if isinstance(metrics_state, dict):
+        state.update(metrics_state)
+
     return {
         "request_id": request_id,
         "user_id": user_id,
@@ -229,30 +221,30 @@ def _build_json_metrics_record(
         "outcome": outcome,
         "timings_ms": {
             "overall_response_ms": _elapsed_ms(started_at),
-            "llm_response_ms": model_ms,
-            "short_term_memory_ms": build_context_ms,
-            "long_term_memory_ms": retrieval_ms,
-            "memory_update_ms": memory_update_ms,
-            "cache_read_ms": cache_read_ms,
-            "cache_write_ms": cache_write_ms,
-            "evaluation_trace_ms": evaluation_trace_ms,
+            "llm_response_ms": state.get("model_ms"),
+            "short_term_memory_ms": state.get("build_context_ms"),
+            "long_term_memory_ms": state.get("retrieval_ms"),
+            "memory_update_ms": state.get("memory_update_ms"),
+            "cache_read_ms": state.get("cache_read_ms"),
+            "cache_write_ms": state.get("cache_write_ms"),
+            "evaluation_trace_ms": state.get("evaluation_trace_ms"),
         },
         "retrieval": {
-            "strategy": retrieval_strategy,
-            "result_count": retrieved_count,
-            "evidence": retrieval_evidence or [],
+            "strategy": str(state.get("retrieval_strategy", "none")),
+            "result_count": int(state.get("retrieved_count", 0)),
+            "evidence": state.get("retrieval_evidence") or [],
         },
-        "quality": quality,
-        "hallucination_proxy": quality.get("hallucination_proxy"),
-        "llm_usage": llm_usage,
+        "quality": state.get("quality", {}),
+        "hallucination_proxy": (state.get("quality") or {}).get("hallucination_proxy"),
+        "llm_usage": state.get("llm_usage", {}),
         "guardrails": {
-            "input_reason": input_guard_reason,
-            "context_reason": context_guard_reason,
-            "output_reason": output_guard_reason,
+            "input_reason": str(state.get("input_guard_reason", "")),
+            "context_reason": str(state.get("context_guard_reason", "")),
+            "output_reason": str(state.get("output_guard_reason", "")),
         },
         "model": {
             "provider": "amazon_bedrock",
-            "used_fallback": used_fallback_model,
+            "used_fallback": bool(state.get("used_fallback_model", False)),
             "primary_model_id": settings.bedrock.primary_model_id,
             "fallback_model_id": settings.bedrock.fallback_model_id,
         },
@@ -335,6 +327,29 @@ def _build_retrieval_query(messages: list[dict]) -> str:
     return "\n\n".join(text_parts[-2:])[:_RETRIEVAL_QUERY_MAX_CHARS].strip()
 
 
+def _retrieval_result_label(metadata, index: int) -> str:
+    if not isinstance(metadata, dict):
+        return f"Result {index}"
+    label_parts: list[str] = []
+    university = metadata.get("university")
+    section_heading = metadata.get("section_heading")
+    if isinstance(university, str) and university.strip():
+        label_parts.append(university.strip())
+    if isinstance(section_heading, str) and section_heading.strip():
+        label_parts.append(section_heading.strip())
+    return " | ".join(label_parts) if label_parts else f"Result {index}"
+
+
+def _retrieval_content_and_metadata(result) -> tuple[str, dict]:
+    if not isinstance(result, dict):
+        return "", {}
+    content = result.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return "", {}
+    metadata = result.get("metadata")
+    return content, metadata if isinstance(metadata, dict) else {}
+
+
 def _format_retrieval_context(retrieval_result: dict) -> dict | None:
     """Convert retrieved long-term chunks into a single system-context message."""
     results = retrieval_result.get("results", []) if isinstance(retrieval_result, dict) else []
@@ -347,11 +362,8 @@ def _format_retrieval_context(retrieval_result: dict) -> dict | None:
     seen_chunks: set[str] = set()
     used_results = 0
     for result in results:
-        if not isinstance(result, dict):
-            continue
-        content = result.get("content")
-        metadata = result.get("metadata") or {}
-        if not isinstance(content, str) or not content.strip():
+        content, metadata = _retrieval_content_and_metadata(result)
+        if not content:
             continue
         dedupe_key = " ".join(content.lower().split())[:180]
         if dedupe_key in seen_chunks:
@@ -359,15 +371,7 @@ def _format_retrieval_context(retrieval_result: dict) -> dict | None:
         seen_chunks.add(dedupe_key)
         used_results += 1
 
-        label_parts = []
-        if isinstance(metadata, dict):
-            university = metadata.get("university")
-            section_heading = metadata.get("section_heading")
-            if isinstance(university, str) and university.strip():
-                label_parts.append(university.strip())
-            if isinstance(section_heading, str) and section_heading.strip():
-                label_parts.append(section_heading.strip())
-        label = " | ".join(label_parts) if label_parts else f"Result {used_results}"
+        label = _retrieval_result_label(metadata, used_results)
         compact_content = " ".join(content.split())[:_RETRIEVAL_CHUNK_MAX_CHARS]
         lines.append(f"{used_results}. {label}: {compact_content}")
         if used_results >= _RETRIEVAL_MAX_PROMPT_RESULTS:
@@ -448,36 +452,22 @@ async def _persist_evaluation_trace(
     )
 
 
-async def _call_primary(messages: list):
-    """Send the request to the primary Bedrock model."""
+async def _chat_completion(messages: list, *, model_id: str):
+    """Send one non-streaming chat completion request."""
     if _truthy_env(_LLM_MOCK_MODE_ENV):
         delay_seconds = _llm_mock_delay_seconds()
         if delay_seconds > 0:
             await asyncio.sleep(delay_seconds)
         return _mock_completion_response(messages)
     return await client.chat.completions.create(
-        model=settings.bedrock.primary_model_id,
+        model=model_id,
         messages=messages,
         timeout=settings.bedrock.timeout,
     )
 
 
-async def _call_fallback(messages: list):
-    """Send the request to the fallback Bedrock model."""
-    if _truthy_env(_LLM_MOCK_MODE_ENV):
-        delay_seconds = _llm_mock_delay_seconds()
-        if delay_seconds > 0:
-            await asyncio.sleep(delay_seconds)
-        return _mock_completion_response(messages)
-    return await client.chat.completions.create(
-        model=settings.bedrock.fallback_model_id,
-        messages=messages,
-        timeout=settings.bedrock.timeout,
-    )
-
-
-async def _stream_primary(messages: list) -> AsyncIterator[str]:
-    """Stream token deltas from the primary deployment."""
+async def _chat_completion_stream(messages: list, *, model_id: str) -> AsyncIterator[str]:
+    """Stream token deltas for one model id."""
     if _truthy_env(_LLM_MOCK_MODE_ENV):
         text = _llm_mock_text(messages)
         chunk_size = _llm_mock_stream_chunk_chars()
@@ -492,155 +482,112 @@ async def _stream_primary(messages: list) -> AsyncIterator[str]:
         return
 
     async for delta in client.chat.completions.stream(
-        model=settings.bedrock.primary_model_id,
+        model=model_id,
         messages=messages,
         timeout=settings.bedrock.timeout,
     ):
+        yield delta
+
+
+async def _call_primary(messages: list):
+    """Send the request to the primary Bedrock model."""
+    return await _chat_completion(messages, model_id=settings.bedrock.primary_model_id)
+
+
+async def _call_fallback(messages: list):
+    """Send the request to the fallback Bedrock model."""
+    return await _chat_completion(messages, model_id=settings.bedrock.fallback_model_id)
+
+
+async def _stream_primary(messages: list) -> AsyncIterator[str]:
+    """Stream token deltas from the primary deployment."""
+    async for delta in _chat_completion_stream(messages, model_id=settings.bedrock.primary_model_id):
         yield delta
 
 
 async def _stream_fallback(messages: list) -> AsyncIterator[str]:
     """Stream token deltas from the fallback deployment."""
-    if _truthy_env(_LLM_MOCK_MODE_ENV):
-        text = _llm_mock_text(messages)
-        chunk_size = _llm_mock_stream_chunk_chars()
-        delay_seconds = _llm_mock_delay_seconds()
-        for start in range(0, len(text), chunk_size):
-            chunk = text[start : start + chunk_size]
-            if not chunk:
-                continue
-            yield chunk
-            if delay_seconds > 0:
-                await asyncio.sleep(delay_seconds)
-        return
-
-    async for delta in client.chat.completions.stream(
-        model=settings.bedrock.fallback_model_id,
-        messages=messages,
-        timeout=settings.bedrock.timeout,
-    ):
+    async for delta in _chat_completion_stream(messages, model_id=settings.bedrock.fallback_model_id):
         yield delta
 
 
-async def generate_response(user_id: str, user_prompt: str, session_id: str | None = None) -> str:
-    """Run the full chat pipeline: guardrails, memory, model call, cache, and persistence."""
+def _new_metrics_state() -> dict:
+    return {
+        "build_context_ms": None,
+        "retrieval_ms": None,
+        "model_ms": None,
+        "memory_update_ms": None,
+        "cache_read_ms": None,
+        "cache_write_ms": None,
+        "evaluation_trace_ms": None,
+        "retrieval_strategy": "none",
+        "retrieved_count": 0,
+        "retrieved_results": [],
+        "retrieval_evidence": [],
+        "llm_usage": {},
+        "quality": {},
+        "input_guard_reason": "",
+        "context_guard_reason": "",
+        "output_guard_reason": "",
+        "used_fallback_model": False,
+    }
+
+
+async def _record_request_outcome(
+    *,
+    request_id: str,
+    started_at: float,
+    user_id: str,
+    session_id: str,
+    user_prompt: str,
+    safe_user_prompt: str,
+    answer: str,
+    outcome: str,
+    state: dict,
+    error_message: str = "",
+) -> None:
+    await _record_json_metrics(
+        _build_json_metrics_record(
+            request_id=request_id,
+            started_at=started_at,
+            user_id=user_id,
+            session_id=session_id,
+            user_prompt=user_prompt,
+            safe_user_prompt=safe_user_prompt,
+            answer=answer,
+            outcome=outcome,
+            metrics_state=state,
+            error_message=error_message,
+        )
+    )
+    await _record_latency_metrics(started_at, outcome)
+
+
+async def _read_cached_response(cache_key: str) -> tuple[str | None, int]:
     started_at = time.perf_counter()
-    request_id = uuid4().hex
-    effective_session_id = _resolve_session_id(user_id, session_id)
-    conversation_user_id = _conversation_user_id(user_id, effective_session_id)
-    safe_user_prompt = user_prompt
-    build_context_ms: int | None = None
-    retrieval_ms: int | None = None
-    model_ms: int | None = None
-    memory_update_ms: int | None = None
-    cache_read_ms: int | None = None
-    cache_write_ms: int | None = None
-    evaluation_trace_ms: int | None = None
-    retrieval_strategy = "none"
-    retrieved_count = 0
-    retrieved_results: list[dict] = []
-    retrieval_evidence: list[dict] = []
-    llm_usage: dict = {}
-    quality: dict = {}
-    input_guard_reason = ""
-    context_guard_reason = ""
-    output_guard_reason = ""
-    used_fallback_model = False
-
-    input_guard = guard_user_input(user_id, user_prompt)
-    if input_guard["blocked"]:
-        input_guard_reason = str(input_guard.get("reason", "blocked_input"))
-        refusal = refusal_response()
-        logger.info(
-            "GuardrailDecision | stage=input | user=%s | blocked=true | reason=%s",
-            user_id,
-            input_guard_reason,
-        )
-        await _record_json_metrics(
-            _build_json_metrics_record(
-                request_id=request_id,
-                started_at=started_at,
-                user_id=user_id,
-                session_id=effective_session_id,
-                user_prompt=user_prompt,
-                safe_user_prompt=safe_user_prompt,
-                answer=refusal,
-                outcome="blocked_input",
-                build_context_ms=build_context_ms,
-                retrieval_ms=retrieval_ms,
-                model_ms=model_ms,
-                memory_update_ms=memory_update_ms,
-                cache_read_ms=cache_read_ms,
-                cache_write_ms=cache_write_ms,
-                evaluation_trace_ms=evaluation_trace_ms,
-                retrieval_strategy=retrieval_strategy,
-                retrieved_count=retrieved_count,
-                retrieval_evidence=retrieval_evidence,
-                quality=quality,
-                llm_usage=llm_usage,
-                input_guard_reason=input_guard_reason,
-                context_guard_reason=context_guard_reason,
-                output_guard_reason=output_guard_reason,
-                used_fallback_model=used_fallback_model,
-            )
-        )
-        await _record_latency_metrics(started_at, "blocked_input")
-        return refusal
-
-    safe_user_prompt = str(input_guard.get("sanitized_text", user_prompt))
-    cache_key = _chat_cache_key(user_id, safe_user_prompt, effective_session_id)
-
-    # Cache lookup
     cached = None
-    cache_read_started_at = time.perf_counter()
     try:
         cached = await _redis_call(async_redis_client.get, cache_key)
     except RedisError as exc:
         logger.warning("Redis cache read failed. %s", exc)
-    finally:
-        cache_read_ms = _elapsed_ms(cache_read_started_at)
+    return cached, _elapsed_ms(started_at)
 
-    if cached:
-        await _record_json_metrics(
-            _build_json_metrics_record(
-                request_id=request_id,
-                started_at=started_at,
-                user_id=user_id,
-                session_id=effective_session_id,
-                user_prompt=user_prompt,
-                safe_user_prompt=safe_user_prompt,
-                answer=str(cached),
-                outcome="cache_hit",
-                build_context_ms=build_context_ms,
-                retrieval_ms=retrieval_ms,
-                model_ms=model_ms,
-                memory_update_ms=memory_update_ms,
-                cache_read_ms=cache_read_ms,
-                cache_write_ms=cache_write_ms,
-                evaluation_trace_ms=evaluation_trace_ms,
-                retrieval_strategy=retrieval_strategy,
-                retrieved_count=retrieved_count,
-                retrieval_evidence=retrieval_evidence,
-                quality=quality,
-                llm_usage=llm_usage,
-                input_guard_reason=input_guard_reason,
-                context_guard_reason=context_guard_reason,
-                output_guard_reason=output_guard_reason,
-                used_fallback_model=used_fallback_model,
-            )
-        )
-        await _record_latency_metrics(started_at, "cache_hit")
-        return str(cached)
 
-    # Build hybrid memory context
+async def _prepare_messages_for_model(
+    *,
+    user_id: str,
+    conversation_user_id: str,
+    safe_user_prompt: str,
+    state: dict,
+) -> tuple[list | None, str | None]:
     build_context_started_at = time.perf_counter()
     messages = await build_context(conversation_user_id, safe_user_prompt)
-    build_context_ms = _elapsed_ms(build_context_started_at)
+    state["build_context_ms"] = _elapsed_ms(build_context_started_at)
 
     retrieval_query = _build_retrieval_query(messages)
     if _truthy_env(_RETRIEVAL_DISABLED_ENV):
-        retrieval_strategy = "disabled"
-        retrieval_ms = 0
+        state["retrieval_strategy"] = "disabled"
+        state["retrieval_ms"] = 0
     elif retrieval_query:
         retrieval_started_at = time.perf_counter()
         try:
@@ -648,148 +595,88 @@ async def generate_response(user_id: str, user_prompt: str, session_id: str | No
                 retrieval_query,
                 top_k=settings.postgres.default_top_k,
             )
-            retrieval_strategy = str(retrieval_result.get("retrieval_strategy", "unknown"))
+            state["retrieval_strategy"] = str(retrieval_result.get("retrieval_strategy", "unknown"))
             results = retrieval_result.get("results", [])
             if isinstance(results, list):
-                retrieved_results = results
-                retrieved_count = len(results)
-                retrieval_evidence = _build_retrieval_evidence(results)
+                state["retrieved_results"] = results
+                state["retrieved_count"] = len(results)
+                state["retrieval_evidence"] = _build_retrieval_evidence(results)
             retrieval_message = _format_retrieval_context(retrieval_result)
             if retrieval_message:
                 messages = [retrieval_message] + messages
         except Exception as exc:
-            retrieval_strategy = "error"
+            state["retrieval_strategy"] = "error"
             logger.warning(
                 "Long-term retrieval failed; continuing without retrieved context. %s",
                 exc,
             )
         finally:
-            retrieval_ms = _elapsed_ms(retrieval_started_at)
+            state["retrieval_ms"] = _elapsed_ms(retrieval_started_at)
     else:
-        retrieval_ms = 0
+        state["retrieval_ms"] = 0
 
     chat_system_prompt = prompts.get("chat", {}).get("system_prompt", "")
     if isinstance(chat_system_prompt, str) and chat_system_prompt.strip():
         messages = [{"role": "system", "content": chat_system_prompt.strip()}] + messages
 
     context_guard = apply_context_guardrails(messages)
-    if context_guard["blocked"]:
-        context_guard_reason = str(context_guard.get("reason", "blocked_context"))
-        refusal = refusal_response()
-        logger.info(
-            "GuardrailDecision | stage=context | user=%s | blocked=true | reason=%s",
-            user_id,
-            context_guard_reason,
-        )
-        await _record_json_metrics(
-            _build_json_metrics_record(
-                request_id=request_id,
-                started_at=started_at,
-                user_id=user_id,
-                session_id=effective_session_id,
-                user_prompt=user_prompt,
-                safe_user_prompt=safe_user_prompt,
-                answer=refusal,
-                outcome="blocked_context",
-                build_context_ms=build_context_ms,
-                retrieval_ms=retrieval_ms,
-                model_ms=model_ms,
-                memory_update_ms=memory_update_ms,
-                cache_read_ms=cache_read_ms,
-                cache_write_ms=cache_write_ms,
-                evaluation_trace_ms=evaluation_trace_ms,
-                retrieval_strategy=retrieval_strategy,
-                retrieved_count=retrieved_count,
-                retrieval_evidence=retrieval_evidence,
-                quality=quality,
-                llm_usage=llm_usage,
-                input_guard_reason=input_guard_reason,
-                context_guard_reason=context_guard_reason,
-                output_guard_reason=output_guard_reason,
-                used_fallback_model=used_fallback_model,
-            )
-        )
-        await _record_latency_metrics(started_at, "blocked_context")
-        return refusal
-    messages = context_guard["messages"]
+    if not context_guard["blocked"]:
+        return context_guard["messages"], None
 
+    state["context_guard_reason"] = str(context_guard.get("reason", "blocked_context"))
+    refusal = refusal_response()
+    logger.info(
+        "GuardrailDecision | stage=context | user=%s | blocked=true | reason=%s",
+        user_id,
+        state["context_guard_reason"],
+    )
+    return None, refusal
+
+
+async def _call_model_with_fallback(messages: list, state: dict):
     model_started_at = time.perf_counter()
     try:
         response = await _call_primary(messages)
     except Exception as primary_exc:
-        used_fallback_model = True
+        state["used_fallback_model"] = True
         logger.warning("Primary model failed; attempting fallback. %s", primary_exc)
         try:
             response = await _call_fallback(messages)
-        except Exception as fallback_exc:
+        except Exception:
             logger.exception("Fallback model also failed.")
-            model_ms = _elapsed_ms(model_started_at)
-            await _record_json_metrics(
-                _build_json_metrics_record(
-                    request_id=request_id,
-                    started_at=started_at,
-                    user_id=user_id,
-                    session_id=effective_session_id,
-                    user_prompt=user_prompt,
-                    safe_user_prompt=safe_user_prompt,
-                    answer="",
-                    outcome="model_error",
-                    build_context_ms=build_context_ms,
-                    retrieval_ms=retrieval_ms,
-                    model_ms=model_ms,
-                    memory_update_ms=memory_update_ms,
-                    cache_read_ms=cache_read_ms,
-                    cache_write_ms=cache_write_ms,
-                    evaluation_trace_ms=evaluation_trace_ms,
-                    retrieval_strategy=retrieval_strategy,
-                    retrieved_count=retrieved_count,
-                    retrieval_evidence=retrieval_evidence,
-                    quality=quality,
-                    llm_usage=llm_usage,
-                    input_guard_reason=input_guard_reason,
-                    context_guard_reason=context_guard_reason,
-                    output_guard_reason=output_guard_reason,
-                    used_fallback_model=used_fallback_model,
-                    error_message=str(fallback_exc),
-                )
-            )
-            await _record_latency_metrics(started_at, "model_error")
+            state["model_ms"] = _elapsed_ms(model_started_at)
             raise
-    model_ms = _elapsed_ms(model_started_at)
+    state["model_ms"] = _elapsed_ms(model_started_at)
+    return response
 
-    raw_result = response.choices[0].message.content
+
+def _extract_guarded_result(*, user_id: str, raw_result, state: dict) -> str:
     guarded_output = guard_model_output(raw_result)
     result = guarded_output["text"]
     if guarded_output["blocked"]:
-        output_guard_reason = str(guarded_output.get("reason", "blocked_output"))
+        state["output_guard_reason"] = str(guarded_output.get("reason", "blocked_output"))
         logger.info(
             "GuardrailDecision | stage=output | user=%s | blocked=true | reason=%s",
             user_id,
-            output_guard_reason,
+            state["output_guard_reason"],
         )
+    return result
 
-    # LLM usage observability
-    llm_usage = _extract_llm_usage(response)
-    if llm_usage:
-        logger.info(
-            "LLMUsage | user=%s | prompt_tokens=%s | completion_tokens=%s | total_tokens=%s",
-            user_id,
-            llm_usage["prompt_tokens"],
-            llm_usage["completion_tokens"],
-            llm_usage["total_tokens"],
-        )
 
-    # Update memory
-    memory_update_started_at = time.perf_counter()
+async def _update_memory_with_timing(
+    *, conversation_user_id: str, safe_user_prompt: str, result: str, state: dict
+) -> None:
+    started_at = time.perf_counter()
     try:
         await update_memory(conversation_user_id, safe_user_prompt, result)
     except Exception as exc:
         logger.warning("Memory update failed. %s", exc)
     finally:
-        memory_update_ms = _elapsed_ms(memory_update_started_at)
+        state["memory_update_ms"] = _elapsed_ms(started_at)
 
-    # Cache result
-    cache_write_started_at = time.perf_counter()
+
+async def _write_cache_with_timing(*, cache_key: str, result: str, state: dict) -> None:
+    started_at = time.perf_counter()
     try:
         await _redis_call(
             async_redis_client.setex,
@@ -800,36 +687,47 @@ async def generate_response(user_id: str, user_prompt: str, session_id: str | No
     except RedisError as exc:
         logger.warning("Redis cache write failed. %s", exc)
     finally:
-        cache_write_ms = _elapsed_ms(cache_write_started_at)
+        state["cache_write_ms"] = _elapsed_ms(started_at)
 
-    evaluation_trace_started_at = time.perf_counter()
+
+def _schedule_evaluation_trace(*, user_id: str, user_prompt: str, result: str, state: dict) -> None:
+    started_at = time.perf_counter()
     _track_background_task(
         asyncio.create_task(
             _persist_evaluation_trace(
                 user_id=user_id,
                 prompt=user_prompt,
                 answer=result,
-                retrieved_results=retrieved_results,
-                retrieval_strategy=retrieval_strategy,
-                build_context_ms=build_context_ms or 0,
-                retrieval_ms=retrieval_ms or 0,
-                model_ms=model_ms or 0,
+                retrieved_results=state["retrieved_results"],
+                retrieval_strategy=state["retrieval_strategy"],
+                build_context_ms=state["build_context_ms"] or 0,
+                retrieval_ms=state["retrieval_ms"] or 0,
+                model_ms=state["model_ms"] or 0,
             )
         ),
         label="Evaluation trace persistence",
     )
-    evaluation_trace_ms = _elapsed_ms(evaluation_trace_started_at)
+    state["evaluation_trace_ms"] = _elapsed_ms(started_at)
 
-    # Online path no longer computes hallucination/relevance metrics.
-    # These are evaluated asynchronously by a separate evaluator job.
-    quality = {}
 
+async def _record_success_metrics(
+    *,
+    request_id: str,
+    started_at: float,
+    user_id: str,
+    session_id: str,
+    user_prompt: str,
+    safe_user_prompt: str,
+    result: str,
+    state: dict,
+) -> None:
+    state["quality"] = {}
     await _record_pipeline_stage_metrics(
-        build_context_ms=build_context_ms or 0,
-        retrieval_ms=retrieval_ms or 0,
-        model_ms=model_ms or 0,
-        retrieval_strategy=retrieval_strategy,
-        retrieved_count=retrieved_count,
+        build_context_ms=state["build_context_ms"] or 0,
+        retrieval_ms=state["retrieval_ms"] or 0,
+        model_ms=state["model_ms"] or 0,
+        retrieval_strategy=state["retrieval_strategy"],
+        retrieved_count=state["retrieved_count"],
     )
     logger.info(
         (
@@ -837,41 +735,345 @@ async def generate_response(user_id: str, user_prompt: str, session_id: str | No
             "| model_ms=%s | retrieval_strategy=%s | retrieved_count=%s"
         ),
         user_id,
-        build_context_ms,
-        retrieval_ms,
-        model_ms,
-        retrieval_strategy,
-        retrieved_count,
+        state["build_context_ms"],
+        state["retrieval_ms"],
+        state["model_ms"],
+        state["retrieval_strategy"],
+        state["retrieved_count"],
     )
-    await _record_json_metrics(
-        _build_json_metrics_record(
-            request_id=request_id,
-            started_at=started_at,
-            user_id=user_id,
-            session_id=effective_session_id,
-            user_prompt=user_prompt,
-            safe_user_prompt=safe_user_prompt,
-            answer=result,
-            outcome="success",
-            build_context_ms=build_context_ms,
-            retrieval_ms=retrieval_ms,
-            model_ms=model_ms,
-            memory_update_ms=memory_update_ms,
-            cache_read_ms=cache_read_ms,
-            cache_write_ms=cache_write_ms,
-            evaluation_trace_ms=evaluation_trace_ms,
-            retrieval_strategy=retrieval_strategy,
-            retrieved_count=retrieved_count,
-            retrieval_evidence=retrieval_evidence,
-            quality=quality,
-            llm_usage=llm_usage,
-            input_guard_reason=input_guard_reason,
-            context_guard_reason=context_guard_reason,
-            output_guard_reason=output_guard_reason,
-            used_fallback_model=used_fallback_model,
+    await _record_request_outcome(
+        request_id=request_id,
+        started_at=started_at,
+        user_id=user_id,
+        session_id=session_id,
+        user_prompt=user_prompt,
+        safe_user_prompt=safe_user_prompt,
+        answer=result,
+        outcome="success",
+        state=state,
+    )
+
+
+def _new_stream_guard_state() -> dict[str, object]:
+    return {"blocked": False, "reason": "", "final_text": ""}
+
+
+def _guard_stream_text(assembled: str, stream_state: dict[str, object]) -> tuple[str, bool]:
+    guarded = guard_model_output(assembled)
+    guarded_text = str(guarded.get("text", ""))
+    blocked = bool(guarded.get("blocked"))
+    reason = str(guarded.get("reason", "blocked_output")) if blocked else ""
+    stream_state["blocked"] = blocked
+    stream_state["reason"] = reason
+    stream_state["final_text"] = guarded_text
+    return guarded_text, blocked
+
+
+def _iter_stream_pieces(text: str, size: int):
+    for start in range(0, len(text), size):
+        piece = text[start : start + size]
+        if piece:
+            yield piece
+
+
+def _stable_stream_text(guarded_text: str, emitted: str, holdback_chars: int) -> str | None:
+    stable_len = len(guarded_text) - holdback_chars
+    if stable_len <= 0:
+        return None
+    stable = guarded_text[:stable_len]
+    if stable and stable != emitted:
+        return stable
+    return None
+
+
+async def _yield_blocked_tail(
+    *,
+    guarded_text: str,
+    emitted: str,
+) -> AsyncIterator[str]:
+    if guarded_text and guarded_text != emitted:
+        yield guarded_text
+
+
+async def _yield_stable_delta(
+    *,
+    guarded_text: str,
+    emitted: str,
+    holdback_chars: int,
+) -> AsyncIterator[str]:
+    stable = _stable_stream_text(guarded_text, emitted, holdback_chars)
+    if stable is not None:
+        yield stable
+
+
+async def _iter_guarded_updates(
+    *,
+    text: str,
+    size: int,
+    stream_state: dict[str, object],
+    emitted: str,
+    holdback_chars: int,
+    delay_seconds: float,
+) -> AsyncIterator[tuple[str, bool]]:
+    assembled = str(stream_state.get("_assembled", ""))
+    for piece in _iter_stream_pieces(text, size):
+        assembled += piece
+        stream_state["_assembled"] = assembled
+        guarded_text, blocked = _guard_stream_text(assembled, stream_state)
+        if blocked:
+            async for blocked_text in _yield_blocked_tail(
+                guarded_text=guarded_text,
+                emitted=emitted,
+            ):
+                yield blocked_text, True
+            yield emitted, True
+            return
+        async for stable in _yield_stable_delta(
+            guarded_text=guarded_text,
+            emitted=emitted,
+            holdback_chars=holdback_chars,
+        ):
+            emitted = stable
+            yield emitted, False
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+
+
+async def _yield_guarded_stream(
+    delta_stream: AsyncIterator[str],
+    *,
+    stream_state: dict[str, object],
+    chunk_size: int,
+    chunk_delay_ms: int,
+) -> AsyncIterator[str]:
+    emitted = ""
+    size = max(1, int(chunk_size))
+    delay_seconds = max(0.0, float(chunk_delay_ms) / 1000.0)
+    holdback_chars = max(0, _STREAM_GUARD_HOLDBACK_CHARS)
+    stream_state["_assembled"] = ""
+
+    async for delta in delta_stream:
+        text = str(delta or "")
+        if not text:
+            continue
+        async for value, blocked in _iter_guarded_updates(
+            text=text,
+            size=size,
+            stream_state=stream_state,
+            emitted=emitted,
+            holdback_chars=holdback_chars,
+            delay_seconds=delay_seconds,
+        ):
+            if value and value != emitted:
+                emitted = value
+                yield emitted
+            if blocked:
+                return
+
+    guarded_text, _blocked = _guard_stream_text(str(stream_state.get("_assembled", "")), stream_state)
+    if guarded_text and guarded_text != emitted:
+        yield guarded_text
+
+
+async def _emit_guarded_stream(
+    delta_stream: AsyncIterator[str],
+    *,
+    runtime: dict[str, object],
+    stream_state: dict[str, object],
+    chunk_size: int,
+    chunk_delay_ms: int,
+) -> AsyncIterator[str]:
+    async for partial in _yield_guarded_stream(
+        delta_stream,
+        stream_state=stream_state,
+        chunk_size=chunk_size,
+        chunk_delay_ms=chunk_delay_ms,
+    ):
+        runtime["streamed_text"] = partial
+        yield partial
+
+
+async def _stream_model_with_fallback(
+    *,
+    messages: list,
+    state: dict,
+    runtime: dict[str, object],
+    chunk_size: int,
+    chunk_delay_ms: int,
+) -> AsyncIterator[str]:
+    model_started_at = time.perf_counter()
+    try:
+        async for partial in _emit_guarded_stream(
+            _stream_primary(messages),
+            runtime=runtime,
+            stream_state=runtime["stream_guard_state"],
+            chunk_size=chunk_size,
+            chunk_delay_ms=chunk_delay_ms,
+        ):
+            yield partial
+    except Exception as primary_exc:
+        state["used_fallback_model"] = True
+        logger.warning("Primary model stream failed; attempting fallback. %s", primary_exc)
+        if runtime["streamed_text"]:
+            state["model_ms"] = _elapsed_ms(model_started_at)
+            raise
+        runtime["stream_guard_state"] = _new_stream_guard_state()
+        try:
+            async for partial in _emit_guarded_stream(
+                _stream_fallback(messages),
+                runtime=runtime,
+                stream_state=runtime["stream_guard_state"],
+                chunk_size=chunk_size,
+                chunk_delay_ms=chunk_delay_ms,
+            ):
+                yield partial
+        except Exception:
+            logger.exception("Fallback model stream also failed.")
+            state["model_ms"] = _elapsed_ms(model_started_at)
+            raise
+    state["model_ms"] = _elapsed_ms(model_started_at)
+
+
+def _new_request_context(user_id: str, user_prompt: str, session_id: str | None) -> dict:
+    effective_session_id = _resolve_session_id(user_id, session_id)
+    return {
+        "started_at": time.perf_counter(),
+        "request_id": uuid4().hex,
+        "user_id": user_id,
+        "user_prompt": user_prompt,
+        "effective_session_id": effective_session_id,
+        "conversation_user_id": _conversation_user_id(user_id, effective_session_id),
+        "safe_user_prompt": user_prompt,
+        "cache_key": "",
+        "state": _new_metrics_state(),
+    }
+
+
+async def _record_context_outcome(
+    context: dict,
+    *,
+    answer: str,
+    outcome: str,
+    error_message: str = "",
+) -> None:
+    await _record_request_outcome(
+        request_id=str(context["request_id"]),
+        started_at=float(context["started_at"]),
+        user_id=str(context["user_id"]),
+        session_id=str(context["effective_session_id"]),
+        user_prompt=str(context["user_prompt"]),
+        safe_user_prompt=str(context["safe_user_prompt"]),
+        answer=answer,
+        outcome=outcome,
+        state=context["state"],
+        error_message=error_message,
+    )
+
+
+async def _prepare_request(
+    user_id: str,
+    user_prompt: str,
+    session_id: str | None,
+) -> tuple[dict, list | None, str | None]:
+    context = _new_request_context(user_id, user_prompt, session_id)
+    state = context["state"]
+    input_guard = guard_user_input(user_id, user_prompt)
+    if input_guard["blocked"]:
+        state["input_guard_reason"] = str(input_guard.get("reason", "blocked_input"))
+        refusal = refusal_response()
+        logger.info(
+            "GuardrailDecision | stage=input | user=%s | blocked=true | reason=%s",
+            user_id,
+            state["input_guard_reason"],
         )
+        await _record_context_outcome(context, answer=refusal, outcome="blocked_input")
+        return context, None, refusal
+
+    context["safe_user_prompt"] = str(input_guard.get("sanitized_text", user_prompt))
+    context["cache_key"] = _chat_cache_key(
+        user_id,
+        str(context["safe_user_prompt"]),
+        str(context["effective_session_id"]),
     )
-    await _record_latency_metrics(started_at, "success")
+    cached, state["cache_read_ms"] = await _read_cached_response(str(context["cache_key"]))
+    if cached:
+        cached_text = str(cached)
+        await _record_context_outcome(context, answer=cached_text, outcome="cache_hit")
+        return context, None, cached_text
+
+    messages, refusal = await _prepare_messages_for_model(
+        user_id=user_id,
+        conversation_user_id=str(context["conversation_user_id"]),
+        safe_user_prompt=str(context["safe_user_prompt"]),
+        state=state,
+    )
+    if refusal is not None:
+        await _record_context_outcome(context, answer=refusal, outcome="blocked_context")
+        return context, None, refusal
+    return context, messages, None
+
+
+async def _finalize_success(context: dict, result: str) -> None:
+    state = context["state"]
+    await _update_memory_with_timing(
+        conversation_user_id=str(context["conversation_user_id"]),
+        safe_user_prompt=str(context["safe_user_prompt"]),
+        result=result,
+        state=state,
+    )
+    await _write_cache_with_timing(
+        cache_key=str(context["cache_key"]),
+        result=result,
+        state=state,
+    )
+    _schedule_evaluation_trace(
+        user_id=str(context["user_id"]),
+        user_prompt=str(context["user_prompt"]),
+        result=result,
+        state=state,
+    )
+    await _record_success_metrics(
+        request_id=str(context["request_id"]),
+        started_at=float(context["started_at"]),
+        user_id=str(context["user_id"]),
+        session_id=str(context["effective_session_id"]),
+        user_prompt=str(context["user_prompt"]),
+        safe_user_prompt=str(context["safe_user_prompt"]),
+        result=result,
+        state=state,
+    )
+
+
+async def generate_response(user_id: str, user_prompt: str, session_id: str | None = None) -> str:
+    """Run the full chat pipeline: guardrails, memory, model call, cache, and persistence."""
+    context, messages, early_answer = await _prepare_request(user_id, user_prompt, session_id)
+    if early_answer is not None:
+        return early_answer
+    state = context["state"]
+
+    try:
+        response = await _call_model_with_fallback(messages, state)
+    except Exception as exc:
+        await _record_context_outcome(
+            context,
+            answer="",
+            outcome="model_error",
+            error_message=str(exc),
+        )
+        raise
+
+    raw_result = response.choices[0].message.content
+    result = _extract_guarded_result(user_id=user_id, raw_result=raw_result, state=state)
+    state["llm_usage"] = _extract_llm_usage(response)
+    if state["llm_usage"]:
+        logger.info(
+            "LLMUsage | user=%s | prompt_tokens=%s | completion_tokens=%s | total_tokens=%s",
+            user_id,
+            state["llm_usage"]["prompt_tokens"],
+            state["llm_usage"]["completion_tokens"],
+            state["llm_usage"]["total_tokens"],
+        )
+    await _finalize_success(context, result)
     return result
 
 
@@ -884,434 +1086,41 @@ async def generate_response_stream(
     chunk_delay_ms: int = 12,
 ) -> AsyncIterator[str]:
     """Stream true model output from Bedrock and yield progressively assembled text."""
-
-    async def _yield_guarded_stream(
-        delta_stream: AsyncIterator[str],
-        *,
-        stream_state: dict[str, object],
-    ) -> AsyncIterator[str]:
-        assembled = ""
-        emitted = ""
-        size = max(1, int(chunk_size))
-        delay_seconds = max(0.0, float(chunk_delay_ms) / 1000.0)
-        holdback_chars = max(0, _STREAM_GUARD_HOLDBACK_CHARS)
-
-        async for delta in delta_stream:
-            text = str(delta or "")
-            if not text:
-                continue
-            for start in range(0, len(text), size):
-                piece = text[start : start + size]
-                if not piece:
-                    continue
-                assembled += piece
-                guarded = guard_model_output(assembled)
-                guarded_text = str(guarded.get("text", ""))
-                blocked = bool(guarded.get("blocked"))
-                reason = str(guarded.get("reason", "blocked_output")) if blocked else ""
-
-                stream_state["blocked"] = blocked
-                stream_state["reason"] = reason
-                stream_state["final_text"] = guarded_text
-
-                if blocked:
-                    if guarded_text and guarded_text != emitted:
-                        emitted = guarded_text
-                        yield emitted
-                    return
-
-                stable_len = len(guarded_text) - holdback_chars
-                if stable_len <= 0:
-                    continue
-
-                stable_text = guarded_text[:stable_len]
-                if stable_text and stable_text != emitted:
-                    emitted = stable_text
-                    yield emitted
-                    if delay_seconds > 0:
-                        await asyncio.sleep(delay_seconds)
-
-        guarded = guard_model_output(assembled)
-        guarded_text = str(guarded.get("text", ""))
-        blocked = bool(guarded.get("blocked"))
-        reason = str(guarded.get("reason", "blocked_output")) if blocked else ""
-        stream_state["blocked"] = blocked
-        stream_state["reason"] = reason
-        stream_state["final_text"] = guarded_text
-        if guarded_text and guarded_text != emitted:
-            yield guarded_text
-
-    started_at = time.perf_counter()
-    request_id = uuid4().hex
-    effective_session_id = _resolve_session_id(user_id, session_id)
-    conversation_user_id = _conversation_user_id(user_id, effective_session_id)
-    safe_user_prompt = user_prompt
-    build_context_ms: int | None = None
-    retrieval_ms: int | None = None
-    model_ms: int | None = None
-    memory_update_ms: int | None = None
-    cache_read_ms: int | None = None
-    cache_write_ms: int | None = None
-    evaluation_trace_ms: int | None = None
-    retrieval_strategy = "none"
-    retrieved_count = 0
-    retrieved_results: list[dict] = []
-    retrieval_evidence: list[dict] = []
-    llm_usage: dict = {}
-    quality: dict = {}
-    input_guard_reason = ""
-    context_guard_reason = ""
-    output_guard_reason = ""
-    used_fallback_model = False
-
-    input_guard = guard_user_input(user_id, user_prompt)
-    if input_guard["blocked"]:
-        input_guard_reason = str(input_guard.get("reason", "blocked_input"))
-        refusal = refusal_response()
-        logger.info(
-            "GuardrailDecision | stage=input | user=%s | blocked=true | reason=%s",
-            user_id,
-            input_guard_reason,
-        )
-        await _record_json_metrics(
-            _build_json_metrics_record(
-                request_id=request_id,
-                started_at=started_at,
-                user_id=user_id,
-                session_id=effective_session_id,
-                user_prompt=user_prompt,
-                safe_user_prompt=safe_user_prompt,
-                answer=refusal,
-                outcome="blocked_input",
-                build_context_ms=build_context_ms,
-                retrieval_ms=retrieval_ms,
-                model_ms=model_ms,
-                memory_update_ms=memory_update_ms,
-                cache_read_ms=cache_read_ms,
-                cache_write_ms=cache_write_ms,
-                evaluation_trace_ms=evaluation_trace_ms,
-                retrieval_strategy=retrieval_strategy,
-                retrieved_count=retrieved_count,
-                retrieval_evidence=retrieval_evidence,
-                quality=quality,
-                llm_usage=llm_usage,
-                input_guard_reason=input_guard_reason,
-                context_guard_reason=context_guard_reason,
-                output_guard_reason=output_guard_reason,
-                used_fallback_model=used_fallback_model,
-            )
-        )
-        await _record_latency_metrics(started_at, "blocked_input")
-        yield refusal
+    context, messages, early_answer = await _prepare_request(user_id, user_prompt, session_id)
+    if early_answer is not None:
+        yield early_answer
         return
+    state = context["state"]
 
-    safe_user_prompt = str(input_guard.get("sanitized_text", user_prompt))
-    cache_key = _chat_cache_key(user_id, safe_user_prompt, effective_session_id)
-
-    cached = None
-    cache_read_started_at = time.perf_counter()
-    try:
-        cached = await _redis_call(async_redis_client.get, cache_key)
-    except RedisError as exc:
-        logger.warning("Redis cache read failed. %s", exc)
-    finally:
-        cache_read_ms = _elapsed_ms(cache_read_started_at)
-
-    if cached:
-        cached_text = str(cached)
-        await _record_json_metrics(
-            _build_json_metrics_record(
-                request_id=request_id,
-                started_at=started_at,
-                user_id=user_id,
-                session_id=effective_session_id,
-                user_prompt=user_prompt,
-                safe_user_prompt=safe_user_prompt,
-                answer=cached_text,
-                outcome="cache_hit",
-                build_context_ms=build_context_ms,
-                retrieval_ms=retrieval_ms,
-                model_ms=model_ms,
-                memory_update_ms=memory_update_ms,
-                cache_read_ms=cache_read_ms,
-                cache_write_ms=cache_write_ms,
-                evaluation_trace_ms=evaluation_trace_ms,
-                retrieval_strategy=retrieval_strategy,
-                retrieved_count=retrieved_count,
-                retrieval_evidence=retrieval_evidence,
-                quality=quality,
-                llm_usage=llm_usage,
-                input_guard_reason=input_guard_reason,
-                context_guard_reason=context_guard_reason,
-                output_guard_reason=output_guard_reason,
-                used_fallback_model=used_fallback_model,
-            )
-        )
-        await _record_latency_metrics(started_at, "cache_hit")
-        yield cached_text
-        return
-
-    build_context_started_at = time.perf_counter()
-    messages = await build_context(conversation_user_id, safe_user_prompt)
-    build_context_ms = _elapsed_ms(build_context_started_at)
-
-    retrieval_query = _build_retrieval_query(messages)
-    if _truthy_env(_RETRIEVAL_DISABLED_ENV):
-        retrieval_strategy = "disabled"
-        retrieval_ms = 0
-    elif retrieval_query:
-        retrieval_started_at = time.perf_counter()
-        try:
-            retrieval_result = await aretrieve_document_chunks(
-                retrieval_query,
-                top_k=settings.postgres.default_top_k,
-            )
-            retrieval_strategy = str(retrieval_result.get("retrieval_strategy", "unknown"))
-            results = retrieval_result.get("results", [])
-            if isinstance(results, list):
-                retrieved_results = results
-                retrieved_count = len(results)
-                retrieval_evidence = _build_retrieval_evidence(results)
-            retrieval_message = _format_retrieval_context(retrieval_result)
-            if retrieval_message:
-                messages = [retrieval_message] + messages
-        except Exception as exc:
-            retrieval_strategy = "error"
-            logger.warning(
-                "Long-term retrieval failed; continuing without retrieved context. %s",
-                exc,
-            )
-        finally:
-            retrieval_ms = _elapsed_ms(retrieval_started_at)
-    else:
-        retrieval_ms = 0
-
-    chat_system_prompt = prompts.get("chat", {}).get("system_prompt", "")
-    if isinstance(chat_system_prompt, str) and chat_system_prompt.strip():
-        messages = [{"role": "system", "content": chat_system_prompt.strip()}] + messages
-
-    context_guard = apply_context_guardrails(messages)
-    if context_guard["blocked"]:
-        context_guard_reason = str(context_guard.get("reason", "blocked_context"))
-        refusal = refusal_response()
-        logger.info(
-            "GuardrailDecision | stage=context | user=%s | blocked=true | reason=%s",
-            user_id,
-            context_guard_reason,
-        )
-        await _record_json_metrics(
-            _build_json_metrics_record(
-                request_id=request_id,
-                started_at=started_at,
-                user_id=user_id,
-                session_id=effective_session_id,
-                user_prompt=user_prompt,
-                safe_user_prompt=safe_user_prompt,
-                answer=refusal,
-                outcome="blocked_context",
-                build_context_ms=build_context_ms,
-                retrieval_ms=retrieval_ms,
-                model_ms=model_ms,
-                memory_update_ms=memory_update_ms,
-                cache_read_ms=cache_read_ms,
-                cache_write_ms=cache_write_ms,
-                evaluation_trace_ms=evaluation_trace_ms,
-                retrieval_strategy=retrieval_strategy,
-                retrieved_count=retrieved_count,
-                retrieval_evidence=retrieval_evidence,
-                quality=quality,
-                llm_usage=llm_usage,
-                input_guard_reason=input_guard_reason,
-                context_guard_reason=context_guard_reason,
-                output_guard_reason=output_guard_reason,
-                used_fallback_model=used_fallback_model,
-            )
-        )
-        await _record_latency_metrics(started_at, "blocked_context")
-        yield refusal
-        return
-    messages = context_guard["messages"]
-
-    streamed_text = ""
-    stream_guard_state: dict[str, object] = {
-        "blocked": False,
-        "reason": "",
-        "final_text": "",
+    runtime: dict[str, object] = {
+        "streamed_text": "",
+        "stream_guard_state": _new_stream_guard_state(),
     }
-    model_started_at = time.perf_counter()
     try:
-        async for partial in _yield_guarded_stream(
-            _stream_primary(messages),
-            stream_state=stream_guard_state,
+        async for partial in _stream_model_with_fallback(
+            messages=messages,
+            state=state,
+            runtime=runtime,
+            chunk_size=chunk_size,
+            chunk_delay_ms=chunk_delay_ms,
         ):
-            streamed_text = partial
             yield partial
-    except Exception as primary_exc:
-        used_fallback_model = True
-        logger.warning("Primary model stream failed; attempting fallback. %s", primary_exc)
-        if streamed_text:
-            model_ms = _elapsed_ms(model_started_at)
-            await _record_json_metrics(
-                _build_json_metrics_record(
-                    request_id=request_id,
-                    started_at=started_at,
-                    user_id=user_id,
-                    session_id=effective_session_id,
-                    user_prompt=user_prompt,
-                    safe_user_prompt=safe_user_prompt,
-                    answer=streamed_text,
-                    outcome="model_error",
-                    build_context_ms=build_context_ms,
-                    retrieval_ms=retrieval_ms,
-                    model_ms=model_ms,
-                    memory_update_ms=memory_update_ms,
-                    cache_read_ms=cache_read_ms,
-                    cache_write_ms=cache_write_ms,
-                    evaluation_trace_ms=evaluation_trace_ms,
-                    retrieval_strategy=retrieval_strategy,
-                    retrieved_count=retrieved_count,
-                    retrieval_evidence=retrieval_evidence,
-                    quality=quality,
-                    llm_usage=llm_usage,
-                    input_guard_reason=input_guard_reason,
-                    context_guard_reason=context_guard_reason,
-                    output_guard_reason=output_guard_reason,
-                    used_fallback_model=used_fallback_model,
-                    error_message=str(primary_exc),
-                )
-            )
-            await _record_latency_metrics(started_at, "model_error")
-            raise
-        try:
-            stream_guard_state = {
-                "blocked": False,
-                "reason": "",
-                "final_text": "",
-            }
-            async for partial in _yield_guarded_stream(
-                _stream_fallback(messages),
-                stream_state=stream_guard_state,
-            ):
-                streamed_text = partial
-                yield partial
-        except Exception as fallback_exc:
-            logger.exception("Fallback model stream also failed.")
-            model_ms = _elapsed_ms(model_started_at)
-            await _record_json_metrics(
-                _build_json_metrics_record(
-                    request_id=request_id,
-                    started_at=started_at,
-                    user_id=user_id,
-                    session_id=effective_session_id,
-                    user_prompt=user_prompt,
-                    safe_user_prompt=safe_user_prompt,
-                    answer=streamed_text,
-                    outcome="model_error",
-                    build_context_ms=build_context_ms,
-                    retrieval_ms=retrieval_ms,
-                    model_ms=model_ms,
-                    memory_update_ms=memory_update_ms,
-                    cache_read_ms=cache_read_ms,
-                    cache_write_ms=cache_write_ms,
-                    evaluation_trace_ms=evaluation_trace_ms,
-                    retrieval_strategy=retrieval_strategy,
-                    retrieved_count=retrieved_count,
-                    retrieval_evidence=retrieval_evidence,
-                    quality=quality,
-                    llm_usage=llm_usage,
-                    input_guard_reason=input_guard_reason,
-                    context_guard_reason=context_guard_reason,
-                    output_guard_reason=output_guard_reason,
-                    used_fallback_model=used_fallback_model,
-                    error_message=str(fallback_exc),
-                )
-            )
-            await _record_latency_metrics(started_at, "model_error")
-            raise
-    model_ms = _elapsed_ms(model_started_at)
+    except Exception as exc:
+        await _record_context_outcome(
+            context,
+            answer=str(runtime["streamed_text"]),
+            outcome="model_error",
+            error_message=str(exc),
+        )
+        raise
 
-    result = str(stream_guard_state.get("final_text", streamed_text) or streamed_text)
+    stream_guard_state = runtime["stream_guard_state"]
+    result = str(stream_guard_state.get("final_text", runtime["streamed_text"]) or runtime["streamed_text"])
     if bool(stream_guard_state.get("blocked")):
-        output_guard_reason = str(stream_guard_state.get("reason", "blocked_output"))
+        state["output_guard_reason"] = str(stream_guard_state.get("reason", "blocked_output"))
         logger.info(
             "GuardrailDecision | stage=output | user=%s | blocked=true | reason=%s",
             user_id,
-            output_guard_reason,
+            state["output_guard_reason"],
         )
-
-    memory_update_started_at = time.perf_counter()
-    try:
-        await update_memory(conversation_user_id, safe_user_prompt, result)
-    except Exception as exc:
-        logger.warning("Memory update failed. %s", exc)
-    finally:
-        memory_update_ms = _elapsed_ms(memory_update_started_at)
-
-    cache_write_started_at = time.perf_counter()
-    try:
-        await _redis_call(
-            async_redis_client.setex,
-            cache_key,
-            settings.memory.redis_ttl_seconds,
-            result,
-        )
-    except RedisError as exc:
-        logger.warning("Redis cache write failed. %s", exc)
-    finally:
-        cache_write_ms = _elapsed_ms(cache_write_started_at)
-
-    evaluation_trace_started_at = time.perf_counter()
-    _track_background_task(
-        asyncio.create_task(
-            _persist_evaluation_trace(
-                user_id=user_id,
-                prompt=user_prompt,
-                answer=result,
-                retrieved_results=retrieved_results,
-                retrieval_strategy=retrieval_strategy,
-                build_context_ms=build_context_ms or 0,
-                retrieval_ms=retrieval_ms or 0,
-                model_ms=model_ms or 0,
-            )
-        ),
-        label="Evaluation trace persistence",
-    )
-    evaluation_trace_ms = _elapsed_ms(evaluation_trace_started_at)
-
-    quality = {}
-    await _record_pipeline_stage_metrics(
-        build_context_ms=build_context_ms or 0,
-        retrieval_ms=retrieval_ms or 0,
-        model_ms=model_ms or 0,
-        retrieval_strategy=retrieval_strategy,
-        retrieved_count=retrieved_count,
-    )
-    await _record_json_metrics(
-        _build_json_metrics_record(
-            request_id=request_id,
-            started_at=started_at,
-            user_id=user_id,
-            session_id=effective_session_id,
-            user_prompt=user_prompt,
-            safe_user_prompt=safe_user_prompt,
-            answer=result,
-            outcome="success",
-            build_context_ms=build_context_ms,
-            retrieval_ms=retrieval_ms,
-            model_ms=model_ms,
-            memory_update_ms=memory_update_ms,
-            cache_read_ms=cache_read_ms,
-            cache_write_ms=cache_write_ms,
-            evaluation_trace_ms=evaluation_trace_ms,
-            retrieval_strategy=retrieval_strategy,
-            retrieved_count=retrieved_count,
-            retrieval_evidence=retrieval_evidence,
-            quality=quality,
-            llm_usage=llm_usage,
-            input_guard_reason=input_guard_reason,
-            context_guard_reason=context_guard_reason,
-            output_guard_reason=output_guard_reason,
-            used_fallback_model=used_fallback_model,
-        )
-    )
-    await _record_latency_metrics(started_at, "success")
+    await _finalize_success(context, result)

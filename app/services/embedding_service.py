@@ -13,6 +13,7 @@ from app.infra.io_limiters import dependency_limiter
 from app.infra.redis_client import app_scoped_key, async_redis_client, redis_client
 
 settings = get_settings()
+_JSON_CONTENT_TYPE = "application/json"
 
 
 def _resolve_path(path_value: str) -> Path:
@@ -162,8 +163,8 @@ def embed_text(text: str) -> list[float]:
         client.invoke_model,
         modelId=settings.embedding.model_id,
         body=json.dumps({"inputText": truncated}),
-        contentType="application/json",
-        accept="application/json",
+        contentType=_JSON_CONTENT_TYPE,
+        accept=_JSON_CONTENT_TYPE,
     )
     response_payload = json.loads(response["body"].read())
     if not isinstance(response_payload, dict):
@@ -184,11 +185,11 @@ async def aembed_text(text: str) -> list[float]:
     payload = {
         "modelId": settings.embedding.model_id,
         "body": json.dumps({"inputText": truncated}),
-        "contentType": "application/json",
-        "accept": "application/json",
+        "contentType": _JSON_CONTENT_TYPE,
+        "accept": _JSON_CONTENT_TYPE,
     }
     async with dependency_limiter("embedding"):
-        response_payload = await ainvoke_model_json(payload, timeout=settings.bedrock.timeout)
+        response_payload = await ainvoke_model_json(payload)
     embedding = _coerce_embedding(response_payload)
     await _awrite_cached_embedding(cache_key, embedding)
     return embedding

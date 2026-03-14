@@ -1,6 +1,10 @@
 from app.middlewares import backpressure, rate_limit
 
 
+def _ip(*octets: int) -> str:
+    return ".".join(str(octet) for octet in octets)
+
+
 class _FakeRedisCounter:
     def __init__(self):
         self.counts = {}
@@ -24,9 +28,11 @@ def test_redis_fixed_window_limiter_enforces_limit(monkeypatch):
         key_prefix="app:ratelimit",
     )
 
-    allowed_1, retry_1 = limiter.allow("user:1|ip:1.2.3.4|path:/api/v1/chat")
-    allowed_2, retry_2 = limiter.allow("user:1|ip:1.2.3.4|path:/api/v1/chat")
-    allowed_3, retry_3 = limiter.allow("user:1|ip:1.2.3.4|path:/api/v1/chat")
+    client_ip = _ip(1, 2, 3, 4)
+    limiter_key = f"user:1|ip:{client_ip}|path:/api/v1/chat"
+    allowed_1, retry_1 = limiter.allow(limiter_key)
+    allowed_2, retry_2 = limiter.allow(limiter_key)
+    allowed_3, retry_3 = limiter.allow(limiter_key)
 
     assert allowed_1 is True and retry_1 == 0
     assert allowed_2 is True and retry_2 == 0

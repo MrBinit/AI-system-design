@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 import time
 import urllib.error
@@ -19,20 +18,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import yaml
 
-
-def _percentile(values: list[float], pct: float) -> float:
-    if not values:
-        return 0.0
-    sorted_values = sorted(values)
-    rank = (pct / 100.0) * (len(sorted_values) - 1)
-    lower = math.floor(rank)
-    upper = math.ceil(rank)
-    if lower == upper:
-        return sorted_values[lower]
-    lower_value = sorted_values[lower]
-    upper_value = sorted_values[upper]
-    fraction = rank - lower
-    return lower_value + (upper_value - lower_value) * fraction
+try:
+    from loadtest.common_stats import percentile
+except ModuleNotFoundError:
+    from common_stats import percentile
 
 
 def _parse_args() -> argparse.Namespace:
@@ -159,46 +148,55 @@ def _poll_status_once(
     return "unknown", ""
 
 
-def main() -> int:
-    args = _parse_args()
-    config = _read_config(args.config)
+def _load_run_settings(config: dict) -> dict:
+    return {
+        "base_url": str(_cfg(config, "target.base_url", "http://127.0.0.1:18000")).rstrip("/"),
+        "users": int(_cfg(config, "workload.users", 100)),
+        "requests_per_user": int(_cfg(config, "workload.requests_per_user", 1)),
+        "concurrency": int(_cfg(config, "workload.concurrency", 25)),
+        "prompt": str(
+            _cfg(config, "workload.prompt", "Tell me about AI universities in Germany.")
+        ),
+        "enqueue_timeout": float(_cfg(config, "timeouts.enqueue_seconds", 20)),
+        "poll_timeout": float(_cfg(config, "timeouts.poll_seconds", 240)),
+        "poll_interval": float(_cfg(config, "timeouts.poll_interval_seconds", 1)),
+        "status_timeout": float(_cfg(config, "timeouts.status_request_seconds", 10)),
+        "max_enqueue_error_rate": float(_cfg(config, "assertions.max_enqueue_error_rate", 0.02)),
+        "max_failed_jobs_rate": float(_cfg(config, "assertions.max_failed_jobs_rate", 0.05)),
+    }
 
-    base_url = str(_cfg(config, "target.base_url", "http://127.0.0.1:18000")).rstrip("/")
-    users = int(_cfg(config, "workload.users", 100))
-    requests_per_user = int(_cfg(config, "workload.requests_per_user", 1))
-    concurrency = int(_cfg(config, "workload.concurrency", 25))
-    prompt = str(_cfg(config, "workload.prompt", "Tell me about AI universities in Germany."))
-    enqueue_timeout = float(_cfg(config, "timeouts.enqueue_seconds", 20))
-    poll_timeout = float(_cfg(config, "timeouts.poll_seconds", 240))
-    poll_interval = float(_cfg(config, "timeouts.poll_interval_seconds", 1))
-    status_timeout = float(_cfg(config, "timeouts.status_request_seconds", 10))
-    max_enqueue_error_rate = float(_cfg(config, "assertions.max_enqueue_error_rate", 0.02))
-    max_failed_jobs_rate = float(_cfg(config, "assertions.max_failed_jobs_rate", 0.05))
 
-    if users <= 0 or requests_per_user <= 0 or concurrency <= 0:
-        print("users, requests_per_user, and concurrency must be > 0", file=sys.stderr)
-        return 2
-
-    enqueue_latencies: list[float] = []
-    enqueue_status_counts: Counter[str] = Counter()
-    enqueue_error_counts: Counter[str] = Counter()
-    enqueue_results: list[dict] = []
-
-    work_items = []
+def _build_work_items(users: int, requests_per_user: int) -> list[tuple[str, str]]:
+    work_items: list[tuple[str, str]] = []
     for user_index in range(users):
         user_id = f"load-user-{user_index + 1:04d}"
         session_id = user_id
         for _ in range(requests_per_user):
             work_items.append((user_id, session_id))
+    return work_items
 
+
+def _run_enqueue_phase(
+    *,
+    base_url: str,
+    token: str,
+    timeout_seconds: float,
+    prompt: str,
+    concurrency: int,
+    work_items: list[tuple[str, str]],
+) -> tuple[list[dict], Counter[str], Counter[str], list[float], float]:
+    enqueue_latencies: list[float] = []
+    enqueue_status_counts: Counter[str] = Counter()
+    enqueue_error_counts: Counter[str] = Counter()
+    enqueue_results: list[dict] = []
     started_at = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = [
             executor.submit(
                 _enqueue_one,
                 base_url=base_url,
-                token=args.token,
-                timeout_seconds=enqueue_timeout,
+                token=token,
+                timeout_seconds=timeout_seconds,
                 user_id=user_id,
                 session_id=session_id,
                 prompt=prompt,
@@ -217,24 +215,37 @@ def main() -> int:
             if item["error"]:
                 enqueue_error_counts[item["error"]] += 1
     enqueue_duration = max(1e-9, time.perf_counter() - started_at)
+    return (
+        enqueue_results,
+        enqueue_status_counts,
+        enqueue_error_counts,
+        enqueue_latencies,
+        enqueue_duration,
+    )
 
+
+def _accepted_job_ids(enqueue_results: list[dict]) -> list[str]:
     accepted = [
         item
         for item in enqueue_results
         if item.get("status_code") == 202 and isinstance(item.get("payload"), dict)
     ]
     job_ids = [str(item["payload"].get("job_id", "")).strip() for item in accepted]
-    job_ids = [job_id for job_id in job_ids if job_id]
+    return [job_id for job_id in job_ids if job_id]
 
-    total_requests = len(work_items)
-    enqueue_success = len(job_ids)
-    enqueue_error_count = total_requests - enqueue_success
-    enqueue_error_rate = enqueue_error_count / max(1, total_requests)
 
-    status_by_job: dict[str, str] = {job_id: "queued" for job_id in job_ids}
+def _poll_job_statuses(
+    *,
+    base_url: str,
+    token: str,
+    timeout_seconds: float,
+    poll_timeout: float,
+    poll_interval: float,
+    job_ids: list[str],
+) -> tuple[dict[str, str], Counter[str], Counter[str], float]:
+    status_by_job: dict[str, str] = dict.fromkeys(job_ids, "queued")
     failed_job_errors: Counter[str] = Counter()
     poll_errors: Counter[str] = Counter()
-
     poll_started = time.perf_counter()
     deadline = poll_started + poll_timeout
     while time.perf_counter() < deadline:
@@ -246,8 +257,8 @@ def main() -> int:
         for job_id in pending:
             status, error = _poll_status_once(
                 base_url=base_url,
-                token=args.token,
-                timeout_seconds=status_timeout,
+                token=token,
+                timeout_seconds=timeout_seconds,
                 job_id=job_id,
             )
             status_by_job[job_id] = status
@@ -256,8 +267,118 @@ def main() -> int:
             if status == "poll_error":
                 poll_errors[error or "poll_error"] += 1
         time.sleep(max(0.0, poll_interval))
-
     poll_duration = max(1e-9, time.perf_counter() - poll_started)
+    return status_by_job, failed_job_errors, poll_errors, poll_duration
+
+
+def _print_summary(summary: dict) -> None:
+    print("=== Async Queue Load Summary ===")
+    print(f"config:                    {summary['config_path']}")
+    print(f"target_base_url:           {summary['base_url']}")
+    print(f"users:                     {summary['users']}")
+    print(f"requests_per_user:         {summary['requests_per_user']}")
+    print(f"total_enqueue_requests:    {summary['total_requests']}")
+    print(f"concurrency:               {summary['concurrency']}")
+    print(f"enqueue_duration_sec:      {summary['enqueue_duration']:.2f}")
+    print(
+        "enqueue_rps:               "
+        f"{summary['total_requests'] / summary['enqueue_duration']:.2f}"
+    )
+    print(f"enqueue_success:           {summary['enqueue_success']}")
+    print(f"enqueue_error_count:       {summary['enqueue_error_count']}")
+    print(f"enqueue_error_rate:        {summary['enqueue_error_rate']:.4f}")
+    print(
+        f"enqueue_latency_p50_ms:    {percentile(summary['enqueue_latencies'], 50):.2f}"
+    )
+    print(
+        f"enqueue_latency_p95_ms:    {percentile(summary['enqueue_latencies'], 95):.2f}"
+    )
+    print(
+        f"enqueue_latency_p99_ms:    {percentile(summary['enqueue_latencies'], 99):.2f}"
+    )
+    print(f"enqueue_status_counts:     {dict(summary['enqueue_status_counts'])}")
+    if summary["enqueue_error_counts"]:
+        print(f"enqueue_errors:            {dict(summary['enqueue_error_counts'])}")
+    print(f"poll_duration_sec:         {summary['poll_duration']:.2f}")
+    print(f"jobs_total:                {summary['total_jobs']}")
+    print(f"jobs_completed:            {summary['completed_jobs']}")
+    print(f"jobs_failed:               {summary['failed_jobs']}")
+    print(f"jobs_unresolved:           {summary['unresolved_jobs']}")
+    print(f"jobs_failed_rate:          {summary['failed_jobs_rate']:.4f}")
+    print(f"job_status_counts:         {dict(summary['final_status_counts'])}")
+    if summary["failed_job_errors"]:
+        print(f"failed_job_errors:         {dict(summary['failed_job_errors'])}")
+    if summary["poll_errors"]:
+        print(f"poll_errors:               {dict(summary['poll_errors'])}")
+
+
+def _exit_code_for_assertions(
+    *,
+    enqueue_error_rate: float,
+    max_enqueue_error_rate: float,
+    failed_jobs_rate: float,
+    max_failed_jobs_rate: float,
+    unresolved_jobs: int,
+) -> int:
+    if enqueue_error_rate > max_enqueue_error_rate:
+        return 1
+    if failed_jobs_rate > max_failed_jobs_rate:
+        return 1
+    if unresolved_jobs > 0:
+        return 1
+    return 0
+
+
+def main() -> int:
+    args = _parse_args()
+    config = _read_config(args.config)
+    settings = _load_run_settings(config)
+    base_url = settings["base_url"]
+    users = settings["users"]
+    requests_per_user = settings["requests_per_user"]
+    concurrency = settings["concurrency"]
+    prompt = settings["prompt"]
+    enqueue_timeout = settings["enqueue_timeout"]
+    poll_timeout = settings["poll_timeout"]
+    poll_interval = settings["poll_interval"]
+    status_timeout = settings["status_timeout"]
+    max_enqueue_error_rate = settings["max_enqueue_error_rate"]
+    max_failed_jobs_rate = settings["max_failed_jobs_rate"]
+
+    if users <= 0 or requests_per_user <= 0 or concurrency <= 0:
+        print("users, requests_per_user, and concurrency must be > 0", file=sys.stderr)
+        return 2
+
+    work_items = _build_work_items(users, requests_per_user)
+    (
+        enqueue_results,
+        enqueue_status_counts,
+        enqueue_error_counts,
+        enqueue_latencies,
+        enqueue_duration,
+    ) = _run_enqueue_phase(
+        base_url=base_url,
+        token=args.token,
+        timeout_seconds=enqueue_timeout,
+        prompt=prompt,
+        concurrency=concurrency,
+        work_items=work_items,
+    )
+    job_ids = _accepted_job_ids(enqueue_results)
+
+    total_requests = len(work_items)
+    enqueue_success = len(job_ids)
+    enqueue_error_count = total_requests - enqueue_success
+    enqueue_error_rate = enqueue_error_count / max(1, total_requests)
+
+    status_by_job, failed_job_errors, poll_errors, poll_duration = _poll_job_statuses(
+        base_url=base_url,
+        token=args.token,
+        timeout_seconds=status_timeout,
+        poll_timeout=poll_timeout,
+        poll_interval=poll_interval,
+        job_ids=job_ids,
+    )
     final_status_counts: Counter[str] = Counter(status_by_job.values())
     completed_jobs = final_status_counts.get("completed", 0)
     failed_jobs = final_status_counts.get("failed", 0)
@@ -267,43 +388,38 @@ def main() -> int:
     total_jobs = len(job_ids)
     failed_jobs_rate = failed_jobs / max(1, total_jobs)
 
-    print("=== Async Queue Load Summary ===")
-    print(f"config:                    {args.config}")
-    print(f"target_base_url:           {base_url}")
-    print(f"users:                     {users}")
-    print(f"requests_per_user:         {requests_per_user}")
-    print(f"total_enqueue_requests:    {total_requests}")
-    print(f"concurrency:               {concurrency}")
-    print(f"enqueue_duration_sec:      {enqueue_duration:.2f}")
-    print(f"enqueue_rps:               {total_requests / enqueue_duration:.2f}")
-    print(f"enqueue_success:           {enqueue_success}")
-    print(f"enqueue_error_count:       {enqueue_error_count}")
-    print(f"enqueue_error_rate:        {enqueue_error_rate:.4f}")
-    print(f"enqueue_latency_p50_ms:    {_percentile(enqueue_latencies, 50):.2f}")
-    print(f"enqueue_latency_p95_ms:    {_percentile(enqueue_latencies, 95):.2f}")
-    print(f"enqueue_latency_p99_ms:    {_percentile(enqueue_latencies, 99):.2f}")
-    print(f"enqueue_status_counts:     {dict(enqueue_status_counts)}")
-    if enqueue_error_counts:
-        print(f"enqueue_errors:            {dict(enqueue_error_counts)}")
-    print(f"poll_duration_sec:         {poll_duration:.2f}")
-    print(f"jobs_total:                {total_jobs}")
-    print(f"jobs_completed:            {completed_jobs}")
-    print(f"jobs_failed:               {failed_jobs}")
-    print(f"jobs_unresolved:           {unresolved_jobs}")
-    print(f"jobs_failed_rate:          {failed_jobs_rate:.4f}")
-    print(f"job_status_counts:         {dict(final_status_counts)}")
-    if failed_job_errors:
-        print(f"failed_job_errors:         {dict(failed_job_errors)}")
-    if poll_errors:
-        print(f"poll_errors:               {dict(poll_errors)}")
-
-    if enqueue_error_rate > max_enqueue_error_rate:
-        return 1
-    if failed_jobs_rate > max_failed_jobs_rate:
-        return 1
-    if unresolved_jobs > 0:
-        return 1
-    return 0
+    summary_payload = {
+        "config_path": args.config,
+        "base_url": base_url,
+        "users": users,
+        "requests_per_user": requests_per_user,
+        "total_requests": total_requests,
+        "concurrency": concurrency,
+        "enqueue_duration": enqueue_duration,
+        "enqueue_success": enqueue_success,
+        "enqueue_error_count": enqueue_error_count,
+        "enqueue_error_rate": enqueue_error_rate,
+        "enqueue_latencies": enqueue_latencies,
+        "enqueue_status_counts": enqueue_status_counts,
+        "enqueue_error_counts": enqueue_error_counts,
+        "poll_duration": poll_duration,
+        "total_jobs": total_jobs,
+        "completed_jobs": completed_jobs,
+        "failed_jobs": failed_jobs,
+        "unresolved_jobs": unresolved_jobs,
+        "failed_jobs_rate": failed_jobs_rate,
+        "final_status_counts": final_status_counts,
+        "failed_job_errors": failed_job_errors,
+        "poll_errors": poll_errors,
+    }
+    _print_summary(summary_payload)
+    return _exit_code_for_assertions(
+        enqueue_error_rate=enqueue_error_rate,
+        max_enqueue_error_rate=max_enqueue_error_rate,
+        failed_jobs_rate=failed_jobs_rate,
+        max_failed_jobs_rate=max_failed_jobs_rate,
+        unresolved_jobs=unresolved_jobs,
+    )
 
 
 if __name__ == "__main__":
