@@ -61,9 +61,7 @@ async def chat_stream(
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 return
             except Exception:
-                logger.exception(
-                    "Async chat enqueue failed for stream user_id=%s", request.user_id
-                )
+                logger.exception("Async chat enqueue failed for stream user_id=%s", request.user_id)
                 payload = {"type": "error", "detail": _ENQUEUE_FAILED_DETAIL}
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 return
