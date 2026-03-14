@@ -462,7 +462,6 @@ async def _chat_completion(messages: list, *, model_id: str):
     return await client.chat.completions.create(
         model=model_id,
         messages=messages,
-        timeout=settings.bedrock.timeout,
     )
 
 
@@ -484,7 +483,6 @@ async def _chat_completion_stream(messages: list, *, model_id: str) -> AsyncIter
     async for delta in client.chat.completions.stream(
         model=model_id,
         messages=messages,
-        timeout=settings.bedrock.timeout,
     ):
         yield delta
 
