@@ -20,6 +20,31 @@ All application routes are mounted under:
 
 ## Endpoints
 
+### `POST /api/v1/auth/login`
+
+Password login endpoint that returns a bearer token.
+
+Request body:
+
+```json
+{
+  "username": "admin",
+  "password": "admin"
+}
+```
+
+Response body (example):
+
+```json
+{
+  "access_token": "<jwt>",
+  "token_type": "bearer",
+  "user_id": "admin",
+  "roles": ["user"],
+  "expires_in_seconds": 3600
+}
+```
+
 ### `POST /api/v1/chat/stream`
 
 Queue-backed streaming endpoint over Server-Sent Events (SSE).

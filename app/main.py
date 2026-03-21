@@ -1,7 +1,10 @@
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
+from app.api.v1.auth import router as auth_router
 from app.api.v1.chat import router as chat_router
 from app.api.v1.evaluation import router as evaluation_router
 from app.api.v1.ops import router as ops_router
@@ -22,6 +25,8 @@ from app.services.offline_evaluation_service import (
 settings = get_settings()
 logger = logging.getLogger(__name__)
 API_V1_PREFIX = "/api/v1"
+FRONTEND_DIR = Path(__file__).resolve().parents[1] / "frontend"
+FRONTEND_DIST_DIR = FRONTEND_DIR / "dist"
 
 
 def _configure_logging():
@@ -102,8 +107,11 @@ def create_app() -> FastAPI:
         app.add_middleware(RequestLoggingMiddleware)
 
     app.include_router(chat_router, prefix=API_V1_PREFIX)
+    app.include_router(auth_router, prefix=API_V1_PREFIX)
     app.include_router(evaluation_router, prefix=API_V1_PREFIX)
     app.include_router(ops_router, prefix=API_V1_PREFIX)
+    if FRONTEND_DIST_DIR.exists():
+        app.mount("/ui", StaticFiles(directory=str(FRONTEND_DIST_DIR), html=True), name="ui")
     return app
 
 

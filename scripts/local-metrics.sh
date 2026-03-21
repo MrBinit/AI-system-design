@@ -23,14 +23,80 @@ COMPOSE_ARGS=(
   --profile local-redis
 )
 
-echo "[local-metrics] Metrics files in gradio container:"
-docker compose --env-file "${ENV_FILE}" "${COMPOSE_ARGS[@]}" exec -T gradio sh -lc "ls -la /app/data/metrics"
+HOST_METRICS_DIR="${ROOT_DIR}/data/metrics"
+REQ_FILE="${HOST_METRICS_DIR}/chat_metrics_requests.jsonl"
+AGG_FILE="${HOST_METRICS_DIR}/chat_metrics_aggregate.json"
+TAIL_COUNT="${TAIL_COUNT:-3}"
 
-echo "[local-metrics] Metrics files on host:"
-ls -la "${ROOT_DIR}/data/metrics"
+section() {
+  local title="${1}"
+  printf "\n========== %s ==========\n" "${title}"
+}
 
-echo "[local-metrics] Last 3 request metrics:"
-docker compose --env-file "${ENV_FILE}" "${COMPOSE_ARGS[@]}" exec -T gradio sh -lc "tail -n 3 /app/data/metrics/chat_metrics_requests.jsonl"
+section "Metrics Files (Container)"
+docker compose --env-file "${ENV_FILE}" "${COMPOSE_ARGS[@]}" exec -T gradio sh -lc "ls -lah /app/data/metrics || true"
 
-echo "[local-metrics] Aggregate metrics snapshot:"
-docker compose --env-file "${ENV_FILE}" "${COMPOSE_ARGS[@]}" exec -T gradio sh -lc "cat /app/data/metrics/chat_metrics_aggregate.json"
+section "Metrics Files (Host)"
+ls -lah "${HOST_METRICS_DIR}" || true
+
+if [[ ! -f "${REQ_FILE}" && ! -f "${AGG_FILE}" ]]; then
+  section "No Metrics Yet"
+  echo "[local-metrics] No metrics files found in ${HOST_METRICS_DIR}."
+  echo "[local-metrics] Send a chat request first, then re-run."
+  exit 0
+fi
+
+if command -v jq >/dev/null 2>&1; then
+  if [[ -f "${REQ_FILE}" ]]; then
+    section "Last ${TAIL_COUNT} Requests (Summary)"
+    tail -n "${TAIL_COUNT}" "${REQ_FILE}" \
+      | jq -s '
+          [
+            .[] | {
+              timestamp,
+              request_id,
+              outcome,
+              overall_ms: .timings_ms.overall_response_ms,
+              llm_ms: .timings_ms.llm_response_ms,
+              retrieval_strategy: .retrieval.strategy,
+              retrieval_results: .retrieval.result_count,
+              question
+            }
+          ]
+        '
+  fi
+
+  if [[ -f "${AGG_FILE}" ]]; then
+    section "Aggregate Metrics (Readable)"
+    jq '
+      {
+        updated_at,
+        total_requests,
+        outcomes,
+        latency_ms: (
+          .latency_ms
+          | with_entries(.value |= {
+              count,
+              average,
+              p95,
+              p99,
+              max
+            })
+        ),
+        token_usage,
+        latest_request
+      }
+    ' "${AGG_FILE}"
+  fi
+else
+  section "jq Not Found"
+  echo "[local-metrics] jq is not installed; falling back to raw output."
+  if [[ -f "${REQ_FILE}" ]]; then
+    section "Last ${TAIL_COUNT} Requests (Raw)"
+    tail -n "${TAIL_COUNT}" "${REQ_FILE}"
+  fi
+  if [[ -f "${AGG_FILE}" ]]; then
+    section "Aggregate Metrics (Raw)"
+    cat "${AGG_FILE}"
+  fi
+fi

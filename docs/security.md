@@ -18,6 +18,11 @@ UniGraph currently applies multiple security layers:
 
 Authentication uses bearer tokens backed by JWT.
 
+For local/dev UI flows, the app can issue JWTs from a username/password login endpoint:
+
+- `POST /api/v1/auth/login`
+- user records come from `SECURITY_LOGIN_USERS_JSON` (fallback local default is `admin/admin`)
+
 Token claims:
 
 - `sub`: user id
