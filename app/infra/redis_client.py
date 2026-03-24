@@ -26,6 +26,8 @@ def _build_redis_client(config):
         "port": config.port,
         "db": config.db,
         "decode_responses": True,
+        "socket_connect_timeout": config.socket_connect_timeout_seconds,
+        "socket_timeout": config.socket_timeout_seconds,
     }
     if config.username:
         kwargs["username"] = config.username
@@ -46,6 +48,8 @@ def _build_async_redis_client(config):
         "port": config.port,
         "db": config.db,
         "decode_responses": True,
+        "socket_connect_timeout": config.socket_connect_timeout_seconds,
+        "socket_timeout": config.socket_timeout_seconds,
     }
     if config.username:
         kwargs["username"] = config.username

@@ -11,6 +11,21 @@ middleware:
   distributed_backpressure_key: "backpressure:inflight"
   distributed_backpressure_lease_seconds: 45
   enable_request_logging: true
+  enable_cors: true
+  cors_allow_origins:
+    - "http://localhost:5173"
+    - "http://unigraph-frontend.s3-website-us-east-1.amazonaws.com"
+  cors_allow_methods:
+    - "GET"
+    - "POST"
+    - "PUT"
+    - "PATCH"
+    - "DELETE"
+    - "OPTIONS"
+  cors_allow_headers:
+    - "Authorization"
+    - "Content-Type"
+  cors_allow_credentials: false
   enable_rate_limit: true
   enable_timeout: true
   enable_backpressure: true

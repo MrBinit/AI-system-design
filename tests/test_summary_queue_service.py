@@ -1,59 +1,107 @@
+import json
+
+from botocore.exceptions import ClientError
+from redis.exceptions import RedisError
+
 from app.services import summary_queue_service
 
 
-class FakeRedis:
+class FakeSQS:
     def __init__(self):
-        self.store = {}
-        self.streams = {}
-        self.claimed_entries = []
-        self.last_xautoclaim = None
+        self.queues = {}
+        self.in_flight = {}
+        self.counter = 0
 
-    def set(self, key, value, ex=None, nx=False):
-        if nx and key in self.store:
-            return False
-        self.store[key] = value
-        return True
+    def _queue(self, queue_url: str):
+        return self.queues.setdefault(queue_url, [])
 
-    def xlen(self, name):
-        return len(self.streams.get(name, []))
+    def send_message(self, QueueUrl, MessageBody, MessageGroupId=None):  # noqa: N803
+        _ = MessageGroupId
+        self.counter += 1
+        message_id = f"msg-{self.counter}"
+        receipt_handle = f"rh-{self.counter}"
+        self._queue(QueueUrl).append(
+            {
+                "MessageId": message_id,
+                "ReceiptHandle": receipt_handle,
+                "Body": MessageBody,
+            }
+        )
+        return {"MessageId": message_id}
 
-    def xrevrange(self, name, count=1):
-        entries = list(reversed(self.streams.get(name, [])))
-        return entries[:count]
-
-    def xadd(self, name, payload, maxlen=None, approximate=None):
-        stream = self.streams.setdefault(name, [])
-        stream_id = f"{len(stream) + 1}-0"
-        stream.append((stream_id, dict(payload)))
-        return stream_id
-
-    def xautoclaim(
+    def receive_message(
         self,
-        name,
-        groupname,
-        consumername,
-        min_idle_time,
-        start_id="0-0",
-        count=None,
+        QueueUrl,  # noqa: N803
+        MaxNumberOfMessages=1,  # noqa: N803
+        WaitTimeSeconds=0,  # noqa: N803
+        VisibilityTimeout=30,  # noqa: N803
+        MessageAttributeNames=None,  # noqa: N803
+        AttributeNames=None,  # noqa: N803
     ):
-        self.last_xautoclaim = {
-            "name": name,
-            "groupname": groupname,
-            "consumername": consumername,
-            "min_idle_time": min_idle_time,
-            "start_id": start_id,
-            "count": count,
+        _ = (
+            WaitTimeSeconds,
+            VisibilityTimeout,
+            MessageAttributeNames,
+            AttributeNames,
+        )
+        queue = self._queue(QueueUrl)
+        batch = []
+        for _idx in range(min(MaxNumberOfMessages, len(queue))):
+            message = queue.pop(0)
+            self.in_flight[message["ReceiptHandle"]] = {
+                "queue_url": QueueUrl,
+                "message": dict(message),
+            }
+            batch.append(dict(message))
+        return {"Messages": batch}
+
+    def delete_message(self, QueueUrl, ReceiptHandle):  # noqa: N803
+        in_flight = self.in_flight.get(ReceiptHandle)
+        if in_flight and in_flight["queue_url"] == QueueUrl:
+            del self.in_flight[ReceiptHandle]
+        return {}
+
+    def get_queue_attributes(self, QueueUrl, AttributeNames):  # noqa: N803
+        _ = AttributeNames
+        visible = len(self._queue(QueueUrl))
+        not_visible = sum(
+            1 for entry in self.in_flight.values() if entry.get("queue_url") == QueueUrl
+        )
+        return {
+            "Attributes": {
+                "ApproximateNumberOfMessages": str(visible),
+                "ApproximateNumberOfMessagesNotVisible": str(not_visible),
+            }
         }
-        return ("0-0", list(self.claimed_entries), [])
+
+
+def _configure_summary_queue(monkeypatch, fake_sqs: FakeSQS):
+    monkeypatch.setattr(summary_queue_service, "_sqs_client", lambda: fake_sqs)
+    monkeypatch.setattr(summary_queue_service.settings.queue, "summary_queue_enabled", True)
+    monkeypatch.setattr(
+        summary_queue_service.settings.queue,
+        "summary_queue_url",
+        "https://sqs.us-east-1.amazonaws.com/123/summary-jobs",
+    )
+    monkeypatch.setattr(
+        summary_queue_service.settings.queue,
+        "summary_dlq_url",
+        "https://sqs.us-east-1.amazonaws.com/123/summary-jobs-dlq",
+    )
+    monkeypatch.setattr(summary_queue_service.settings.queue, "summary_receive_wait_seconds", 0)
+    monkeypatch.setattr(summary_queue_service.settings.queue, "summary_max_messages_per_poll", 10)
+    monkeypatch.setattr(
+        summary_queue_service.settings.queue,
+        "summary_visibility_timeout_seconds",
+        30,
+    )
 
 
 def test_monitor_summary_dlq_alerts_once_per_cooldown(monkeypatch):
-    fake_redis = FakeRedis()
-    monkeypatch.setattr(summary_queue_service, "worker_redis_client", fake_redis)
+    fake_sqs = FakeSQS()
+    _configure_summary_queue(monkeypatch, fake_sqs)
     monkeypatch.setattr(
-        summary_queue_service.settings.memory,
-        "summary_queue_dlq_alert_threshold",
-        1,
+        summary_queue_service.settings.memory, "summary_queue_dlq_alert_threshold", 1
     )
     monkeypatch.setattr(
         summary_queue_service.settings.memory,
@@ -61,18 +109,22 @@ def test_monitor_summary_dlq_alerts_once_per_cooldown(monkeypatch):
         300,
     )
 
-    fake_redis.streams[summary_queue_service._dlq_stream_key()] = [
-        (
-            "1-0",
-            {
-                "job_id": "job-1",
-                "user_id": "user-1",
-                "failed_at": "2026-02-28T00:00:00+00:00",
-                "error": "boom",
-                "final_attempt": "5",
-            },
-        )
-    ]
+    summary_queue_service._LAST_DLQ_ALERT_AT_MONOTONIC = 0.0
+    summary_queue_service._LAST_DLQ_INFO = None
+
+    payload = {
+        "job_id": "job-1",
+        "user_id": "user-1",
+        "failed_at": "2026-02-28T00:00:00+00:00",
+        "error": "boom",
+        "final_attempt": "5",
+    }
+    fake_sqs.send_message(
+        QueueUrl=summary_queue_service.settings.queue.summary_dlq_url,
+        MessageBody=json.dumps(payload),
+        MessageGroupId="summary",
+    )
+    summary_queue_service._remember_latest_dlq(payload)
 
     alerts = []
     monkeypatch.setattr(
@@ -92,13 +144,9 @@ def test_monitor_summary_dlq_alerts_once_per_cooldown(monkeypatch):
 
 
 def test_retry_or_dlq_summary_job_triggers_dlq_monitor(monkeypatch):
-    fake_redis = FakeRedis()
-    monkeypatch.setattr(summary_queue_service, "worker_redis_client", fake_redis)
-    monkeypatch.setattr(
-        summary_queue_service.settings.memory,
-        "summary_queue_max_attempts",
-        5,
-    )
+    fake_sqs = FakeSQS()
+    _configure_summary_queue(monkeypatch, fake_sqs)
+    monkeypatch.setattr(summary_queue_service.settings.memory, "summary_queue_max_attempts", 5)
 
     acked = []
     monitored = []
@@ -110,7 +158,7 @@ def test_retry_or_dlq_summary_job_triggers_dlq_monitor(monkeypatch):
     )
 
     summary_queue_service.retry_or_dlq_summary_job(
-        "7-0",
+        "rh-7",
         {
             "job_id": "job-7",
             "user_id": "user-7",
@@ -119,43 +167,25 @@ def test_retry_or_dlq_summary_job_triggers_dlq_monitor(monkeypatch):
         "failed badly",
     )
 
-    dlq_entries = fake_redis.streams[summary_queue_service._dlq_stream_key()]
-    assert len(dlq_entries) == 1
-    assert dlq_entries[0][1]["job_id"] == "job-7"
-    assert acked == ["7-0"]
+    dlq_messages = fake_sqs.queues[summary_queue_service.settings.queue.summary_dlq_url]
+    assert len(dlq_messages) == 1
+    payload = json.loads(dlq_messages[0]["Body"])
+    assert payload["job_id"] == "job-7"
+    assert payload["final_attempt"] == "5"
+    assert acked == ["rh-7"]
     assert monitored == [True]
 
 
-def test_claim_stale_summary_jobs_reads_xautoclaim(monkeypatch):
-    fake_redis = FakeRedis()
-    fake_redis.claimed_entries = [
-        ("8-0", {"job_id": "job-8", "user_id": "user-8", "cutoff_seq": "12"}),
-    ]
-    monkeypatch.setattr(summary_queue_service, "worker_redis_client", fake_redis)
-    monkeypatch.setattr(summary_queue_service, "ensure_consumer_group", lambda: None)
-    monkeypatch.setattr(
-        summary_queue_service.settings.memory,
-        "summary_queue_claim_idle_ms",
-        12345,
-    )
-    monkeypatch.setattr(
-        summary_queue_service.settings.memory,
-        "summary_queue_claim_batch_size",
-        42,
-    )
-
+def test_claim_stale_summary_jobs_returns_empty(monkeypatch):
+    fake_sqs = FakeSQS()
+    _configure_summary_queue(monkeypatch, fake_sqs)
     jobs = summary_queue_service.claim_stale_summary_jobs("worker-a")
-
-    assert jobs == fake_redis.claimed_entries
-    assert fake_redis.last_xautoclaim is not None
-    assert fake_redis.last_xautoclaim["consumername"] == "worker-a"
-    assert fake_redis.last_xautoclaim["min_idle_time"] == 12345
-    assert fake_redis.last_xautoclaim["count"] == 42
+    assert jobs == []
 
 
-def test_enqueue_summary_job_uses_worker_redis_client(monkeypatch):
-    fake_redis = FakeRedis()
-    monkeypatch.setattr(summary_queue_service, "worker_redis_client", fake_redis)
+def test_enqueue_summary_job_uses_sqs(monkeypatch):
+    fake_sqs = FakeSQS()
+    _configure_summary_queue(monkeypatch, fake_sqs)
 
     job_id = summary_queue_service.enqueue_summary_job(
         user_id="user-1",
@@ -166,7 +196,224 @@ def test_enqueue_summary_job_uses_worker_redis_client(monkeypatch):
     )
 
     assert isinstance(job_id, str) and job_id
-    entries = fake_redis.streams[summary_queue_service._stream_key()]
-    assert len(entries) == 1
-    assert entries[0][1]["user_id"] == "user-1"
-    assert entries[0][1]["cutoff_seq"] == "10"
+    messages = fake_sqs.queues[summary_queue_service.settings.queue.summary_queue_url]
+    assert len(messages) == 1
+    payload = json.loads(messages[0]["Body"])
+    assert payload["job_id"] == job_id
+    assert payload["user_id"] == "user-1"
+    assert payload["cutoff_seq"] == "10"
+
+
+def test_read_and_ack_summary_jobs_updates_queue_state(monkeypatch):
+    fake_sqs = FakeSQS()
+    _configure_summary_queue(monkeypatch, fake_sqs)
+
+    summary_queue_service.enqueue_summary_job(
+        user_id="user-2",
+        cutoff_seq=20,
+        trigger="summary_trigger",
+        enqueue_version=3,
+        approx_removed_tokens=1200,
+    )
+    before = summary_queue_service.get_summary_queue_state()
+    jobs = summary_queue_service.read_summary_jobs("worker-a")
+    mid = summary_queue_service.get_summary_queue_state()
+
+    assert before["stream_depth"] == 1
+    assert before["pending_jobs"] == 0
+    assert len(jobs) == 1
+    receipt_handle, fields = jobs[0]
+    assert receipt_handle
+    assert fields["user_id"] == "user-2"
+    assert mid["stream_depth"] == 0
+    assert mid["pending_jobs"] == 1
+
+    summary_queue_service.ack_summary_job(receipt_handle)
+    after = summary_queue_service.get_summary_queue_state()
+    assert after["pending_jobs"] == 0
+
+
+def test_secrets_region_resolution(monkeypatch):
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.delenv("AWS_SECRETS_MANAGER_REGION", raising=False)
+    assert summary_queue_service._secrets_region() is None
+
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    assert summary_queue_service._secrets_region() == "us-east-1"
+
+
+def test_copy_payload_and_group_id_helpers():
+    class DemoValue:
+        def __str__(self):
+            return "demo-value"
+
+    payload = summary_queue_service._copy_job_payload(
+        {
+            "visible": "yes",
+            "_hidden": "skip",
+            99: "invalid-key",
+            "extra": DemoValue(),
+        }
+    )
+    assert payload == {"visible": "yes", "extra": "demo-value"}
+    assert summary_queue_service._safe_message_group_id("") == "summary"
+    assert len(summary_queue_service._safe_message_group_id("x" * 200)) == 128
+
+
+def test_send_json_retries_without_message_group(monkeypatch):
+    class RetrySQS:
+        def __init__(self):
+            self.calls = []
+            self._first = True
+
+        def send_message(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if self._first:
+                self._first = False
+                raise ClientError(
+                    {"Error": {"Code": "InvalidParameterValue", "Message": "bad group"}},
+                    "SendMessage",
+                )
+            return {"MessageId": "ok-1"}
+
+    fake = RetrySQS()
+    monkeypatch.setattr(summary_queue_service, "_sqs_client", lambda: fake)
+
+    sent = summary_queue_service._send_json(
+        "https://sqs.us-east-1.amazonaws.com/123/summary-jobs",
+        {"job_id": "job-1"},
+        message_group_id="user-1",
+    )
+
+    assert sent is True
+    assert len(fake.calls) == 2
+    assert "MessageGroupId" in fake.calls[0]
+    assert "MessageGroupId" not in fake.calls[1]
+
+
+def test_send_json_returns_false_on_client_and_runtime_errors(monkeypatch):
+    class DeniedSQS:
+        def send_message(self, **kwargs):
+            _ = kwargs
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "no permissions"}},
+                "SendMessage",
+            )
+
+    class BrokenSQS:
+        def send_message(self, **kwargs):
+            _ = kwargs
+            raise RuntimeError("network down")
+
+    assert summary_queue_service._send_json("", {"x": 1}, "g") is False
+
+    monkeypatch.setattr(summary_queue_service, "_sqs_client", lambda: DeniedSQS())
+    assert (
+        summary_queue_service._send_json("https://sqs.us-east-1.amazonaws.com/123/q", {"x": 1}, "g")
+        is False
+    )
+
+    monkeypatch.setattr(summary_queue_service, "_sqs_client", lambda: BrokenSQS())
+    assert (
+        summary_queue_service._send_json("https://sqs.us-east-1.amazonaws.com/123/q", {"x": 1}, "g")
+        is False
+    )
+
+
+def test_queue_depth_and_pending_edge_cases(monkeypatch):
+    class BadAttributesSQS:
+        def get_queue_attributes(self, **kwargs):
+            _ = kwargs
+            return {"Attributes": []}
+
+    class NegativeCountsSQS:
+        def get_queue_attributes(self, **kwargs):
+            _ = kwargs
+            return {
+                "Attributes": {
+                    "ApproximateNumberOfMessages": "-5",
+                    "ApproximateNumberOfMessagesNotVisible": "-2",
+                }
+            }
+
+    class ErrorSQS:
+        def get_queue_attributes(self, **kwargs):
+            _ = kwargs
+            raise RuntimeError("boom")
+
+    assert summary_queue_service._queue_depth_and_pending("") == (0, 0)
+
+    monkeypatch.setattr(
+        summary_queue_service,
+        "_sqs_client",
+        lambda: BadAttributesSQS(),
+    )
+    assert summary_queue_service._queue_depth_and_pending(
+        "https://sqs.us-east-1.amazonaws.com/123/q"
+    ) == (
+        0,
+        0,
+    )
+
+    monkeypatch.setattr(
+        summary_queue_service,
+        "_sqs_client",
+        lambda: NegativeCountsSQS(),
+    )
+    assert summary_queue_service._queue_depth_and_pending(
+        "https://sqs.us-east-1.amazonaws.com/123/q"
+    ) == (
+        0,
+        0,
+    )
+
+    monkeypatch.setattr(
+        summary_queue_service,
+        "_sqs_client",
+        lambda: ErrorSQS(),
+    )
+    assert summary_queue_service._queue_depth_and_pending(
+        "https://sqs.us-east-1.amazonaws.com/123/q"
+    ) == (
+        0,
+        0,
+    )
+
+
+def test_idempotency_key_selection_paths():
+    explicit = summary_queue_service.get_summary_job_idempotency_key(
+        {"idempotency_key": " explicit-key "}
+    )
+    assert explicit == "explicit-key"
+
+    rebuilt = summary_queue_service.get_summary_job_idempotency_key(
+        {
+            "user_id": "u-1",
+            "cutoff_seq": "10",
+            "trigger": "token_limit",
+            "enqueue_version": "2",
+        }
+    )
+    assert len(rebuilt) == 64
+
+    by_job_id = summary_queue_service.get_summary_job_idempotency_key(
+        {"user_id": "u-1", "cutoff_seq": "bad", "job_id": "job-77"}
+    )
+    assert by_job_id == "job:job-77"
+    assert summary_queue_service.get_summary_job_idempotency_key({}) == ""
+
+
+def test_redis_marker_helpers_handle_redis_errors(monkeypatch):
+    def boom(*args, **kwargs):
+        _ = (args, kwargs)
+        raise RedisError("redis unavailable")
+
+    monkeypatch.setattr(summary_queue_service.worker_redis_client, "get", boom)
+    monkeypatch.setattr(summary_queue_service.worker_redis_client, "set", boom)
+    monkeypatch.setattr(summary_queue_service.worker_redis_client, "delete", boom)
+
+    assert summary_queue_service.is_summary_job_processed("abc") is False
+    assert summary_queue_service.claim_summary_job_processing("abc", "stream-1") is True
+    summary_queue_service.release_summary_job_processing("abc")
+    summary_queue_service.mark_summary_job_processed("abc", "stream-1")

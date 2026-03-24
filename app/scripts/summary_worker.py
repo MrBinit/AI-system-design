@@ -45,7 +45,7 @@ async def run_worker():
         if not jobs:
             jobs = read_summary_jobs(consumer_name)
         if not jobs:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(settings.queue.summary_poll_sleep_seconds)
             continue
 
         for stream_id, fields in jobs:

@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.auth import router as auth_router
@@ -16,6 +17,7 @@ from app.middlewares.request_logging import RequestLoggingMiddleware
 from app.middlewares.route_matching import RouteMatchingMiddleware
 from app.middlewares.timeout import TimeoutMiddleware
 from app.infra.postgres_client import get_postgres_pool
+from app.repositories.auth_user_repository import ensure_auth_user_table
 from app.infra.redis_client import app_redis_client
 from app.services.offline_evaluation_service import (
     start_offline_eval_scheduler,
@@ -56,6 +58,7 @@ def _warm_postgres_backend():
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
+        ensure_auth_user_table()
         logger.info("StartupWarmup | postgres=ok")
     except Exception as exc:
         logger.warning("StartupWarmup | postgres=failed | error=%s", exc)
@@ -104,6 +107,14 @@ def _add_enabled_middlewares(app: FastAPI):
         )
     if settings.middleware.enable_request_logging:
         app.add_middleware(RequestLoggingMiddleware)
+    if settings.middleware.enable_cors:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.middleware.cors_allow_origins,
+            allow_methods=settings.middleware.cors_allow_methods,
+            allow_headers=settings.middleware.cors_allow_headers,
+            allow_credentials=settings.middleware.cors_allow_credentials,
+        )
 
 
 def _include_api_routers(app: FastAPI):

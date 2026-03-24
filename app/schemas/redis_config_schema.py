@@ -12,6 +12,8 @@ class RedisRoleConfig(BaseModel):
     tls: bool = False
     ssl_cert_reqs: Literal["required", "optional", "none"] = "required"
     ssl_ca_certs: str = ""
+    socket_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=60)
+    socket_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
     namespace: str = Field(min_length=1, default="app")
 
 

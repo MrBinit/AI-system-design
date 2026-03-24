@@ -225,6 +225,12 @@ def _apply_env_overrides(data: dict) -> dict:
     _set(["redis", "app", "tls"], "REDIS_APP_TLS", bool)
     _set(["redis", "app", "ssl_cert_reqs"], "REDIS_APP_SSL_CERT_REQS")
     _set(["redis", "app", "ssl_ca_certs"], "REDIS_APP_SSL_CA_CERTS")
+    _set(
+        ["redis", "app", "socket_connect_timeout_seconds"],
+        "REDIS_APP_SOCKET_CONNECT_TIMEOUT_SECONDS",
+        float,
+    )
+    _set(["redis", "app", "socket_timeout_seconds"], "REDIS_APP_SOCKET_TIMEOUT_SECONDS", float)
     _set(["redis", "app", "namespace"], "REDIS_APP_NAMESPACE")
 
     _set(["redis", "worker", "host"], "REDIS_WORKER_HOST")
@@ -235,6 +241,16 @@ def _apply_env_overrides(data: dict) -> dict:
     _set(["redis", "worker", "tls"], "REDIS_WORKER_TLS", bool)
     _set(["redis", "worker", "ssl_cert_reqs"], "REDIS_WORKER_SSL_CERT_REQS")
     _set(["redis", "worker", "ssl_ca_certs"], "REDIS_WORKER_SSL_CA_CERTS")
+    _set(
+        ["redis", "worker", "socket_connect_timeout_seconds"],
+        "REDIS_WORKER_SOCKET_CONNECT_TIMEOUT_SECONDS",
+        float,
+    )
+    _set(
+        ["redis", "worker", "socket_timeout_seconds"],
+        "REDIS_WORKER_SOCKET_TIMEOUT_SECONDS",
+        float,
+    )
     _set(["redis", "worker", "namespace"], "REDIS_WORKER_NAMESPACE")
 
     _set(["postgres", "enabled"], "POSTGRES_ENABLED", bool)
@@ -287,6 +303,27 @@ def _apply_env_overrides(data: dict) -> dict:
         int,
     )
     _set(["middleware", "enable_request_logging"], "MIDDLEWARE_ENABLE_REQUEST_LOGGING", bool)
+    _set(["middleware", "enable_cors"], "MIDDLEWARE_ENABLE_CORS", bool)
+    _set(
+        ["middleware", "cors_allow_origins"],
+        "MIDDLEWARE_CORS_ALLOW_ORIGINS",
+        lambda raw: [entry.strip() for entry in raw.split(",") if entry.strip()],
+    )
+    _set(
+        ["middleware", "cors_allow_methods"],
+        "MIDDLEWARE_CORS_ALLOW_METHODS",
+        lambda raw: [entry.strip().upper() for entry in raw.split(",") if entry.strip()],
+    )
+    _set(
+        ["middleware", "cors_allow_headers"],
+        "MIDDLEWARE_CORS_ALLOW_HEADERS",
+        lambda raw: [entry.strip() for entry in raw.split(",") if entry.strip()],
+    )
+    _set(
+        ["middleware", "cors_allow_credentials"],
+        "MIDDLEWARE_CORS_ALLOW_CREDENTIALS",
+        bool,
+    )
     _set(["middleware", "enable_rate_limit"], "MIDDLEWARE_ENABLE_RATE_LIMIT", bool)
     _set(["middleware", "enable_timeout"], "MIDDLEWARE_ENABLE_TIMEOUT", bool)
     _set(["middleware", "enable_backpressure"], "MIDDLEWARE_ENABLE_BACKPRESSURE", bool)
@@ -347,6 +384,29 @@ def _apply_env_overrides(data: dict) -> dict:
     _set(
         ["queue", "evaluation_poll_sleep_seconds"],
         "EVALUATION_POLL_SLEEP_SECONDS",
+        float,
+    )
+    _set(["queue", "summary_queue_enabled"], "SUMMARY_QUEUE_ENABLED", bool)
+    _set(["queue", "summary_queue_url"], "SUMMARY_QUEUE_URL")
+    _set(["queue", "summary_dlq_url"], "SUMMARY_DLQ_URL")
+    _set(
+        ["queue", "summary_receive_wait_seconds"],
+        "SUMMARY_RECEIVE_WAIT_SECONDS",
+        int,
+    )
+    _set(
+        ["queue", "summary_max_messages_per_poll"],
+        "SUMMARY_MAX_MESSAGES_PER_POLL",
+        int,
+    )
+    _set(
+        ["queue", "summary_visibility_timeout_seconds"],
+        "SUMMARY_VISIBILITY_TIMEOUT_SECONDS",
+        int,
+    )
+    _set(
+        ["queue", "summary_poll_sleep_seconds"],
+        "SUMMARY_POLL_SLEEP_SECONDS",
         float,
     )
     _set(["io", "llm_max_concurrency"], "IO_LLM_MAX_CONCURRENCY", int)

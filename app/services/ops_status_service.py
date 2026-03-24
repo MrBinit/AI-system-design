@@ -80,7 +80,8 @@ def get_ops_status() -> dict:
             "stream_depth": queue_state["stream_depth"],
             "pending_jobs": queue_state["pending_jobs"],
             "dlq_depth": dlq_state["depth"],
-            "consumer_group": settings.memory.summary_queue_group,
+            "consumer_group": settings.queue.summary_queue_url.strip()
+            or settings.memory.summary_queue_group,
             "last_dlq_error": latest_dlq.get("error", ""),
         },
         "compaction": {

@@ -208,6 +208,55 @@ def test_route_matching_middleware_formats_404():
     assert body["path"] == "/api/v1/does-not-exist"
 
 
+def test_chat_history_clear_endpoint_success(monkeypatch):
+    monkeypatch.setattr(
+        chat_api,
+        "clear_user_chat_state",
+        lambda _user_id, session_id=None: {
+            "memory_keys_deleted": 2 if not session_id else 1,
+            "legacy_memory_keys_deleted": 1 if not session_id else 0,
+            "cache_keys_deleted": 5 if not session_id else 2,
+        },
+    )
+    monkeypatch.setattr(
+        chat_api,
+        "clear_chat_traces",
+        lambda _user_id: {
+            "trace_keys_deleted": 7,
+            "index_key_deleted": 1,
+        },
+    )
+
+    token = create_access_token(user_id="user-1", roles=["user"])
+    client = TestClient(app)
+    response = client.delete(
+        "/api/v1/chat/history",
+        params={"user_id": "user-1"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["user_id"] == "user-1"
+    assert payload["session_id"] is None
+    assert payload["memory_keys_deleted"] == 2
+    assert payload["legacy_memory_keys_deleted"] == 1
+    assert payload["cache_keys_deleted"] == 5
+    assert payload["trace_keys_deleted"] == 7
+    assert payload["trace_index_deleted"] == 1
+
+
+def test_chat_history_clear_endpoint_requires_owner():
+    token = create_access_token(user_id="user-a", roles=["user"])
+    client = TestClient(app)
+    response = client.delete(
+        "/api/v1/chat/history",
+        params={"user_id": "user-b"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 403
+
+
 def test_ops_status_requires_admin(monkeypatch):
     monkeypatch.setattr(
         ops_api,

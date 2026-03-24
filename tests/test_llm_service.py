@@ -482,6 +482,104 @@ async def test_generate_response_returns_sorry_when_web_fallback_has_no_results(
 
 
 @pytest.mark.asyncio
+async def test_generate_response_uses_vector_when_web_fallback_empty(monkeypatch):
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_similarity_threshold", 0.35)
+
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    async def fake_primary(messages):
+        assert any(
+            isinstance(message, dict)
+            and "Retrieved long-term knowledge" in str(message.get("content", ""))
+            for message in messages
+        )
+        return FakeResponse("vector-response")
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {
+            "retrieval_strategy": "ann",
+            "results": [
+                {
+                    "content": "Vector-backed result remains available.",
+                    "distance": 0.9,
+                    "metadata": {"university": "Saarland University"},
+                }
+            ],
+        }
+
+    async def fake_web_fallback(*_args, **_kwargs):
+        return {"results": []}
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+    monkeypatch.setattr(llm_service, "aretrieve_web_chunks", fake_web_fallback)
+
+    result = await llm_service.generate_response("user-1", "saarland ai")
+    assert result == "vector-response"
+
+
+@pytest.mark.asyncio
+async def test_generate_response_tries_web_when_vector_has_no_urls(monkeypatch):
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_similarity_threshold", 0.05)
+    monkeypatch.setattr(llm_service, "_evidence_urls", lambda _results: [])
+
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    async def fake_primary(_messages):
+        raise AssertionError("model should not run when evidence has no URLs and web is empty")
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {
+            "retrieval_strategy": "ann",
+            "results": [
+                {
+                    "content": "Vector result without URL metadata.",
+                    "distance": 0.1,
+                    "metadata": {"university": "Saarland University"},
+                }
+            ],
+        }
+
+    web_calls = {"count": 0}
+
+    async def fake_web_fallback(*_args, **_kwargs):
+        web_calls["count"] += 1
+        return {"results": []}
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+    monkeypatch.setattr(llm_service, "aretrieve_web_chunks", fake_web_fallback)
+
+    result = await llm_service.generate_response("user-1", "saarland ai")
+    assert result == "Sorry, no relevant information is found."
+    assert web_calls["count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_generate_response_returns_sorry_when_strict_citation_has_no_evidence(monkeypatch):
     monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: True)
     monkeypatch.setattr(llm_service.settings.serpapi, "enabled", False)

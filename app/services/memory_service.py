@@ -414,3 +414,69 @@ async def update_memory(user_id: str, user_message: str, assistant_reply: str):
         logger.info("MemoryUpdateConflict | user=%s | attempt=%s", user_id, attempt)
 
     raise RuntimeError(f"Memory update failed after {max_attempts} optimistic-lock retries.")
+
+
+def _session_memory_user_id(user_id: str, session_id: str | None) -> str:
+    """Match llm-service memory partitioning for optional per-session state."""
+    normalized_user = str(user_id).strip()
+    normalized_session = str(session_id or "").strip()
+    if not normalized_session or normalized_session == normalized_user:
+        return normalized_user
+    return f"{normalized_user}::session::{normalized_session}"
+
+
+def _delete_pattern_keys(pattern: str, *, client=None) -> int:
+    """Delete all Redis keys matching one pattern using SCAN for safety."""
+    redis_conn = client or redis_client
+    deleted = 0
+    try:
+        for key in redis_conn.scan_iter(match=pattern, count=200):
+            deleted += int(redis_conn.delete(key))
+    except RedisError as exc:
+        logger.warning("Redis pattern delete failed | pattern=%s | error=%s", pattern, exc)
+    return deleted
+
+
+def clear_user_chat_state(user_id: str, session_id: str | None = None) -> dict[str, int]:
+    """Delete persisted short-term chat state and chat cache keys for a user/session."""
+    normalized_user = str(user_id).strip()
+    if not normalized_user:
+        return {
+            "memory_keys_deleted": 0,
+            "legacy_memory_keys_deleted": 0,
+            "cache_keys_deleted": 0,
+        }
+
+    memory_keys_deleted = 0
+    legacy_memory_keys_deleted = 0
+    cache_keys_deleted = 0
+
+    target_memory_user = _session_memory_user_id(normalized_user, session_id)
+    try:
+        memory_keys_deleted += int(redis_client.delete(_redis_key(target_memory_user)))
+        legacy_memory_keys_deleted += int(
+            redis_client.delete(_legacy_redis_key(target_memory_user))
+        )
+    except RedisError as exc:
+        logger.warning("Redis direct memory delete failed for user=%s. %s", normalized_user, exc)
+
+    normalized_session = str(session_id or "").strip()
+    if not normalized_session:
+        memory_keys_deleted += _delete_pattern_keys(_redis_key(f"{normalized_user}::session::*"))
+        legacy_memory_keys_deleted += _delete_pattern_keys(
+            _legacy_redis_key(f"{normalized_user}::session::*")
+        )
+        cache_keys_deleted += _delete_pattern_keys(
+            app_scoped_key("cache", "chat", normalized_user, "*")
+        )
+    else:
+        session_cache_scope = normalized_session or normalized_user
+        cache_keys_deleted += _delete_pattern_keys(
+            app_scoped_key("cache", "chat", normalized_user, session_cache_scope, "*")
+        )
+
+    return {
+        "memory_keys_deleted": memory_keys_deleted,
+        "legacy_memory_keys_deleted": legacy_memory_keys_deleted,
+        "cache_keys_deleted": cache_keys_deleted,
+    }

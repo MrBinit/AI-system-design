@@ -1,18 +1,17 @@
-import hmac
-import json
 import logging
-import os
+
 from fastapi import APIRouter, HTTPException, status
+
 from app.core.config import get_settings
+from app.core.passwords import verify_password
 from app.core.security import create_access_token
+from app.repositories.auth_user_repository import get_auth_user_by_username
 from app.schemas.auth_schema import PasswordLoginRequest, PasswordLoginResponse
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-_LOGIN_USERS_ENV = "SECURITY_LOGIN_USERS_JSON"
-_DEFAULT_LOGIN_USERS: list[dict] = []
 _INVALID_CREDENTIALS_DETAIL = "Invalid username or password."
 
 
@@ -23,76 +22,63 @@ def _normalize_roles(raw_roles) -> list[str]:
     return normalized or ["user"]
 
 
-def _normalize_login_users(raw_users) -> list[dict]:
-    normalized: list[dict] = []
-    if not isinstance(raw_users, list):
-        return normalized
-
-    for raw_user in raw_users:
-        if not isinstance(raw_user, dict):
-            continue
-        username = str(raw_user.get("username", "")).strip()
-        password = str(raw_user.get("password", "")).strip()
-        user_id = str(raw_user.get("user_id", username)).strip()
-        if not username or not password or not user_id:
-            continue
-        normalized.append(
-            {
-                "username": username,
-                "password": password,
-                "user_id": user_id,
-                "roles": _normalize_roles(raw_user.get("roles")),
-            }
-        )
-    return normalized
+def _normalize_user_id(user: dict) -> str:
+    user_id = str(user.get("user_id", "")).strip()
+    if user_id:
+        return user_id
+    return str(user.get("username", "")).strip()
 
 
-def _login_users() -> list[dict]:
-    raw = os.getenv(_LOGIN_USERS_ENV, "").strip()
-    if not raw:
-        return list(_DEFAULT_LOGIN_USERS)
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("Invalid JSON in %s; no login users loaded.", _LOGIN_USERS_ENV)
-        return list(_DEFAULT_LOGIN_USERS)
-
-    users = _normalize_login_users(parsed)
-    if users:
-        return users
-
-    logger.warning("%s did not contain valid users; no login users loaded.", _LOGIN_USERS_ENV)
-    return list(_DEFAULT_LOGIN_USERS)
+def _normalize_user_roles(user: dict) -> list[str]:
+    return _normalize_roles(user.get("roles"))
 
 
-def _find_login_user(username: str) -> dict | None:
+def _fetch_auth_user(username: str) -> dict | None:
     target = str(username).strip()
-    for user in _login_users():
-        if str(user.get("username", "")).strip() == target:
-            return user
-    return None
+    if not target:
+        return None
+    if not settings.postgres.enabled:
+        logger.warning("Postgres-backed login is configured but postgres.enabled=false.")
+        return None
+    try:
+        return get_auth_user_by_username(target)
+    except Exception as exc:
+        logger.warning("Auth user lookup failed for username=%s. %s", target, exc)
+        return None
 
 
 @router.post("/auth/login", response_model=PasswordLoginResponse)
 async def password_login(request: PasswordLoginRequest):
     """Authenticate a username/password pair and return a JWT bearer token."""
-    user = _find_login_user(request.username)
+    user = _fetch_auth_user(request.username)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=_INVALID_CREDENTIALS_DETAIL,
         )
 
-    configured_password = str(user.get("password", "")).strip()
-    if not configured_password or not hmac.compare_digest(request.password, configured_password):
+    if not bool(user.get("is_active", True)):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=_INVALID_CREDENTIALS_DETAIL,
         )
 
-    roles = _normalize_roles(user.get("roles"))
-    user_id = str(user.get("user_id", "")).strip()
+    configured_password_hash = str(user.get("password_hash", "")).strip()
+    if not configured_password_hash or not verify_password(
+        request.password, configured_password_hash
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_INVALID_CREDENTIALS_DETAIL,
+        )
+
+    roles = _normalize_user_roles(user)
+    user_id = _normalize_user_id(user)
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_INVALID_CREDENTIALS_DETAIL,
+        )
     token = create_access_token(user_id=user_id, roles=roles)
     return {
         "access_token": token,

@@ -647,6 +647,31 @@ def _collect_search_rows(
     return _filter_rows_by_allowed_domains(rows, allowed_suffixes)
 
 
+def _collect_search_rows_with_domain_retry(
+    payloads: list[dict],
+    query_variants: list[str],
+    *,
+    top_k: int,
+    allowed_suffixes: list[str],
+) -> tuple[list[dict], bool]:
+    """Collect rows with a fallback pass when strict domain suffix filtering is too narrow."""
+    rows = _collect_search_rows(
+        payloads,
+        query_variants,
+        top_k=top_k,
+        allowed_suffixes=allowed_suffixes,
+    )
+    if rows or not allowed_suffixes:
+        return rows, False
+    relaxed_rows = _collect_search_rows(
+        payloads,
+        query_variants,
+        top_k=top_k,
+        allowed_suffixes=[],
+    )
+    return relaxed_rows, bool(relaxed_rows)
+
+
 def _ai_overview_candidate(payloads: list[dict], allowed_suffixes: list[str]) -> dict | None:
     if allowed_suffixes:
         return None
@@ -818,7 +843,7 @@ async def aretrieve_web_chunks(query: str, *, top_k: int = 3) -> dict:
     payloads = await _asearch_payloads(query_variants, top_k=top_k)
     search_ms = _elapsed_ms(search_started_at)
 
-    rows = _collect_search_rows(
+    rows, domain_filter_relaxed = _collect_search_rows_with_domain_retry(
         payloads,
         query_variants,
         top_k=top_k,
@@ -843,7 +868,10 @@ async def aretrieve_web_chunks(query: str, *, top_k: int = 3) -> dict:
     return {
         "query": query,
         "query_variants": query_variants,
-        "retrieval_strategy": "web_search",
+        "retrieval_strategy": (
+            "web_search_domain_relaxed" if domain_filter_relaxed else "web_search"
+        ),
+        "domain_filter_relaxed": domain_filter_relaxed,
         "timings_ms": {
             "search": search_ms,
             "page_fetch": fetch_ms,

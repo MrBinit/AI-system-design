@@ -201,6 +201,75 @@ class FakeRedis:
         return bucket[start : end + 1]
 
 
+class FakeSQS:
+    def __init__(self):
+        self.queues = {}
+        self.in_flight = {}
+        self.counter = 0
+
+    def _queue(self, queue_url: str):
+        return self.queues.setdefault(queue_url, [])
+
+    def send_message(self, QueueUrl, MessageBody, MessageGroupId=None):  # noqa: N803
+        _ = MessageGroupId
+        self.counter += 1
+        message_id = f"msg-{self.counter}"
+        receipt_handle = f"rh-{self.counter}"
+        self._queue(QueueUrl).append(
+            {
+                "MessageId": message_id,
+                "ReceiptHandle": receipt_handle,
+                "Body": MessageBody,
+            }
+        )
+        return {"MessageId": message_id}
+
+    def receive_message(
+        self,
+        QueueUrl,  # noqa: N803
+        MaxNumberOfMessages=1,  # noqa: N803
+        WaitTimeSeconds=0,  # noqa: N803
+        VisibilityTimeout=30,  # noqa: N803
+        MessageAttributeNames=None,  # noqa: N803
+        AttributeNames=None,  # noqa: N803
+    ):
+        _ = (
+            WaitTimeSeconds,
+            VisibilityTimeout,
+            MessageAttributeNames,
+            AttributeNames,
+        )
+        queue = self._queue(QueueUrl)
+        batch = []
+        for _idx in range(min(MaxNumberOfMessages, len(queue))):
+            message = queue.pop(0)
+            self.in_flight[message["ReceiptHandle"]] = {
+                "queue_url": QueueUrl,
+                "message": dict(message),
+            }
+            batch.append(dict(message))
+        return {"Messages": batch}
+
+    def delete_message(self, QueueUrl, ReceiptHandle):  # noqa: N803
+        in_flight = self.in_flight.get(ReceiptHandle)
+        if in_flight and in_flight["queue_url"] == QueueUrl:
+            del self.in_flight[ReceiptHandle]
+        return {}
+
+    def get_queue_attributes(self, QueueUrl, AttributeNames):  # noqa: N803
+        _ = AttributeNames
+        visible = len(self._queue(QueueUrl))
+        not_visible = sum(
+            1 for entry in self.in_flight.values() if entry.get("queue_url") == QueueUrl
+        )
+        return {
+            "Attributes": {
+                "ApproximateNumberOfMessages": str(visible),
+                "ApproximateNumberOfMessagesNotVisible": str(not_visible),
+            }
+        }
+
+
 async def _fake_noop(*_args, **_kwargs):
     return None
 
@@ -250,6 +319,7 @@ def _base_memory():
 
 def test_api_to_queue_to_worker_to_memory_update(monkeypatch):
     fake_redis = FakeRedis()
+    fake_sqs = FakeSQS()
     jobs = {}
 
     monkeypatch.setattr(llm_service, "redis_client", fake_redis)
@@ -259,11 +329,30 @@ def test_api_to_queue_to_worker_to_memory_update(monkeypatch):
     monkeypatch.setattr(memory_metrics_service, "redis_client", fake_redis)
     monkeypatch.setattr(ops_status_service, "app_redis_client", fake_redis)
     monkeypatch.setattr(summary_queue_service, "worker_redis_client", fake_redis)
+    monkeypatch.setattr(summary_queue_service, "_sqs_client", lambda: fake_sqs)
     monkeypatch.setattr(rate_limit, "app_redis_client", fake_redis)
     monkeypatch.setattr(backpressure, "app_redis_client", fake_redis)
     monkeypatch.setattr(main_app, "app_redis_client", fake_redis)
     monkeypatch.setattr(main_app, "start_offline_eval_scheduler", _fake_noop_sync)
     monkeypatch.setattr(main_app, "stop_offline_eval_scheduler", _fake_noop)
+    monkeypatch.setattr(summary_queue_service.settings.queue, "summary_queue_enabled", True)
+    monkeypatch.setattr(
+        summary_queue_service.settings.queue,
+        "summary_queue_url",
+        "https://sqs.us-east-1.amazonaws.com/123/summary-jobs",
+    )
+    monkeypatch.setattr(
+        summary_queue_service.settings.queue,
+        "summary_dlq_url",
+        "https://sqs.us-east-1.amazonaws.com/123/summary-jobs-dlq",
+    )
+    monkeypatch.setattr(summary_queue_service.settings.queue, "summary_receive_wait_seconds", 0)
+    monkeypatch.setattr(summary_queue_service.settings.queue, "summary_max_messages_per_poll", 10)
+    monkeypatch.setattr(
+        summary_queue_service.settings.queue,
+        "summary_visibility_timeout_seconds",
+        30,
+    )
 
     def _fake_enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None):
         answer = asyncio.run(llm_service.generate_response(user_id, prompt))

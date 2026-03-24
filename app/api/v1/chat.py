@@ -2,16 +2,19 @@ import asyncio
 import json
 import logging
 from typing import Annotated, AsyncIterator
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from app.api.dependencies.security import authorize_user_access, get_current_principal
 from app.core.config import get_settings
 from app.schemas.auth_schema import Principal
 from app.schemas.chat_schema import (
     AsyncChatStatusResponse,
+    ChatHistoryClearResponse,
     ChatRequest,
 )
+from app.services.evaluation_service import clear_chat_traces
 from app.services.llm_async_queue_service import enqueue_chat_job, get_chat_job
+from app.services.memory_service import clear_user_chat_state
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -179,4 +182,36 @@ async def chat_status(
         completed_at=str(record.get("completed_at", "")),
         response=str(record.get("answer", "")),
         error=public_error,
+    )
+
+
+@router.delete("/chat/history", response_model=ChatHistoryClearResponse)
+async def clear_chat_history(
+    user_id: Annotated[str, Query(min_length=3, max_length=128)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+    session_id: Annotated[
+        str | None,
+        Query(
+            min_length=3,
+            max_length=128,
+            pattern=r"^[A-Za-z0-9_.:@\-]+$",
+            description=(
+                "Optional session id. If provided, clear only that session state; "
+                "if omitted, clear all conversation state for the user."
+            ),
+        ),
+    ] = None,
+):
+    """Delete prior conversation state for one user (memory, cache, and eval traces)."""
+    authorize_user_access(principal, user_id)
+    memory_result = clear_user_chat_state(user_id, session_id=session_id)
+    trace_result = clear_chat_traces(user_id)
+    return ChatHistoryClearResponse(
+        user_id=user_id,
+        session_id=session_id,
+        memory_keys_deleted=int(memory_result.get("memory_keys_deleted", 0)),
+        legacy_memory_keys_deleted=int(memory_result.get("legacy_memory_keys_deleted", 0)),
+        cache_keys_deleted=int(memory_result.get("cache_keys_deleted", 0)),
+        trace_keys_deleted=int(trace_result.get("trace_keys_deleted", 0)),
+        trace_index_deleted=int(trace_result.get("index_key_deleted", 0)),
     )

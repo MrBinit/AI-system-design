@@ -8,6 +8,8 @@ redis:
     tls: true
     ssl_cert_reqs: "required"
     ssl_ca_certs: "/etc/ssl/certs/ca-certificates.crt"
+    socket_connect_timeout_seconds: 3
+    socket_timeout_seconds: 5
     namespace: "app"
   worker:
     host: "ai-redis-cache-vho1b2.serverless.use1.cache.amazonaws.com"
@@ -18,4 +20,6 @@ redis:
     tls: true
     ssl_cert_reqs: "required"
     ssl_ca_certs: "/etc/ssl/certs/ca-certificates.crt"
+    socket_connect_timeout_seconds: 3
+    socket_timeout_seconds: 5
     namespace: "worker"

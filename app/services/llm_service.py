@@ -47,6 +47,17 @@ _LLM_MOCK_DELAY_MS_ENV = "LLM_MOCK_DELAY_MS"
 _LLM_MOCK_STREAM_CHUNK_CHARS_ENV = "LLM_MOCK_STREAM_CHUNK_CHARS"
 _RETRIEVAL_DISABLED_ENV = "RETRIEVAL_DISABLED"
 _NO_RELEVANT_INFORMATION_DETAIL = "Sorry, no relevant information is found."
+_DEADLINE_QUERY_RE = re.compile(
+    r"\b(application\s+deadline|deadline|last\s+date|closing\s+date|apply\s+by)\b",
+    flags=re.IGNORECASE,
+)
+_DATE_LIKE_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}\b|"
+    r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b|"
+    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,\s*\d{4})?\b|"
+    r"\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _chat_cache_key(user_id: str, prompt: str, session_id: str | None = None) -> str:
@@ -116,6 +127,14 @@ def _is_citation_grounding_required() -> bool:
     if isinstance(raw, str):
         return raw.strip().lower() in {"1", "true", "yes", "on"}
     return bool(raw)
+
+
+def _is_deadline_query(user_prompt: str) -> bool:
+    return bool(_DEADLINE_QUERY_RE.search(str(user_prompt or "")))
+
+
+def _has_date_like_value(text: str) -> bool:
+    return bool(_DATE_LIKE_RE.search(str(text or "")))
 
 
 def _llm_mock_delay_seconds() -> float:
@@ -529,14 +548,25 @@ async def _retrieve_web_candidates_if_needed(
     retrieval_query: str,
     *,
     vector_results: list[dict],
+    vector_has_urls: bool,
     top_similarity: float | None,
     state: dict,
 ) -> tuple[list[dict], bool]:
-    if not _should_use_web_fallback(state, top_similarity):
+    fallback_for_low_confidence = _should_use_web_fallback(state, top_similarity)
+    fallback_for_missing_urls = (
+        bool(vector_results)
+        and not vector_has_urls
+        and settings.serpapi.enabled
+        and settings.serpapi.fallback_enabled
+        and _serpapi_key_present()
+    )
+    if not (fallback_for_low_confidence or fallback_for_missing_urls):
         return [], False
 
-    if vector_results:
+    if vector_results and fallback_for_low_confidence:
         state["retrieval_strategy"] = "vector_low_confidence"
+    elif vector_results and fallback_for_missing_urls:
+        state["retrieval_strategy"] = "vector_missing_urls"
 
     try:
         web_result = await aretrieve_web_chunks(
@@ -644,15 +674,23 @@ async def _augment_messages_with_retrieval(
     retrieval_started_at = time.perf_counter()
     try:
         vector_results, top_similarity = await _retrieve_vector_candidates(retrieval_query, state)
+        vector_has_urls = bool(_evidence_urls(vector_results))
         web_results, web_fallback_attempted = await _retrieve_web_candidates_if_needed(
             retrieval_query,
             vector_results=vector_results,
+            vector_has_urls=vector_has_urls,
             top_similarity=top_similarity,
             state=state,
         )
         if web_fallback_attempted and not web_results:
-            state["context_guard_reason"] = "no_relevant_information"
-            return None, _NO_RELEVANT_INFORMATION_DETAIL
+            if not vector_results:
+                state["context_guard_reason"] = "no_relevant_information"
+                return None, _NO_RELEVANT_INFORMATION_DETAIL
+            if not vector_has_urls:
+                state["context_guard_reason"] = "weak_evidence_no_urls"
+                return None, _NO_RELEVANT_INFORMATION_DETAIL
+            state["retrieval_strategy"] = "vector_fallback_web_empty"
+            logger.info("Web fallback returned no results; using available vector evidence.")
 
         merged_results = _merge_vector_and_web_results(vector_results, web_results)
         merged_results = await _rerank_if_configured(retrieval_query, merged_results, state)
@@ -990,6 +1028,7 @@ def _new_metrics_state() -> dict:
         "retrieval_evidence": [],
         "citation_required": False,
         "evidence_urls": [],
+        "deadline_query": False,
         "llm_usage": {},
         "quality": {},
         "input_guard_reason": "",
@@ -1047,6 +1086,7 @@ async def _prepare_messages_for_model(
     state: dict,
 ) -> tuple[list | None, str | None]:
     build_context_started_at = time.perf_counter()
+    state["deadline_query"] = _is_deadline_query(safe_user_prompt)
     messages = await build_context(conversation_user_id, safe_user_prompt)
     state["build_context_ms"] = _elapsed_ms(build_context_started_at)
 
@@ -1070,8 +1110,22 @@ async def _prepare_messages_for_model(
         return None, citation_detail
 
     chat_system_prompt = prompts.get("chat", {}).get("system_prompt", "")
+    system_messages: list[dict] = []
+    if state["deadline_query"]:
+        system_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Date-answer policy: when the user asks for deadlines/dates, "
+                    "return exact date values from evidence with URL citations. "
+                    f"If exact dates are absent, answer exactly: {_NO_RELEVANT_INFORMATION_DETAIL}"
+                ),
+            }
+        )
     if isinstance(chat_system_prompt, str) and chat_system_prompt.strip():
-        messages = [{"role": "system", "content": chat_system_prompt.strip()}] + messages
+        system_messages.append({"role": "system", "content": chat_system_prompt.strip()})
+    if system_messages:
+        messages = system_messages + messages
 
     context_guard = apply_context_guardrails(messages)
     if not context_guard["blocked"]:
@@ -1114,7 +1168,13 @@ def _extract_guarded_result(*, user_id: str, raw_result, state: dict) -> str:
             user_id,
             state["output_guard_reason"],
         )
-    return _enforce_citation_grounding(str(result), state)
+    grounded_result = _enforce_citation_grounding(str(result), state)
+    if grounded_result == _NO_RELEVANT_INFORMATION_DETAIL:
+        return grounded_result
+    if bool(state.get("deadline_query", False)) and not _has_date_like_value(grounded_result):
+        state["output_guard_reason"] = "deadline_missing_date"
+        return _NO_RELEVANT_INFORMATION_DETAIL
+    return grounded_result
 
 
 async def _update_memory_with_timing(

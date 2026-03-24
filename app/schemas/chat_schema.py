@@ -38,3 +38,15 @@ class AsyncChatStatusResponse(BaseModel):
     completed_at: str = Field(default="", max_length=64)
     response: str = Field(default="", max_length=12000)
     error: str = Field(default="", max_length=2000)
+
+
+class ChatHistoryClearResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=3, max_length=128)
+    session_id: str | None = Field(default=None, max_length=128)
+    memory_keys_deleted: int = Field(ge=0)
+    legacy_memory_keys_deleted: int = Field(ge=0)
+    cache_keys_deleted: int = Field(ge=0)
+    trace_keys_deleted: int = Field(ge=0)
+    trace_index_deleted: int = Field(ge=0)

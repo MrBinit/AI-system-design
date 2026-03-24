@@ -77,9 +77,8 @@ def guard_user_input(user_id: str, prompt: str) -> dict:
         logger.info("GuardrailBlockInput | user=%s | reason=blocked_input_pattern", user_id)
         return {"blocked": True, "sanitized_text": "", "reason": "blocked_input_pattern"}
 
-    if not _is_in_domain(prompt):
-        logger.info("GuardrailBlockInput | user=%s | reason=out_of_scope", user_id)
-        return {"blocked": True, "sanitized_text": "", "reason": "out_of_scope"}
+    # Do not block on out-of-context queries at the input layer.
+    # Scope is handled by retrieval/prompt behavior, while safety blocks remain active.
 
     sanitized = redact_sensitive_content(prompt)
     return {"blocked": False, "sanitized_text": sanitized, "reason": ""}
@@ -108,9 +107,6 @@ def apply_context_guardrails(messages: list[dict]) -> dict:
         ):
             injection_detected = True
             content = "[Potential prompt-injection content removed.]"
-        elif role == "user" and not _is_in_domain(content):
-            content = "[Out-of-scope content removed.]"
-
         cleaned.append({"role": role, "content": content})
 
     policy_msg = {

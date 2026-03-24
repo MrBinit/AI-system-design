@@ -15,6 +15,17 @@ class MiddlewareConfig(BaseModel):
     )
     distributed_backpressure_lease_seconds: int = Field(default=45, ge=5, le=300)
     enable_request_logging: bool = True
+    enable_cors: bool = False
+    cors_allow_origins: list[str] = Field(default_factory=list, max_length=256)
+    cors_allow_methods: list[str] = Field(
+        default_factory=lambda: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        max_length=32,
+    )
+    cors_allow_headers: list[str] = Field(
+        default_factory=lambda: ["Authorization", "Content-Type"],
+        max_length=64,
+    )
+    cors_allow_credentials: bool = False
     enable_rate_limit: bool = True
     enable_timeout: bool = True
     enable_backpressure: bool = True

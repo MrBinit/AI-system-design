@@ -1,10 +1,16 @@
+import hashlib
 import json
 import logging
-import hashlib
+import os
+import time
 from datetime import datetime, timezone
+from functools import lru_cache
+from threading import Lock
 from uuid import uuid4
 
-from redis.exceptions import RedisError, ResponseError
+import boto3
+from botocore.exceptions import ClientError
+from redis.exceptions import RedisError
 
 from app.core.config import get_settings
 from app.infra.redis_client import worker_redis_client, worker_scoped_key
@@ -14,15 +20,47 @@ logger = logging.getLogger(__name__)
 
 _PROCESSING_TTL_SECONDS = 300
 _COMPLETED_TTL_SECONDS = 86400
+_MAX_SQS_POLL_MESSAGES = 10
+_LAST_DLQ_INFO: dict | None = None
+_LAST_DLQ_ALERT_AT_MONOTONIC = 0.0
+_STATE_LOCK = Lock()
+_SUMMARY_QUEUE_SEND_FAILURE_LOG = "Failed sending summary queue message. %s"
+
+
+def _secrets_region() -> str | None:
+    region = (
+        os.getenv("AWS_REGION", "").strip()
+        or os.getenv("AWS_DEFAULT_REGION", "").strip()
+        or os.getenv("AWS_SECRETS_MANAGER_REGION", "").strip()
+    )
+    return region or None
+
+
+@lru_cache()
+def _sqs_client():
+    kwargs = {"region_name": _secrets_region()} if _secrets_region() else {}
+    return boto3.client("sqs", **kwargs)
+
+
+def _summary_queue_url() -> str:
+    return str(settings.queue.summary_queue_url or "").strip()
+
+
+def _summary_dlq_url() -> str:
+    return str(settings.queue.summary_dlq_url or "").strip()
+
+
+def _is_summary_queue_enabled() -> bool:
+    return bool(settings.queue.summary_queue_enabled and _summary_queue_url())
 
 
 def _stream_key() -> str:
-    """Return the worker-scoped Redis stream key for summary jobs."""
+    """Return the worker-scoped key namespace used for summary idempotency markers."""
     return worker_scoped_key(settings.memory.summary_queue_stream_key)
 
 
 def _dlq_stream_key() -> str:
-    """Return the worker-scoped Redis stream key for summary dead-letter jobs."""
+    """Return the worker-scoped key namespace used for summary DLQ metadata markers."""
     return worker_scoped_key(settings.memory.summary_queue_dlq_stream_key)
 
 
@@ -36,9 +74,124 @@ def _completed_key(idempotency_key: str) -> str:
     return f"{_stream_key()}:completed:{idempotency_key}"
 
 
-def _dlq_alert_key() -> str:
-    """Build the Redis key used to throttle DLQ alert emission."""
-    return f"{_dlq_stream_key()}:alerted"
+def _to_int(value, default=0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_message_group_id(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return "summary"
+    return text[:128]
+
+
+def _json_safe_value(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, dict)):
+        return value
+    return str(value)
+
+
+def _copy_job_payload(fields: dict) -> dict:
+    payload = {}
+    for key, value in fields.items():
+        if not isinstance(key, str) or key.startswith("_"):
+            continue
+        payload[key] = _json_safe_value(value)
+    return payload
+
+
+def _send_json(queue_url: str, payload: dict, message_group_id: str) -> bool:
+    if not queue_url.strip():
+        return False
+    body = json.dumps(payload, ensure_ascii=False)
+    send_kwargs = {
+        "QueueUrl": queue_url.strip(),
+        "MessageBody": body,
+        "MessageGroupId": _safe_message_group_id(message_group_id),
+    }
+    try:
+        _sqs_client().send_message(**send_kwargs)
+        return True
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        if error_code not in {"InvalidParameterValue", "UnsupportedOperation"}:
+            logger.warning(_SUMMARY_QUEUE_SEND_FAILURE_LOG, exc)
+            return False
+        send_kwargs.pop("MessageGroupId", None)
+        try:
+            _sqs_client().send_message(**send_kwargs)
+            return True
+        except Exception as inner_exc:
+            logger.warning(_SUMMARY_QUEUE_SEND_FAILURE_LOG, inner_exc)
+            return False
+    except Exception as exc:
+        logger.warning(_SUMMARY_QUEUE_SEND_FAILURE_LOG, exc)
+        return False
+
+
+def _queue_depth_and_pending(queue_url: str) -> tuple[int, int]:
+    if not queue_url.strip():
+        return 0, 0
+    try:
+        response = _sqs_client().get_queue_attributes(
+            QueueUrl=queue_url.strip(),
+            AttributeNames=[
+                "ApproximateNumberOfMessages",
+                "ApproximateNumberOfMessagesNotVisible",
+            ],
+        )
+    except Exception as exc:
+        logger.warning("Failed reading SQS queue attributes. %s", exc)
+        return 0, 0
+
+    attributes = response.get("Attributes", {})
+    if not isinstance(attributes, dict):
+        return 0, 0
+    depth = max(0, _to_int(attributes.get("ApproximateNumberOfMessages"), 0))
+    pending = max(0, _to_int(attributes.get("ApproximateNumberOfMessagesNotVisible"), 0))
+    return depth, pending
+
+
+def _remember_latest_dlq(payload: dict) -> None:
+    global _LAST_DLQ_INFO
+    latest_info = {
+        "stream_id": str(payload.get("job_id", "")),
+        "job_id": str(payload.get("job_id", "")),
+        "user_id": str(payload.get("user_id", "")),
+        "failed_at": str(payload.get("failed_at", "")),
+        "error": str(payload.get("error", "")),
+        "final_attempt": str(payload.get("final_attempt", "")),
+    }
+    with _STATE_LOCK:
+        _LAST_DLQ_INFO = latest_info
+
+
+def _receive_summary_messages() -> list[dict]:
+    queue_url = _summary_queue_url()
+    if not queue_url:
+        return []
+    try:
+        response = _sqs_client().receive_message(
+            QueueUrl=queue_url,
+            MaxNumberOfMessages=min(
+                settings.queue.summary_max_messages_per_poll,
+                _MAX_SQS_POLL_MESSAGES,
+            ),
+            WaitTimeSeconds=settings.queue.summary_receive_wait_seconds,
+            VisibilityTimeout=settings.queue.summary_visibility_timeout_seconds,
+            MessageAttributeNames=["All"],
+            AttributeNames=["All"],
+        )
+    except Exception as exc:
+        logger.warning("Failed reading summary queue. %s", exc)
+        return []
+    messages = response.get("Messages", [])
+    return messages if isinstance(messages, list) else []
 
 
 def build_summary_job_idempotency_key(
@@ -54,7 +207,7 @@ def build_summary_job_idempotency_key(
 
 
 def get_summary_job_idempotency_key(fields: dict) -> str:
-    """Read or reconstruct the idempotency key from a stream entry payload."""
+    """Read or reconstruct the idempotency key from one queue entry payload."""
     explicit = fields.get("idempotency_key")
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
@@ -83,73 +236,33 @@ def get_summary_job_idempotency_key(fields: dict) -> str:
 
 
 def ensure_consumer_group():
-    """Create the Redis consumer group used by summary workers if it does not exist."""
-    try:
-        worker_redis_client.xgroup_create(
-            name=_stream_key(),
-            groupname=settings.memory.summary_queue_group,
-            id="0",
-            mkstream=True,
-        )
-    except ResponseError as exc:
-        if "BUSYGROUP" not in str(exc):
-            raise
-    except RedisError as exc:
-        logger.warning("Failed to ensure summary queue consumer group. %s", exc)
+    """No-op for SQS-backed summary queue; kept for backward-compatible call sites."""
+    return None
 
 
 def get_summary_dlq_state() -> dict:
-    """Return the current DLQ depth and the latest failed job metadata."""
-    try:
-        depth = int(worker_redis_client.xlen(_dlq_stream_key()))
-        latest = worker_redis_client.xrevrange(_dlq_stream_key(), count=1)
-    except RedisError as exc:
-        logger.warning("Failed reading summary DLQ state. %s", exc)
-        return {"depth": 0, "latest": None}
-
-    if not latest:
-        return {"depth": depth, "latest": None}
-
-    stream_id, fields = latest[0]
-    latest_info = {
-        "stream_id": stream_id,
-        "job_id": fields.get("job_id", ""),
-        "user_id": fields.get("user_id", ""),
-        "failed_at": fields.get("failed_at", ""),
-        "error": fields.get("error", ""),
-        "final_attempt": fields.get("final_attempt", ""),
-    }
-    return {"depth": depth, "latest": latest_info}
+    """Return the current summary DLQ depth and latest known failed job metadata."""
+    dlq_url = _summary_dlq_url()
+    depth, _ = _queue_depth_and_pending(dlq_url) if dlq_url else (0, 0)
+    with _STATE_LOCK:
+        latest = dict(_LAST_DLQ_INFO) if isinstance(_LAST_DLQ_INFO, dict) else None
+    return {"depth": depth, "latest": latest}
 
 
 def get_summary_queue_state() -> dict:
-    """Return the current summary stream depth and pending job count."""
-    try:
-        stream_depth = int(worker_redis_client.xlen(_stream_key()))
-    except RedisError as exc:
-        logger.warning("Failed reading summary queue depth. %s", exc)
-        stream_depth = 0
-
-    pending_jobs = 0
-    try:
-        pending = worker_redis_client.xpending(_stream_key(), settings.memory.summary_queue_group)
-        if isinstance(pending, dict):
-            pending_jobs = int(pending.get("pending", 0))
-        elif isinstance(pending, (list, tuple)) and pending:
-            pending_jobs = int(pending[0])
-    except AttributeError:
-        pending_jobs = 0
-    except (RedisError, TypeError, ValueError) as exc:
-        logger.warning("Failed reading summary queue pending count. %s", exc)
-
+    """Return the current summary queue depth and in-flight count from SQS attributes."""
+    if not _is_summary_queue_enabled():
+        return {"stream_depth": 0, "pending_jobs": 0}
+    depth, pending = _queue_depth_and_pending(_summary_queue_url())
     return {
-        "stream_depth": stream_depth,
-        "pending_jobs": max(0, pending_jobs),
+        "stream_depth": depth,
+        "pending_jobs": pending,
     }
 
 
 def monitor_summary_dlq(*, force: bool = False) -> dict:
-    """Inspect the DLQ and emit a throttled alert when backlog crosses the threshold."""
+    """Inspect DLQ depth and emit a throttled alert when backlog crosses the threshold."""
+    global _LAST_DLQ_ALERT_AT_MONOTONIC
     state = get_summary_dlq_state()
     depth = state["depth"]
     threshold = settings.memory.summary_queue_dlq_alert_threshold
@@ -159,18 +272,12 @@ def monitor_summary_dlq(*, force: bool = False) -> dict:
 
     should_alert = force
     if not force:
-        try:
-            should_alert = bool(
-                worker_redis_client.set(
-                    _dlq_alert_key(),
-                    str(depth),
-                    ex=settings.memory.summary_queue_dlq_alert_cooldown_seconds,
-                    nx=True,
-                )
-            )
-        except RedisError as exc:
-            logger.warning("Failed setting summary DLQ alert throttle. %s", exc)
-            should_alert = True
+        now = time.monotonic()
+        with _STATE_LOCK:
+            elapsed = now - _LAST_DLQ_ALERT_AT_MONOTONIC
+            if elapsed >= settings.memory.summary_queue_dlq_alert_cooldown_seconds:
+                _LAST_DLQ_ALERT_AT_MONOTONIC = now
+                should_alert = True
 
     if should_alert:
         logger.error(
@@ -197,7 +304,11 @@ def enqueue_summary_job(
     approx_removed_tokens: int,
     attempt: int = 0,
 ) -> str | None:
-    """Push a new summary compaction job onto the Redis stream."""
+    """Push a new summary compaction job onto the configured SQS summary queue."""
+    if not _is_summary_queue_enabled():
+        logger.warning("Summary queue is disabled or not configured.")
+        return None
+
     job_id = str(uuid4())
     idempotency_key = build_summary_job_idempotency_key(
         user_id=user_id,
@@ -217,18 +328,13 @@ def enqueue_summary_job(
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    try:
-        worker_redis_client.xadd(
-            _stream_key(),
-            payload,
-            maxlen=10000,
-            approximate=True,
-        )
-        logger.info("SummaryJobEnqueued | %s", json.dumps(payload, sort_keys=True))
-        return job_id
-    except RedisError as exc:
-        logger.warning("Failed to enqueue summary job for user=%s. %s", user_id, exc)
+    sent = _send_json(_summary_queue_url(), payload, message_group_id=user_id)
+    if not sent:
+        logger.warning("Failed to enqueue summary job for user=%s.", user_id)
         return None
+
+    logger.info("SummaryJobEnqueued | %s", json.dumps(payload, sort_keys=True))
+    return job_id
 
 
 def is_summary_job_processed(idempotency_key: str) -> bool:
@@ -285,72 +391,47 @@ def mark_summary_job_processed(idempotency_key: str, stream_id: str):
 
 
 def read_summary_jobs(consumer_name: str) -> list[tuple[str, dict]]:
-    """Read the next batch of summary jobs for a worker consumer."""
-    ensure_consumer_group()
-    try:
-        response = worker_redis_client.xreadgroup(
-            groupname=settings.memory.summary_queue_group,
-            consumername=consumer_name,
-            streams={_stream_key(): ">"},
-            count=settings.memory.summary_queue_read_count,
-            block=settings.memory.summary_queue_block_ms,
-        )
-    except RedisError as exc:
-        logger.warning("Failed reading summary queue. %s", exc)
+    """Read the next batch of summary jobs from SQS for one worker poll cycle."""
+    _ = consumer_name
+    if not _is_summary_queue_enabled():
         return []
 
     jobs = []
-    for _stream, entries in response:
-        for stream_id, fields in entries:
-            jobs.append((stream_id, fields))
+    for message in _receive_summary_messages():
+        receipt_handle = str(message.get("ReceiptHandle", "")).strip()
+        if not receipt_handle:
+            continue
+
+        raw_body = str(message.get("Body", ""))
+        try:
+            payload = json.loads(raw_body)
+        except json.JSONDecodeError:
+            payload = {}
+        fields = payload if isinstance(payload, dict) else {}
+        if "attempt" not in fields:
+            fields["attempt"] = "0"
+        fields["_message_id"] = str(message.get("MessageId", ""))
+        jobs.append((receipt_handle, fields))
     return jobs
 
 
 def claim_stale_summary_jobs(consumer_name: str) -> list[tuple[str, dict]]:
-    """Claim stale pending jobs abandoned by other consumers."""
-    ensure_consumer_group()
-    try:
-        response = worker_redis_client.xautoclaim(
-            _stream_key(),
-            settings.memory.summary_queue_group,
-            consumer_name,
-            settings.memory.summary_queue_claim_idle_ms,
-            start_id="0-0",
-            count=settings.memory.summary_queue_claim_batch_size,
-        )
-    except AttributeError:
-        logger.warning("Redis client does not support xautoclaim; stale job recovery is disabled.")
-        return []
-    except ResponseError as exc:
-        logger.warning("Failed reclaiming stale summary jobs. %s", exc)
-        return []
-    except RedisError as exc:
-        logger.warning("Failed reclaiming stale summary jobs. %s", exc)
-        return []
-
-    if not isinstance(response, (list, tuple)) or len(response) < 2:
-        return []
-
-    claimed_entries = response[1]
-    if not isinstance(claimed_entries, list):
-        return []
-
-    jobs = []
-    for entry in claimed_entries:
-        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-            continue
-        stream_id, fields = entry
-        if not isinstance(fields, dict):
-            continue
-        jobs.append((stream_id, fields))
-    return jobs
+    """No-op for SQS: visibility timeout manages stale/in-flight message retries."""
+    _ = consumer_name
+    return []
 
 
 def ack_summary_job(stream_id: str):
-    """Acknowledge a processed or discarded summary job in the Redis stream."""
+    """Acknowledge a processed summary job by deleting its SQS message."""
+    queue_url = _summary_queue_url()
+    if not queue_url or not stream_id:
+        return
     try:
-        worker_redis_client.xack(_stream_key(), settings.memory.summary_queue_group, stream_id)
-    except RedisError as exc:
+        _sqs_client().delete_message(
+            QueueUrl=queue_url,
+            ReceiptHandle=stream_id,
+        )
+    except Exception as exc:
         logger.warning("Failed acknowledging summary job %s. %s", stream_id, exc)
 
 
@@ -362,37 +443,40 @@ def retry_or_dlq_summary_job(stream_id: str, fields: dict, error: str):
         attempt = 1
 
     if attempt >= settings.memory.summary_queue_max_attempts:
-        dlq_payload = dict(fields)
+        dlq_payload = _copy_job_payload(fields)
         dlq_payload["failed_at"] = datetime.now(timezone.utc).isoformat()
         dlq_payload["error"] = error[:500]
         dlq_payload["final_attempt"] = str(attempt)
-        try:
-            worker_redis_client.xadd(
-                _dlq_stream_key(),
+        dlq_url = _summary_dlq_url()
+        if dlq_url:
+            sent = _send_json(
+                dlq_url,
                 dlq_payload,
-                maxlen=5000,
-                approximate=True,
+                message_group_id=str(dlq_payload.get("user_id", "summary")),
             )
-            logger.error("SummaryJobDLQ | %s", json.dumps(dlq_payload, sort_keys=True))
-            monitor_summary_dlq()
-        except RedisError as exc:
-            logger.warning("Failed writing summary job to DLQ. %s", exc)
+            if sent:
+                _remember_latest_dlq(dlq_payload)
+                logger.error("SummaryJobDLQ | %s", json.dumps(dlq_payload, sort_keys=True))
+                monitor_summary_dlq()
+            else:
+                logger.warning("Failed writing summary job to DLQ.")
+        else:
+            logger.warning("Summary DLQ URL is not configured; dropping final failed summary job.")
 
         ack_summary_job(stream_id)
         return
 
-    retry_payload = dict(fields)
+    retry_payload = _copy_job_payload(fields)
     retry_payload["attempt"] = str(attempt)
     retry_payload["last_error"] = error[:300]
     retry_payload["retried_at"] = datetime.now(timezone.utc).isoformat()
 
-    try:
-        worker_redis_client.xadd(
-            _stream_key(),
-            retry_payload,
-            maxlen=10000,
-            approximate=True,
-        )
-        ack_summary_job(stream_id)
-    except RedisError as exc:
-        logger.warning("Failed to retry summary job %s. %s", stream_id, exc)
+    sent = _send_json(
+        _summary_queue_url(),
+        retry_payload,
+        message_group_id=str(retry_payload.get("user_id", "summary")),
+    )
+    if not sent:
+        logger.warning("Failed to retry summary job %s.", stream_id)
+        return
+    ack_summary_job(stream_id)

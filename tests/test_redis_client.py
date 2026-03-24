@@ -25,6 +25,8 @@ def test_build_redis_client_without_tls(monkeypatch):
         "tls": False,
         "ssl_cert_reqs": "required",
         "ssl_ca_certs": "",
+        "socket_connect_timeout_seconds": 2.0,
+        "socket_timeout_seconds": 4.0,
     }
     cfg_values[_cred_key()] = ""
     cfg = SimpleNamespace(**cfg_values)
@@ -35,6 +37,8 @@ def test_build_redis_client_without_tls(monkeypatch):
     assert captured_kwargs["port"] == 6379
     assert captured_kwargs["db"] == 0
     assert captured_kwargs["decode_responses"] is True
+    assert captured_kwargs["socket_connect_timeout"] == 2.0
+    assert captured_kwargs["socket_timeout"] == 4.0
     assert "ssl" not in captured_kwargs
     assert "ssl_cert_reqs" not in captured_kwargs
 
@@ -56,6 +60,8 @@ def test_build_redis_client_with_tls(monkeypatch):
         "tls": True,
         "ssl_cert_reqs": "required",
         "ssl_ca_certs": "/etc/ssl/certs/ca-bundle.crt",
+        "socket_connect_timeout_seconds": 2.0,
+        "socket_timeout_seconds": 4.0,
     }
     cfg_values[_cred_key()] = "redis-test-token"
     cfg = SimpleNamespace(**cfg_values)
@@ -65,5 +71,7 @@ def test_build_redis_client_with_tls(monkeypatch):
     assert captured_kwargs["ssl"] is True
     assert captured_kwargs["ssl_cert_reqs"] == ssl.CERT_REQUIRED
     assert captured_kwargs["ssl_ca_certs"] == "/etc/ssl/certs/ca-bundle.crt"
+    assert captured_kwargs["socket_connect_timeout"] == 2.0
+    assert captured_kwargs["socket_timeout"] == 4.0
     assert captured_kwargs["username"] == "app-user"
     assert captured_kwargs[_cred_key()] == "redis-test-token"

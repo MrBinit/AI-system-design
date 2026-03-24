@@ -47,10 +47,10 @@ def test_sanitize_summary_output_filters_injection():
     assert "[REDACTED_EMAIL]" in sanitized
 
 
-def test_guard_user_input_blocks_general_out_of_scope_query():
+def test_guard_user_input_allows_general_out_of_scope_query():
     result = guardrails_service.guard_user_input("user-1", "What is the weather today?")
-    assert result["blocked"] is True
-    assert result["reason"] == "out_of_scope"
+    assert result["blocked"] is False
+    assert result["reason"] == ""
 
 
 def test_guard_user_input_allows_university_scope_query():
@@ -73,5 +73,13 @@ def test_guard_user_input_allows_german_universities_query():
     result = guardrails_service.guard_user_input(
         "user-1",
         "Find me german universities. I need only names of the universities.",
+    )
+    assert result["blocked"] is False
+
+
+def test_guard_user_input_allows_deadline_query_without_university_name():
+    result = guardrails_service.guard_user_input(
+        "user-1",
+        "tell me about application deadlines",
     )
     assert result["blocked"] is False

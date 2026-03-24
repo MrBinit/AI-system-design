@@ -148,6 +148,44 @@ def list_chat_traces(user_id: str, *, limit: int = 20, redis=None) -> list[dict]
     return traces
 
 
+def clear_chat_traces(user_id: str, *, redis=None) -> dict[str, int]:
+    """Delete all stored evaluation conversation traces for one user."""
+    client = redis or redis_client
+    normalized_user = str(user_id).strip()
+    if not normalized_user:
+        return {"trace_keys_deleted": 0, "index_key_deleted": 0}
+
+    user_index_key = _user_conversation_index_key(normalized_user)
+    try:
+        conversation_ids = client.lrange(user_index_key, 0, -1)
+    except Exception as exc:
+        logger.warning("Failed reading chat trace index for user=%s. %s", normalized_user, exc)
+        conversation_ids = []
+
+    trace_keys: list[str] = []
+    seen: set[str] = set()
+    for conversation_id in conversation_ids:
+        text = str(conversation_id).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        trace_keys.append(_conversation_key(text))
+
+    trace_keys_deleted = 0
+    index_key_deleted = 0
+    try:
+        if trace_keys:
+            trace_keys_deleted = int(client.delete(*trace_keys))
+        index_key_deleted = int(client.delete(user_index_key))
+    except Exception as exc:
+        logger.warning("Failed deleting chat traces for user=%s. %s", normalized_user, exc)
+
+    return {
+        "trace_keys_deleted": trace_keys_deleted,
+        "index_key_deleted": index_key_deleted,
+    }
+
+
 def label_chat_trace(
     *,
     user_id: str,

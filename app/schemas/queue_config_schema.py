@@ -23,3 +23,10 @@ class QueueConfig(BaseModel):
     evaluation_max_messages_per_poll: int = Field(default=10, ge=1, le=10)
     evaluation_visibility_timeout_seconds: int = Field(default=300, ge=0, le=43200)
     evaluation_poll_sleep_seconds: float = Field(default=1.0, ge=0.0, le=60.0)
+    summary_queue_enabled: bool = False
+    summary_queue_url: str = ""
+    summary_dlq_url: str = ""
+    summary_receive_wait_seconds: int = Field(default=20, ge=0, le=20)
+    summary_max_messages_per_poll: int = Field(default=10, ge=1, le=10)
+    summary_visibility_timeout_seconds: int = Field(default=300, ge=0, le=43200)
+    summary_poll_sleep_seconds: float = Field(default=0.2, ge=0.0, le=60.0)

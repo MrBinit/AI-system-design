@@ -1,7 +1,7 @@
 queue:
   llm_async_enabled: true
-  llm_queue_url: "https://sqs.us-east-1.amazonaws.com/173763384281/unigraph-llm-jobs"
-  llm_dlq_url: "https://sqs.us-east-1.amazonaws.com/173763384281/unigraph-llm-jobs-dlq"
+  llm_queue_url: "https://sqs.us-east-1.amazonaws.com/173763384281/unigraph-llm-jobs-local"
+  llm_dlq_url: "https://sqs.us-east-1.amazonaws.com/173763384281/unigraph-llm-jobs-local-dlq"
   llm_result_table: "unigraph-llm-results"
   llm_result_ttl_days: 7
   llm_receive_wait_seconds: 20
@@ -20,3 +20,10 @@ queue:
   evaluation_max_messages_per_poll: 10
   evaluation_visibility_timeout_seconds: 300
   evaluation_poll_sleep_seconds: 1.0
+  summary_queue_enabled: true
+  summary_queue_url: "https://sqs.us-east-1.amazonaws.com/173763384281/unigraph-summary-jobs-local"
+  summary_dlq_url: "https://sqs.us-east-1.amazonaws.com/173763384281/unigraph-summary-jobs-local-dlq"
+  summary_receive_wait_seconds: 20
+  summary_max_messages_per_poll: 10
+  summary_visibility_timeout_seconds: 300
+  summary_poll_sleep_seconds: 0.2
