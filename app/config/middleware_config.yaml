@@ -14,7 +14,7 @@ middleware:
   enable_cors: true
   cors_allow_origins:
     - "http://localhost:5173"
-    - "http://unigraph-frontend.s3-website-us-east-1.amazonaws.com"
+    - "https://d3pnkakwol083v.cloudfront.net"
   cors_allow_methods:
     - "GET"
     - "POST"
