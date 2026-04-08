@@ -26,6 +26,8 @@ _JOB_STATUS_PROCESSING = "processing"
 _JOB_STATUS_COMPLETED = "completed"
 _JOB_STATUS_FAILED = "failed"
 _PUBLIC_JOB_ERROR = "Async chat job failed."
+_TRACE_EVENT_MAX_PAYLOAD_CHARS = 800
+_TRACE_MAX_EVENTS_PER_JOB = 120
 _VALID_STATUSES = {
     _JOB_STATUS_QUEUED,
     _JOB_STATUS_PROCESSING,
@@ -100,6 +102,35 @@ def _sanitize_job_error(error_message: str) -> str:
     return _PUBLIC_JOB_ERROR
 
 
+def _safe_trace_value(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        text = str(value) if value is not None else ""
+        return text[:_TRACE_EVENT_MAX_PAYLOAD_CHARS] if isinstance(value, str) else value
+    if isinstance(value, list):
+        return [_safe_trace_value(item) for item in value[:20]]
+    if isinstance(value, dict):
+        sanitized: dict = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 30:
+                break
+            sanitized[str(key)[:80]] = _safe_trace_value(item)
+        return sanitized
+    return str(value)[:_TRACE_EVENT_MAX_PAYLOAD_CHARS]
+
+
+def _sanitize_trace_event(event: dict) -> dict:
+    raw = event if isinstance(event, dict) else {}
+    event_type = str(raw.get("type", "")).strip() or "event"
+    timestamp = str(raw.get("timestamp", "")).strip() or _now_iso()
+    payload = raw.get("payload", {})
+    safe_payload = _safe_trace_value(payload) if isinstance(payload, dict) else {}
+    return {
+        "type": event_type[:80],
+        "timestamp": timestamp[:64],
+        "payload": safe_payload,
+    }
+
+
 def _put_initial_job(job: dict) -> None:
     _dynamodb_table().put_item(
         Item=job,
@@ -128,13 +159,27 @@ def _update_job(job_id: str, updates: dict) -> None:
     )
 
 
-def enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None) -> dict:
+def _normalized_mode(value: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in {"fast", "deep", "auto"}:
+        return candidate
+    return "auto"
+
+
+def enqueue_chat_job(
+    *,
+    user_id: str,
+    prompt: str,
+    session_id: str | None = None,
+    mode: str | None = None,
+) -> dict:
     """Create async chat job state and enqueue it into SQS."""
     _require_async_chat_config()
 
     normalized_user = str(user_id).strip()
     normalized_prompt = str(prompt).strip()
     normalized_session = str(session_id or normalized_user).strip() or normalized_user
+    normalized_mode = _normalized_mode(mode)
     job_id = uuid4().hex
     now_iso = _now_iso()
     ttl_days = settings.queue.llm_result_ttl_days
@@ -145,6 +190,7 @@ def enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None
         "user_id": normalized_user,
         "session_id": normalized_session,
         "prompt": normalized_prompt,
+        "mode": normalized_mode,
         "status": _JOB_STATUS_QUEUED,
         "answer": "",
         "error": "",
@@ -167,6 +213,7 @@ def enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None
             "user_id": normalized_user,
             "session_id": normalized_session,
             "prompt": normalized_prompt,
+            "mode": normalized_mode,
             "submitted_at": now_iso,
         },
         ensure_ascii=False,
@@ -217,6 +264,9 @@ def get_chat_job(job_id: str) -> dict | None:
     status = str(item.get("status", "")).strip().lower()
     if status not in _VALID_STATUSES:
         item["status"] = _JOB_STATUS_FAILED
+    trace_events = item.get("trace_events", [])
+    if not isinstance(trace_events, list):
+        item["trace_events"] = []
     return item
 
 
@@ -226,7 +276,7 @@ def mark_job_processing(job_id: str) -> None:
         Key={"job_id": job_id},
         UpdateExpression=(
             "SET #status=:status, started_at=if_not_exists(started_at,:started_at), "
-            "updated_at=:updated_at ADD attempt_count :attempt_inc"
+            "updated_at=:updated_at, trace_events=:trace_events ADD attempt_count :attempt_inc"
         ),
         ConditionExpression="attribute_exists(job_id)",
         ExpressionAttributeNames={"#status": "status"},
@@ -234,6 +284,7 @@ def mark_job_processing(job_id: str) -> None:
             ":status": _JOB_STATUS_PROCESSING,
             ":started_at": now_iso,
             ":updated_at": now_iso,
+            ":trace_events": [],
             ":attempt_inc": 1,
         },
     )
@@ -261,6 +312,27 @@ def mark_job_failed(job_id: str, error_message: str) -> None:
             "status": _JOB_STATUS_FAILED,
             "error": safe_error[:2000],
             "updated_at": _now_iso(),
+        },
+    )
+
+
+def append_job_trace_event(job_id: str, event: dict) -> None:
+    safe_event = _sanitize_trace_event(event)
+    _dynamodb_table().update_item(
+        Key={"job_id": job_id},
+        UpdateExpression=(
+            "SET trace_events=list_append(if_not_exists(trace_events, :empty_events), :new_event), "
+            "updated_at=:updated_at"
+        ),
+        ConditionExpression=(
+            "attribute_exists(job_id) AND "
+            "(attribute_not_exists(trace_events) OR size(trace_events) < :max_events)"
+        ),
+        ExpressionAttributeValues={
+            ":empty_events": [],
+            ":new_event": [safe_event],
+            ":updated_at": _now_iso(),
+            ":max_events": _TRACE_MAX_EVENTS_PER_JOB,
         },
     )
 

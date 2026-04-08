@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from decimal import Decimal
 from typing import Annotated, AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
@@ -46,7 +47,19 @@ class _StreamClientError(RuntimeError):
 
 def _sse_data(payload: dict) -> str:
     """Return one SSE data frame."""
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return f"data: {json.dumps(_json_safe(payload), ensure_ascii=False)}\n\n"
+
+
+def _json_safe(value):
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return int(value)
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _queued_payload(job: dict, job_id: str) -> dict:
@@ -65,6 +78,13 @@ def _record_status(record: dict) -> str:
     return status or "processing"
 
 
+def _record_trace_events(record: dict) -> list[dict]:
+    events = record.get("trace_events", []) if isinstance(record, dict) else []
+    if not isinstance(events, list):
+        return []
+    return [_json_safe(item) for item in events if isinstance(item, dict)]
+
+
 async def _enqueue_stream_job(request: ChatRequest, session_id: str) -> dict:
     """Enqueue one async chat job and return its queued payload."""
     try:
@@ -73,6 +93,7 @@ async def _enqueue_stream_job(request: ChatRequest, session_id: str) -> dict:
             user_id=request.user_id,
             prompt=request.prompt,
             session_id=session_id,
+            mode=request.mode,
         )
     except RuntimeError as exc:
         logger.warning(
@@ -94,6 +115,7 @@ async def _enqueue_stream_job(request: ChatRequest, session_id: str) -> dict:
 async def _stream_job_events(job_id: str) -> AsyncIterator[str]:
     """Yield status/result SSE frames for one async chat job."""
     last_status = ""
+    last_trace_count = 0
     while True:
         record = await asyncio.to_thread(get_chat_job, job_id)
         if not record:
@@ -110,6 +132,18 @@ async def _stream_job_events(job_id: str) -> AsyncIterator[str]:
                 }
             )
             last_status = record_status
+
+        trace_events = _record_trace_events(record)
+        if len(trace_events) > last_trace_count:
+            for event in trace_events[last_trace_count:]:
+                yield _sse_data(
+                    {
+                        "type": "trace",
+                        "job_id": job_id,
+                        "event": event,
+                    }
+                )
+            last_trace_count = len(trace_events)
 
         if record_status == "completed":
             yield _sse_data({"type": "chunk", "text": str(record.get("answer", ""))})
@@ -182,6 +216,7 @@ async def chat_status(
         completed_at=str(record.get("completed_at", "")),
         response=str(record.get("answer", "")),
         error=public_error,
+        trace_events=_record_trace_events(record),
     )
 
 

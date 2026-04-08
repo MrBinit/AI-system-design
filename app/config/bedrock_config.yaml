@@ -1,7 +1,7 @@
 # Bedrock generation configuration.
 bedrock:
-  primary_model_id: "arn:aws:bedrock:us-east-1:173763384281:inference-profile/us.anthropic.claude-sonnet-4-6"
-  fallback_model_id: "arn:aws:bedrock:us-east-1:173763384281:inference-profile/us.anthropic.claude-3-sonnet-20240229-v1:0"
+  primary_model_id: "us.anthropic.claude-sonnet-4-20250514-v1:0"
+  fallback_model_id: "us.anthropic.claude-3-5-haiku-20241022-v1:0"
   timeout: 30
   max_concurrency: 50
   reranker_enabled: true

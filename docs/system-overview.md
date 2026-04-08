@@ -184,6 +184,10 @@ Implemented behavior:
 - SerpAPI multi-query retrieval with async batch execution.
 - Optional domain allowlist filtering (`.de`, `.eu`, etc.).
 - Async top-page fetch, boilerplate stripping, clean chunking, and near-duplicate chunk removal.
+- Retrieval fan-out/fan-in path:
+  - optional speculative vector prefetch during short-term context build,
+  - optional web prefetch in parallel with vector retrieval when hybrid mode is enabled,
+  - merged/reranked fan-in before answer synthesis.
 - Citation-grounded response policy:
   - answer only from provided evidence,
   - cite URLs,
@@ -194,3 +198,8 @@ Implemented behavior:
   - groundedness,
   - citation accuracy,
   - user feedback.
+
+Key config toggles:
+- `serpapi.retrieval_fanout_enabled` (env: `SERPAPI_RETRIEVAL_FANOUT_ENABLED`)
+- `serpapi.always_web_retrieval_enabled`
+- `serpapi.fallback_enabled`

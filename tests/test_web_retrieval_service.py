@@ -3,6 +3,13 @@ import pytest
 from app.services import web_retrieval_service as service
 
 
+@pytest.fixture(autouse=True)
+def _disable_llm_planner_by_default(monkeypatch):
+    monkeypatch.setattr(service.settings.serpapi, "query_planner_use_llm", False)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_use_llm", False)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_min_unique_domains", 1)
+
+
 @pytest.mark.asyncio
 async def test_aretrieve_web_chunks_merges_ai_overview_and_organic(monkeypatch):
     monkeypatch.setattr(service.settings.serpapi, "max_context_results", 3)
@@ -251,3 +258,368 @@ async def test_aretrieve_web_chunks_preserves_published_date(monkeypatch):
     assert organic
     assert organic[0]["metadata"]["published_date"] == "2026-03-20"
     assert organic[0]["metadata"]["title"] == "University News"
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_requeries_for_missing_subquestions(monkeypatch):
+    monkeypatch.setattr(service.settings.serpapi, "max_context_results", 3)
+    monkeypatch.setattr(service.settings.serpapi, "query_planner_enabled", True)
+    monkeypatch.setattr(service.settings.serpapi, "query_planner_use_llm", False)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_enabled", True)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_max_steps", 2)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_max_gap_queries", 1)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_gap_min_token_coverage", 0.6)
+    monkeypatch.setattr(service.settings.serpapi, "allowed_domain_suffixes", [])
+
+    async def _fake_plan(_query: str, _allowed_suffixes: list[str]):
+        return {
+            "queries": ["germany ai admissions"],
+            "subquestions": ["tuition fees", "language requirement"],
+            "planner": "heuristic",
+            "llm_used": False,
+        }
+
+    calls = {"count": 0}
+
+    async def _fake_payloads(queries: list[str], *, top_k: int):
+        calls["count"] += 1
+        if any("language requirement" in query.lower() for query in queries):
+            return [
+                {
+                    "organic_results": [
+                        {
+                            "title": "Language Requirement",
+                            "link": "https://example.edu/language",
+                            "snippet": "English language requirement IELTS 6.5",
+                        }
+                    ]
+                }
+            ]
+        return [
+            {
+                "organic_results": [
+                    {
+                        "title": "Tuition Details",
+                        "link": "https://example.edu/tuition",
+                        "snippet": "Tuition fees are EUR 2000.",
+                    }
+                ]
+            }
+        ]
+
+    async def _fake_fetch_pages(rows: list[dict]):
+        urls = {row["url"] for row in rows}
+        payload = {}
+        if "https://example.edu/tuition" in urls:
+            payload["https://example.edu/tuition"] = {
+                "content": "Tuition fees are EUR 2000 per semester.",
+                "published_date": "2026-02-01",
+            }
+        if "https://example.edu/language" in urls:
+            payload["https://example.edu/language"] = {
+                "content": "Language requirement: IELTS 6.5 overall.",
+                "published_date": "2026-02-02",
+            }
+        return payload
+
+    monkeypatch.setattr(service, "_resolve_query_plan", _fake_plan)
+    monkeypatch.setattr(service, "_asearch_payloads", _fake_payloads)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+
+    result = await service.aretrieve_web_chunks("germany ai admissions", top_k=3)
+
+    assert calls["count"] == 2
+    assert result["retrieval_loop"]["iterations"] == 2
+    facts_text = " ".join(fact["fact"].lower() for fact in result["facts"])
+    assert "tuition fees" in facts_text
+    assert "language requirement" in facts_text
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_requeries_for_domain_diversity(monkeypatch):
+    monkeypatch.setattr(service.settings.serpapi, "max_context_results", 4)
+    monkeypatch.setattr(service.settings.serpapi, "query_planner_enabled", True)
+    monkeypatch.setattr(service.settings.serpapi, "query_planner_use_llm", False)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_enabled", True)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_max_steps", 2)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_max_gap_queries", 2)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_min_unique_domains", 2)
+    monkeypatch.setattr(service.settings.serpapi, "allowed_domain_suffixes", [])
+
+    async def _fake_plan(_query: str, _allowed_suffixes: list[str]):
+        return {
+            "queries": ["germany ai admissions"],
+            "subquestions": [],
+            "planner": "heuristic",
+            "llm_used": False,
+        }
+
+    calls: list[list[str]] = []
+
+    async def _fake_payloads(queries: list[str], *, top_k: int):
+        calls.append(list(queries))
+        if any(query.strip().lower() != "germany ai admissions" for query in queries):
+            return [
+                {
+                    "organic_results": [
+                        {
+                            "title": "Second Source",
+                            "link": "https://second.example.org/admissions",
+                            "snippet": "Independent confirmation.",
+                        }
+                    ]
+                }
+            ]
+        return [
+            {
+                "organic_results": [
+                    {
+                        "title": "Primary Source",
+                        "link": "https://first.example.edu/admissions",
+                        "snippet": "Official admissions details.",
+                    }
+                ]
+            }
+        ]
+
+    async def _fake_fetch_pages(rows: list[dict]):
+        payload = {}
+        for row in rows:
+            url = row["url"]
+            payload[url] = {
+                "content": f"Admissions details from {url}.",
+                "published_date": "2026-03-01",
+            }
+        return payload
+
+    monkeypatch.setattr(service, "_resolve_query_plan", _fake_plan)
+    monkeypatch.setattr(service, "_asearch_payloads", _fake_payloads)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+
+    result = await service.aretrieve_web_chunks("germany ai admissions", top_k=3)
+
+    assert len(calls) == 2
+    assert result["retrieval_loop"]["iterations"] == 2
+    assert result["verification"]["unique_domain_count"] >= 2
+    assert result["verification"]["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_adds_trust_score_metadata(monkeypatch):
+    monkeypatch.setattr(service.settings.serpapi, "max_context_results", 2)
+    monkeypatch.setattr(service.settings.serpapi, "query_planner_enabled", False)
+    monkeypatch.setattr(service.settings.serpapi, "multi_query_enabled", False)
+    monkeypatch.setattr(service.settings.serpapi, "allowed_domain_suffixes", [])
+
+    async def _fake_single(_query: str, **_kwargs):
+        return {
+            "organic_results": [
+                {
+                    "title": "Official Program Page",
+                    "link": "https://www.example.edu/programs/ai",
+                    "snippet": "Admission requirements and curriculum.",
+                }
+            ]
+        }
+
+    async def _fake_fetch_pages(_rows: list[dict]):
+        return {
+            "https://www.example.edu/programs/ai": {
+                "content": "Admission requirements include transcripts and language proof.",
+                "published_date": "2026-03-01",
+            }
+        }
+
+    monkeypatch.setattr(service, "asearch_google", _fake_single)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+
+    result = await service.aretrieve_web_chunks("example ai admission", top_k=2)
+    assert result["results"]
+    metadata = result["results"][0]["metadata"]
+    assert "trust_score" in metadata
+    assert metadata["trust_score"] >= 0.0
+    assert "trust_components" in metadata
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_uses_llm_gap_queries_when_enabled(monkeypatch):
+    monkeypatch.setattr(service.settings.serpapi, "query_planner_enabled", True)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_enabled", True)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_use_llm", True)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_max_steps", 2)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_max_gap_queries", 1)
+    monkeypatch.setattr(service.settings.serpapi, "allowed_domain_suffixes", [])
+
+    async def _fake_plan(_query: str, _allowed_suffixes: list[str]):
+        return {
+            "queries": ["germany ai admissions"],
+            "subquestions": ["tuition fees", "language requirement"],
+            "planner": "llm",
+            "llm_used": True,
+        }
+
+    async def _fake_gap_plan(_query: str, **_kwargs):
+        return {
+            "missing_subquestions": ["language requirement"],
+            "queries": ["germany ai admissions official language requirement"],
+        }
+
+    call_queries: list[list[str]] = []
+
+    async def _fake_payloads(queries: list[str], *, top_k: int):
+        call_queries.append(list(queries))
+        if any("official language requirement" in query.lower() for query in queries):
+            return [
+                {
+                    "organic_results": [
+                        {
+                            "title": "Language Requirement",
+                            "link": "https://example.edu/lang",
+                            "snippet": "English language requirement IELTS 6.5",
+                        }
+                    ]
+                }
+            ]
+        return [
+            {
+                "organic_results": [
+                    {
+                        "title": "Tuition",
+                        "link": "https://example.edu/tuition",
+                        "snippet": "Tuition fees are EUR 2000.",
+                    }
+                ]
+            }
+        ]
+
+    async def _fake_fetch_pages(rows: list[dict]):
+        urls = {row["url"] for row in rows}
+        payload = {}
+        if "https://example.edu/tuition" in urls:
+            payload["https://example.edu/tuition"] = {
+                "content": "Tuition fees are EUR 2000.",
+                "published_date": "2026-02-01",
+            }
+        if "https://example.edu/lang" in urls:
+            payload["https://example.edu/lang"] = {
+                "content": "Language requirement IELTS 6.5.",
+                "published_date": "2026-02-03",
+            }
+        return payload
+
+    monkeypatch.setattr(service, "_resolve_query_plan", _fake_plan)
+    monkeypatch.setattr(service, "_aidentify_gap_plan_with_llm", _fake_gap_plan)
+    monkeypatch.setattr(service, "_asearch_payloads", _fake_payloads)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+
+    result = await service.aretrieve_web_chunks("germany ai admissions", top_k=3)
+
+    assert len(call_queries) == 2
+    assert any("official language requirement" in query.lower() for query in call_queries[1])
+    assert result["retrieval_loop"]["llm_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_runs_llm_query_planner_before_search(monkeypatch):
+    monkeypatch.setattr(service.settings.serpapi, "query_planner_enabled", True)
+    monkeypatch.setattr(service.settings.serpapi, "query_planner_use_llm", True)
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_enabled", False)
+    monkeypatch.setattr(service.settings.serpapi, "allowed_domain_suffixes", [])
+
+    call_order: list[str] = []
+
+    async def _fake_llm_plan(query: str, allowed_suffixes: list[str]):
+        assert query == "germany ai admissions"
+        assert allowed_suffixes == []
+        call_order.append("planner")
+        return {
+            "queries": ["germany ai admissions official site"],
+            "subquestions": ["tuition fees"],
+            "planner": "llm",
+            "llm_used": True,
+        }
+
+    async def _fake_payloads(queries: list[str], *, top_k: int):
+        assert top_k == 2
+        # Search must start only after planner has produced query variants.
+        assert call_order == ["planner"]
+        assert queries == ["germany ai admissions official site"]
+        call_order.append("search")
+        return [
+            {
+                "organic_results": [
+                    {
+                        "title": "Admissions",
+                        "link": "https://example.edu/admissions",
+                        "snippet": "Tuition fees and requirements.",
+                    }
+                ]
+            }
+        ]
+
+    async def _fake_fetch_pages(rows: list[dict]):
+        assert rows and rows[0]["url"] == "https://example.edu/admissions"
+        return {
+            "https://example.edu/admissions": {
+                "content": "Tuition fees are EUR 2000 and language requirement is IELTS 6.5.",
+                "published_date": "2026-03-20",
+            }
+        }
+
+    monkeypatch.setattr(service, "_aplan_queries_with_llm", _fake_llm_plan)
+    monkeypatch.setattr(service, "_asearch_payloads", _fake_payloads)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+
+    result = await service.aretrieve_web_chunks("germany ai admissions", top_k=2)
+
+    assert call_order == ["planner", "search"]
+    assert result["query_plan"]["planner"] == "llm"
+    assert result["query_plan"]["llm_used"] is True
+    assert result["query_variants"] == ["germany ai admissions official site"]
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_fast_mode_skips_deep_loop(monkeypatch):
+    monkeypatch.setattr(service.settings.serpapi, "retrieval_loop_enabled", True)
+
+    async def _should_not_call_resolve_plan(*_args, **_kwargs):
+        raise AssertionError("fast mode should not call deep planner resolver")
+
+    call_count = {"search": 0}
+
+    async def _fake_payloads(queries: list[str], *, top_k: int):
+        call_count["search"] += 1
+        return [
+            {
+                "organic_results": [
+                    {
+                        "title": "Admissions",
+                        "link": "https://example.edu/admissions",
+                        "snippet": "Admission summary.",
+                    }
+                ]
+            }
+        ]
+
+    async def _fake_fetch_pages(rows: list[dict], **_kwargs):
+        return {
+            "https://example.edu/admissions": {
+                "content": "Admissions details from official page.",
+                "published_date": "2026-03-21",
+            }
+        }
+
+    monkeypatch.setattr(service, "_resolve_query_plan", _should_not_call_resolve_plan)
+    monkeypatch.setattr(service, "_asearch_payloads", _fake_payloads)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+
+    result = await service.aretrieve_web_chunks(
+        "germany ai admissions",
+        top_k=2,
+        search_mode="fast",
+    )
+
+    assert call_count["search"] == 1
+    assert result["search_mode"] == "fast"
+    assert result["retrieval_loop"]["enabled"] is False
+    assert result["retrieval_loop"]["iterations"] == 1

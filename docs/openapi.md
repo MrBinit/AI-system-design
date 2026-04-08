@@ -63,9 +63,15 @@ Request body:
 ```json
 {
   "user_id": "user-1",
+  "mode": "auto",
   "prompt": "Find AI research labs at Stanford University"
 }
 ```
+
+Execution modes:
+- `auto`: route to `fast` or `deep` by complexity and quality gates.
+- `fast`: minimal planning/verification for lower latency.
+- `deep`: planner + verification/reflection path for higher answer quality.
 
 Response content type:
 
@@ -77,6 +83,8 @@ SSE event examples:
 data: {"type":"queued","job_id":"4d7a9b6d6a5b4cf7b3ef31e3f3468b0b","status":"queued","submitted_at":"2026-03-10T10:30:00+00:00"}
 
 data: {"type":"status","job_id":"4d7a9b6d6a5b4cf7b3ef31e3f3468b0b","status":"processing"}
+
+data: {"type":"trace","job_id":"4d7a9b6d6a5b4cf7b3ef31e3f3468b0b","event":{"type":"query_plan_created","timestamp":"2026-03-10T10:30:02+00:00","payload":{"planner":"llm"}}}
 
 data: {"type":"status","job_id":"4d7a9b6d6a5b4cf7b3ef31e3f3468b0b","status":"completed"}
 
@@ -101,7 +109,16 @@ Response body (example):
   "started_at": "2026-03-10T10:30:01+00:00",
   "completed_at": "2026-03-10T10:30:04+00:00",
   "response": "...",
-  "error": ""
+  "error": "",
+  "trace_events": [
+    {
+      "type": "query_plan_created",
+      "timestamp": "2026-03-10T10:30:02+00:00",
+      "payload": {
+        "planner": "llm"
+      }
+    }
+  ]
 }
 ```
 

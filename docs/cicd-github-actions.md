@@ -2,20 +2,20 @@
 
 This project now includes:
 
-- `.github/workflows/ci.yml` (lint + tests on PR/push + optional SonarQube quality-gate scan)
-- `.github/workflows/cd.yml` (build/push Docker images to ECR + direct deploy to EC2)
+- `.github/workflows/ci.yml` (tests on PR/push)
+- `.github/workflows/cd.yml` (build/push Docker images to ECR + deploy backend to EC2 + deploy frontend to S3/CloudFront)
 
 ## 1) GitHub Secrets (Repository)
 
 Add these in `Settings -> Secrets and variables -> Actions -> Secrets`:
 
 - `AWS_GITHUB_ACTIONS_ROLE_ARN`  
-  IAM role assumed by GitHub OIDC for ECR push.
+  IAM role assumed by GitHub OIDC for deployment operations (ECR/S3/CloudFront).
 - `EC2_HOST`  
   Public IP or DNS of EC2.
 - `EC2_USER`  
   Usually `ubuntu`.
-- `EC2_SSH_PRIVATE_KEY`  
+- `EC2_SSH_KEY`  
   Private key content for the EC2 key pair (full PEM text).
 - `EC2_PORT` (optional)  
   Default is `22`.
@@ -31,6 +31,8 @@ Add these in `Settings -> Secrets and variables -> Actions -> Variables`:
 - `AWS_SECRETS_MANAGER_SECRET_ID` (for example `unigraph/prod/app`)
 - `API_WORKERS` (for example `1`)
 - `EC2_APP_DIR` (for example `/home/ubuntu/AI-system-design`)
+- `FRONTEND_S3_BUCKET` (default in workflow: `unigraph-frontend`)
+- `FRONTEND_CLOUDFRONT_DISTRIBUTION_ID` (default in workflow: `EILC5TTHBL1C3`)
 - `SONAR_HOST_URL` (for example `https://sonarqube.company.com`)
 
 ## 3) GitHub Environment Protection (Recommended)
@@ -43,7 +45,7 @@ The CD workflow uses:
 
 ## 4) AWS IAM for GitHub OIDC Role
 
-Attach permissions for ECR push (minimum practical set):
+Attach permissions for ECR push + frontend deploy (minimum practical set):
 
 - `ecr:GetAuthorizationToken`
 - `ecr:BatchCheckLayerAvailability`
@@ -52,11 +54,19 @@ Attach permissions for ECR push (minimum practical set):
 - `ecr:UploadLayerPart`
 - `ecr:PutImage`
 - `ecr:BatchGetImage`
+- `s3:ListBucket`
+- `s3:GetObject`
+- `s3:PutObject`
+- `s3:DeleteObject`
+- `cloudfront:CreateInvalidation`
 
 Scope repository ARNs to:
 
 - `arn:aws:ecr:<region>:<account-id>:repository/unigraph-app`
 - `arn:aws:ecr:<region>:<account-id>:repository/unigraph-gradio`
+- `arn:aws:s3:::<frontend-bucket-name>`
+- `arn:aws:s3:::<frontend-bucket-name>/*`
+- `arn:aws:cloudfront::<account-id>:distribution/<distribution-id>`
 
 OIDC trust should allow `token.actions.githubusercontent.com` for this repo/branch.
 
@@ -77,7 +87,7 @@ The workflow deploy step runs directly on EC2 and executes:
 ## 6) PEM Key Notes
 
 - Never commit PEM files into the repo.
-- Store PEM only in `EC2_SSH_PRIVATE_KEY` secret.
+- Store PEM only in `EC2_SSH_KEY` secret.
 - If your key rotates, update this secret immediately.
 
 ## 7) Deployment Flow
@@ -88,20 +98,14 @@ On push to `main`:
 2. Push to ECR with tags:
    - `sha-<12-char-commit>`
    - `latest`
-3. SSH to EC2, pull latest `main`, login to ECR, run compose pull/up, and run health checks.
+3. Build frontend (`frontend`), upload `dist/` to S3 bucket, and create CloudFront invalidation.
+4. SSH to EC2, pull latest `main`, login to ECR, run compose pull/up, and run health checks.
 
 Manual trigger:
 
 - `Run workflow` for CD (same full deployment flow as push-to-main).
 
-## 8) SonarQube in CI
+## 8) SonarQube (Optional)
 
-The CI workflow runs SonarQube as a separate job after lint and unit tests:
-
-1. Run full test suite and generate `coverage.xml`
-2. Run `sonarsource/sonar-scanner-cli` in Docker
-3. Upload analysis to your SonarQube server
-
-Behavior:
-- If `SONAR_TOKEN` and `SONAR_HOST_URL` are present, scan runs and quality-gate status appears in SonarQube.
-- If either is missing, the Sonar step is skipped with an explicit message (CI still completes lint/tests).
+SonarQube is not currently wired in `ci.yml` in this branch.  
+If you add a Sonar job later, use `SONAR_TOKEN` and `SONAR_HOST_URL` from repo secrets/variables.

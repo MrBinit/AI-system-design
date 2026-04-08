@@ -1,15 +1,20 @@
 import asyncio
+import json
+import logging
 import re
 import time
 import urllib.request
+from datetime import datetime, timezone
 from html import unescape
 from urllib.parse import urlparse
 
 from app.core.config import get_settings
 from app.infra.io_limiters import dependency_limiter
+from app.services.chat_trace_service import emit_trace_event
 from app.services.serpapi_search_service import asearch_google, asearch_google_batch
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", flags=re.IGNORECASE | re.DOTALL)
 _COMMENT_RE = re.compile(r"<!--.*?-->", flags=re.DOTALL)
@@ -44,6 +49,7 @@ _DATE_LIKE_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b",
     flags=re.IGNORECASE,
 )
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", flags=re.DOTALL)
 _QUERY_STOPWORDS = {
     "a",
     "an",
@@ -79,6 +85,12 @@ _BOILERPLATE_LINE_MARKERS = {
     "enable javascript",
     "accept all",
 }
+_HIGH_AUTHORITY_SUFFIXES = (
+    ".gov",
+    ".edu",
+    ".ac.uk",
+    ".europa.eu",
+)
 
 
 def _elapsed_ms(started_at: float) -> int:
@@ -240,12 +252,19 @@ async def _afetch_page_data(url: str) -> dict:
         )
 
 
-async def _afetch_organic_pages(rows: list[dict]) -> dict[str, dict]:
+async def _afetch_organic_pages(
+    rows: list[dict], *, max_pages_to_fetch: int | None = None
+) -> dict[str, dict]:
     if not settings.serpapi.fetch_page_content:
         return {}
 
     targets = [row for row in rows if row.get("url")]
-    targets = targets[: settings.serpapi.max_pages_to_fetch]
+    page_limit = (
+        max(0, int(max_pages_to_fetch))
+        if max_pages_to_fetch is not None
+        else int(settings.serpapi.max_pages_to_fetch)
+    )
+    targets = targets[:page_limit]
     if not targets:
         return {}
 
@@ -352,6 +371,328 @@ def _build_query_variants(query: str, allowed_suffixes: list[str]) -> list[str]:
         if len(variants) >= max_variants:
             break
     return variants or [base]
+
+
+def _normalize_query_list(values, *, limit: int) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        candidate = " ".join(str(value).split()).strip()
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(candidate)
+        if len(normalized) >= limit:
+            break
+    return normalized
+
+
+def _normalize_subquestion_list(values, *, limit: int) -> list[str]:
+    return _normalize_query_list(values, limit=limit)
+
+
+def _planner_model_id() -> str:
+    configured = str(getattr(settings.serpapi, "query_planner_model_id", "")).strip()
+    return configured or str(settings.bedrock.primary_model_id).strip()
+
+
+def _max_planner_queries() -> int:
+    return max(1, int(getattr(settings.serpapi, "query_planner_max_queries", 5)))
+
+
+def _max_planner_subquestions() -> int:
+    return max(0, int(getattr(settings.serpapi, "query_planner_max_subquestions", 4)))
+
+
+def _build_query_planner_messages(query: str, allowed_suffixes: list[str]) -> list[dict]:
+    max_queries = _max_planner_queries()
+    max_subquestions = _max_planner_subquestions()
+    suffix_clause = ", ".join(allowed_suffixes[:3]) if allowed_suffixes else "none"
+    system_prompt = (
+        "You are a web search query planner. "
+        "Return strict JSON only with keys: queries, subquestions. "
+        "queries must preserve key entities, numbers, dates, and negations from the user query."
+    )
+    user_prompt = (
+        f"User query: {query}\n"
+        f"Allowed domain suffixes (optional): {suffix_clause}\n"
+        f"Return at most {max_queries} queries and at most {max_subquestions} subquestions."
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _extract_json_object(raw: str) -> dict | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            return payload
+    except json.JSONDecodeError:
+        pass
+
+    match = _JSON_OBJECT_RE.search(text)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _heuristic_subquestions(query: str) -> list[str]:
+    compact = " ".join(str(query).split()).strip()
+    if not compact:
+        return []
+    parts = re.split(r"\s+(?:and|vs|versus)\s+", compact, flags=re.IGNORECASE)
+    normalized = _normalize_subquestion_list(parts, limit=_max_planner_subquestions())
+    return normalized if len(normalized) > 1 else []
+
+
+def _build_heuristic_query_plan(query: str, allowed_suffixes: list[str]) -> dict:
+    return {
+        "queries": _build_query_variants(query, allowed_suffixes),
+        "subquestions": _heuristic_subquestions(query),
+        "planner": "heuristic",
+        "llm_used": False,
+    }
+
+
+def _normalize_query_plan_payload(
+    *,
+    query: str,
+    allowed_suffixes: list[str],
+    payload: dict,
+) -> dict:
+    max_queries = _max_planner_queries()
+    max_subquestions = _max_planner_subquestions()
+    base_queries = [query] + _build_query_variants(query, allowed_suffixes)
+    llm_queries = _normalize_query_list(payload.get("queries"), limit=max_queries)
+    merged_queries = _normalize_query_list(
+        base_queries + llm_queries,
+        limit=max_queries,
+    )
+    return {
+        "queries": merged_queries or _build_query_variants(query, allowed_suffixes),
+        "subquestions": _normalize_subquestion_list(
+            payload.get("subquestions"),
+            limit=max_subquestions,
+        ),
+        "planner": "llm",
+        "llm_used": True,
+    }
+
+
+async def _aplan_queries_with_llm(query: str, allowed_suffixes: list[str]) -> dict | None:
+    if not bool(getattr(settings.serpapi, "query_planner_use_llm", False)):
+        return None
+
+    model_id = _planner_model_id()
+    if not model_id:
+        return None
+
+    try:
+        messages = _build_query_planner_messages(query, allowed_suffixes)
+        from app.infra.bedrock_chat_client import client
+
+        response = await client.chat.completions.create(model=model_id, messages=messages)
+    except Exception as exc:
+        logger.warning("SerpApi query planner failed; falling back to heuristic variants. %s", exc)
+        return None
+
+    if not response or not getattr(response, "choices", None):
+        return None
+    content = str(response.choices[0].message.content or "").strip()
+    payload = _extract_json_object(content)
+    if not payload:
+        return None
+    return _normalize_query_plan_payload(
+        query=query,
+        allowed_suffixes=allowed_suffixes,
+        payload=payload,
+    )
+
+
+def _planner_enabled() -> bool:
+    return bool(getattr(settings.serpapi, "query_planner_enabled", True))
+
+
+async def _resolve_query_plan(query: str, allowed_suffixes: list[str]) -> dict:
+    if not _planner_enabled():
+        return _build_heuristic_query_plan(query, allowed_suffixes)
+    llm_plan = await _aplan_queries_with_llm(query, allowed_suffixes)
+    if llm_plan:
+        return llm_plan
+    return _build_heuristic_query_plan(query, allowed_suffixes)
+
+
+def _retrieval_loop_model_id() -> str:
+    configured = str(getattr(settings.serpapi, "retrieval_loop_model_id", "")).strip()
+    return configured or _planner_model_id()
+
+
+def _loop_llm_enabled() -> bool:
+    return bool(getattr(settings.serpapi, "retrieval_loop_use_llm", False))
+
+
+def _compact_facts_for_prompt(facts: list[dict], *, limit: int) -> list[str]:
+    lines: list[str] = []
+    for item in facts:
+        if not isinstance(item, dict):
+            continue
+        fact = " ".join(str(item.get("fact", "")).split()).strip()
+        if not fact:
+            continue
+        url = str(item.get("url", "")).strip()
+        if url:
+            lines.append(f"- {fact} | {url}")
+        else:
+            lines.append(f"- {fact}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _build_gap_analyzer_messages(
+    query: str,
+    *,
+    subquestions: list[str],
+    facts: list[dict],
+) -> list[dict]:
+    max_gap_queries = max(1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2)))
+    compact_facts = _compact_facts_for_prompt(facts, limit=12)
+    subquestion_text = "\n".join(f"- {item}" for item in subquestions) or "- (none)"
+    facts_text = "\n".join(compact_facts) or "- (none)"
+    system_prompt = (
+        "You analyze retrieval coverage. "
+        "Reason silently and return JSON only with keys: missing_subquestions, queries. "
+        "Do not include explanations."
+    )
+    user_prompt = (
+        f"User query: {query}\n"
+        f"Subquestions:\n{subquestion_text}\n"
+        f"Extracted facts:\n{facts_text}\n"
+        f"Return at most {max_gap_queries} targeted follow-up queries."
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _normalize_gap_plan_payload(payload: dict, *, query: str, fallback_missing: list[str]) -> dict:
+    max_gap_queries = max(1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2)))
+    missing = _normalize_subquestion_list(
+        payload.get("missing_subquestions"), limit=_max_planner_subquestions()
+    )
+    if not missing:
+        missing = list(fallback_missing)
+    queries = _normalize_query_list(payload.get("queries"), limit=max_gap_queries)
+    if not queries and missing:
+        queries = _build_gap_queries(query, missing)
+    return {
+        "missing_subquestions": missing,
+        "queries": queries,
+    }
+
+
+async def _aidentify_gap_plan_with_llm(
+    query: str,
+    *,
+    subquestions: list[str],
+    facts: list[dict],
+    fallback_missing: list[str],
+) -> dict | None:
+    if not _loop_llm_enabled() or not subquestions:
+        return None
+    model_id = _retrieval_loop_model_id()
+    if not model_id:
+        return None
+    try:
+        messages = _build_gap_analyzer_messages(
+            query,
+            subquestions=subquestions,
+            facts=facts,
+        )
+        from app.infra.bedrock_chat_client import client
+
+        response = await client.chat.completions.create(model=model_id, messages=messages)
+    except Exception as exc:
+        logger.warning(
+            "SerpApi retrieval-loop gap analysis failed; "
+            "falling back to heuristic gap detection. %s",
+            exc,
+        )
+        return None
+
+    if not response or not getattr(response, "choices", None):
+        return None
+    content = str(response.choices[0].message.content or "").strip()
+    payload = _extract_json_object(content)
+    if not payload:
+        return None
+    return _normalize_gap_plan_payload(
+        payload,
+        query=query,
+        fallback_missing=fallback_missing,
+    )
+
+
+def _subquestion_token_coverage(subquestion: str, evidence_text: str) -> float:
+    tokens = _token_signature(subquestion)
+    if not tokens:
+        return 1.0
+    evidence_tokens = _token_signature(evidence_text)
+    if not evidence_tokens:
+        return 0.0
+    return len(tokens & evidence_tokens) / max(1, len(tokens))
+
+
+def _identify_missing_subquestions(subquestions: list[str], facts: list[dict]) -> list[str]:
+    if not subquestions:
+        return []
+    evidence_text = " ".join(str(item.get("fact", "")) for item in facts if isinstance(item, dict))
+    threshold = float(getattr(settings.serpapi, "retrieval_gap_min_token_coverage", 0.5))
+    missing: list[str] = []
+    for subquestion in subquestions:
+        if _subquestion_token_coverage(subquestion, evidence_text) >= threshold:
+            continue
+        missing.append(subquestion)
+    return missing
+
+
+def _build_gap_queries(query: str, missing_subquestions: list[str]) -> list[str]:
+    if not missing_subquestions:
+        return []
+    max_gap_queries = max(1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2)))
+    candidates = [
+        f"{query} {subquestion}".strip() for subquestion in missing_subquestions[:max_gap_queries]
+    ]
+    return _normalize_query_list(candidates, limit=max_gap_queries)
+
+
+def _next_queries_for_loop(planned_queries: list[str], seen_queries: set[str]) -> list[str]:
+    max_queries = _max_planner_queries()
+    next_queries: list[str] = []
+    for query in planned_queries:
+        key = str(query).strip().lower()
+        if not key or key in seen_queries:
+            continue
+        seen_queries.add(key)
+        next_queries.append(str(query).strip())
+        if len(next_queries) >= max_queries:
+            break
+    return next_queries
 
 
 def _url_matches_allowed_suffix(url: str, allowed_suffixes: list[str]) -> bool:
@@ -593,6 +934,127 @@ def _chunk_relevance_score(
     return overlap + snippet_bonus + rank_bonus
 
 
+def _domain_authority_score(url: str, allowed_suffixes: list[str]) -> float:
+    host = str(urlparse(url).hostname or "").strip().lower()
+    if not host:
+        return 0.35
+    if any(host.endswith(suffix) for suffix in _HIGH_AUTHORITY_SUFFIXES):
+        return 0.95
+    if allowed_suffixes and any(host.endswith(suffix) for suffix in allowed_suffixes):
+        return 0.85
+    if host.endswith(".org"):
+        return 0.7
+    if host.endswith(".com") or host.endswith(".net"):
+        return 0.55
+    return 0.5
+
+
+def _parse_published_datetime(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    for candidate in (normalized, normalized[:10]):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return None
+
+
+def _recency_score(published_date: str) -> float:
+    parsed = _parse_published_datetime(published_date)
+    if parsed is None:
+        return 0.5
+    now = datetime.now(timezone.utc)
+    age_days = max(0, int((now - parsed).total_seconds() // 86400))
+    if age_days <= 30:
+        return 1.0
+    if age_days <= 180:
+        return 0.85
+    if age_days <= 365:
+        return 0.7
+    if age_days <= 730:
+        return 0.55
+    return 0.4
+
+
+def _agreement_score(candidate: dict, candidates: list[dict]) -> float:
+    if not isinstance(candidate, dict):
+        return 0.0
+    extracted = _candidate_signature_and_url(candidate)
+    if not extracted:
+        return 0.0
+    signature, url = extracted
+    support = 0
+    for peer in candidates:
+        if peer is candidate:
+            continue
+        peer_extracted = _candidate_signature_and_url(peer)
+        if not peer_extracted:
+            continue
+        peer_signature, peer_url = peer_extracted
+        if url and peer_url and url == peer_url:
+            continue
+        if _jaccard_similarity(signature, peer_signature) >= 0.2:
+            support += 1
+            if support >= 3:
+                break
+    return min(1.0, support / 3.0)
+
+
+def _normalized_trust_weights() -> tuple[float, float, float, float]:
+    relevance = max(0.0, float(getattr(settings.serpapi, "trust_relevance_weight", 0.6)))
+    authority = max(0.0, float(getattr(settings.serpapi, "trust_authority_weight", 0.2)))
+    recency = max(0.0, float(getattr(settings.serpapi, "trust_recency_weight", 0.1)))
+    agreement = max(0.0, float(getattr(settings.serpapi, "trust_agreement_weight", 0.1)))
+    total = relevance + authority + recency + agreement
+    if total <= 0:
+        return 0.6, 0.2, 0.1, 0.1
+    return (
+        relevance / total,
+        authority / total,
+        recency / total,
+        agreement / total,
+    )
+
+
+def _apply_trust_scores(candidates: list[dict], allowed_suffixes: list[str]) -> list[dict]:
+    relevance_w, authority_w, recency_w, agreement_w = _normalized_trust_weights()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        metadata = candidate.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            candidate["metadata"] = metadata
+        url = str(metadata.get("url", "")).strip()
+        published_date = str(metadata.get("published_date", "")).strip()
+        relevance = max(0.0, min(1.0, float(candidate.get("_score", 0.0))))
+        authority = _domain_authority_score(url, allowed_suffixes)
+        recency = _recency_score(published_date)
+        agreement = _agreement_score(candidate, candidates)
+        trust = (
+            (relevance * relevance_w)
+            + (authority * authority_w)
+            + (recency * recency_w)
+            + (agreement * agreement_w)
+        )
+        metadata["trust_score"] = round(trust, 4)
+        metadata["trust_components"] = {
+            "relevance": round(relevance, 4),
+            "authority": round(authority, 4),
+            "recency": round(recency, 4),
+            "agreement": round(agreement, 4),
+        }
+        candidate["_trust_score"] = trust
+        candidate["_final_score"] = (relevance * 0.65) + (trust * 0.35)
+    return candidates
+
+
 async def _asearch_payloads(query_variants: list[str], *, top_k: int) -> list[dict]:
     if not query_variants:
         return []
@@ -821,60 +1283,470 @@ def _build_organic_candidates(
 
 
 def _finalize_candidates(candidates: list[dict]) -> list[dict]:
-    candidates.sort(key=lambda item: float(item.get("_score", 0.0)), reverse=True)
+    candidates.sort(
+        key=lambda item: float(item.get("_final_score", item.get("_score", 0.0))), reverse=True
+    )
     deduped = _dedupe_chunk_candidates(candidates)
+    max_results = max(1, int(settings.serpapi.max_context_results))
+    min_unique_domains = _retrieval_min_unique_domains()
+
+    selected_indexes: set[int] = set()
+    selected_domains: set[str] = set()
+    ordered_items: list[dict] = []
+
+    if min_unique_domains > 1:
+        for index, item in enumerate(deduped):
+            metadata = item.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            domain = _normalized_host(str(metadata.get("url", "")))
+            if not domain or domain in selected_domains:
+                continue
+            selected_domains.add(domain)
+            selected_indexes.add(index)
+            ordered_items.append(item)
+            if len(ordered_items) >= max_results or len(selected_domains) >= min_unique_domains:
+                break
+
+    for index, item in enumerate(deduped):
+        if index in selected_indexes:
+            continue
+        ordered_items.append(item)
+        if len(ordered_items) >= max_results:
+            break
 
     results: list[dict] = []
-    for item in deduped:
+    for item in ordered_items[:max_results]:
         cleaned = dict(item)
         cleaned.pop("_score", None)
+        cleaned.pop("_trust_score", None)
+        cleaned.pop("_final_score", None)
         results.append(cleaned)
-        if len(results) >= settings.serpapi.max_context_results:
-            break
     return results
 
 
-async def aretrieve_web_chunks(query: str, *, top_k: int = 3) -> dict:
+def _fact_text_from_content(content: str) -> str:
+    text = " ".join(str(content or "").split()).strip()
+    if not text:
+        return ""
+    sentence = _SENTENCE_SPLIT_RE.split(text)[0].strip()
+    if not sentence:
+        sentence = text
+    return sentence[:280].strip()
+
+
+def _extract_facts(candidates: list[dict], *, limit: int) -> list[dict]:
+    facts: list[dict] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        metadata = candidate.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        fact_text = _fact_text_from_content(candidate.get("content", ""))
+        if not fact_text:
+            continue
+        key = fact_text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        facts.append(
+            {
+                "fact": fact_text,
+                "url": str(metadata.get("url", "")).strip(),
+                "title": str(metadata.get("title", "")).strip(),
+                "published_date": str(metadata.get("published_date", "")).strip(),
+                "trust_score": float(metadata.get("trust_score", 0.0) or 0.0),
+            }
+        )
+        if len(facts) >= limit:
+            break
+    return facts
+
+
+def _normalized_host(url: str) -> str:
+    host = str(urlparse(url).hostname or "").strip().lower()
+    if host.startswith("www."):
+        return host[4:]
+    return host
+
+
+def _unique_domains_from_candidates(candidates: list[dict]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        metadata = candidate.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        host = _normalized_host(str(metadata.get("url", "")))
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        ordered.append(host)
+    return ordered
+
+
+def _retrieval_min_unique_domains() -> int:
+    return max(1, int(getattr(settings.serpapi, "retrieval_min_unique_domains", 2)))
+
+
+def _domain_diversity_gap(unique_domains: list[str]) -> int:
+    return max(0, _retrieval_min_unique_domains() - len(unique_domains))
+
+
+def _domain_gap_subquestions(unique_domains: list[str]) -> list[str]:
+    gap = _domain_diversity_gap(unique_domains)
+    if gap <= 0:
+        return []
+    return [f"confirm with at least {gap} additional independent website(s)"]
+
+
+def _build_domain_gap_queries(query: str, unique_domains: list[str]) -> list[str]:
+    gap = _domain_diversity_gap(unique_domains)
+    if gap <= 0:
+        return []
+    candidates: list[str] = []
+    for _ in range(gap):
+        candidates.extend(
+            [
+                f"{query} official source",
+                f"{query} independent source",
+                f"{query} corroborated information",
+            ]
+        )
+    return _normalize_query_list(
+        candidates,
+        limit=max(1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2))),
+    )
+
+
+def _combine_missing_subquestions(base_missing: list[str], unique_domains: list[str]) -> list[str]:
+    return _normalize_subquestion_list(
+        list(base_missing) + _domain_gap_subquestions(unique_domains),
+        limit=max(_max_planner_subquestions(), _retrieval_min_unique_domains() + 2),
+    )
+
+
+def _build_follow_up_queries(
+    query: str,
+    *,
+    missing_subquestions: list[str],
+    llm_gap_queries: list[str],
+    unique_domains: list[str],
+) -> list[str]:
+    if llm_gap_queries:
+        return llm_gap_queries
+    heuristic_queries = _build_gap_queries(query, missing_subquestions)
+    domain_queries = _build_domain_gap_queries(query, unique_domains)
+    return _normalize_query_list(
+        heuristic_queries + domain_queries,
+        limit=max(1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2))),
+    )
+
+
+def _next_loop_queries(
+    *,
+    base_query: str,
+    initial_queries: list[str],
+    missing_subquestions: list[str],
+    llm_gap_queries: list[str],
+    follow_up_queries: list[str],
+    seen_queries: set[str],
+    loop_step: int,
+) -> list[str]:
+    if loop_step <= 1:
+        return _next_queries_for_loop(initial_queries, seen_queries)
+    gap_queries = (
+        llm_gap_queries or follow_up_queries or _build_gap_queries(base_query, missing_subquestions)
+    )
+    return _next_queries_for_loop(gap_queries, seen_queries)
+
+
+def _retrieval_loop_enabled() -> bool:
+    return bool(getattr(settings.serpapi, "retrieval_loop_enabled", True))
+
+
+async def aretrieve_web_chunks(
+    query: str,
+    *,
+    top_k: int = 3,
+    search_mode: str = "deep",
+) -> dict:
     """Retrieve fallback web evidence from Google via SerpAPI."""
     started_at = time.perf_counter()
-    search_started_at = time.perf_counter()
     allowed_suffixes = _normalized_allowed_domain_suffixes()
-    query_variants = _build_query_variants(query, allowed_suffixes)
-    payloads = await _asearch_payloads(query_variants, top_k=top_k)
-    search_ms = _elapsed_ms(search_started_at)
-
-    rows, domain_filter_relaxed = _collect_search_rows_with_domain_retry(
-        payloads,
-        query_variants,
-        top_k=top_k,
-        allowed_suffixes=allowed_suffixes,
+    normalized_mode = str(search_mode or "deep").strip().lower()
+    deep_mode = normalized_mode != "fast"
+    if deep_mode:
+        query_plan = await _resolve_query_plan(query, allowed_suffixes)
+    else:
+        query_plan = _build_heuristic_query_plan(query, allowed_suffixes)
+        query_plan["planner"] = "fast_heuristic"
+        query_plan["llm_used"] = False
+        query_plan["subquestions"] = []
+    emit_trace_event(
+        "query_plan_created",
+        {
+            "query": query[:220],
+            "search_mode": normalized_mode,
+            "planner": str(query_plan.get("planner", "heuristic")),
+            "llm_used": bool(query_plan.get("llm_used", False)),
+            "subquestions": query_plan.get("subquestions", []),
+            "queries": query_plan.get("queries", []),
+        },
     )
-    fetch_started_at = time.perf_counter()
-    page_data_by_url = await _afetch_organic_pages(rows)
-    fetch_ms = _elapsed_ms(fetch_started_at)
+    planned_query_limit = _max_planner_queries() if deep_mode else min(2, _max_planner_queries())
+    planned_queries = _normalize_query_list(
+        query_plan.get("queries", []),
+        limit=planned_query_limit,
+    ) or _build_query_variants(query, allowed_suffixes)
+    if deep_mode:
+        subquestions = _normalize_subquestion_list(
+            query_plan.get("subquestions", []),
+            limit=_max_planner_subquestions(),
+        )
+    else:
+        subquestions = []
 
-    query_tokens = _query_tokens(query)
-    candidates = _build_organic_candidates(
-        rows=rows,
-        page_data_by_url=page_data_by_url,
-        query_tokens=query_tokens,
-        allowed_suffixes=allowed_suffixes,
+    search_ms_total = 0
+    fetch_ms_total = 0
+    domain_filter_relaxed = False
+    all_candidates: list[dict] = []
+    all_facts: list[dict] = []
+    gap_iterations: list[dict] = []
+    seen_queries: set[str] = set()
+    executed_queries: list[str] = []
+    loop_llm_used = False
+
+    max_steps = max(1, int(getattr(settings.serpapi, "retrieval_loop_max_steps", 2)))
+    if not deep_mode or not _retrieval_loop_enabled():
+        max_steps = 1
+
+    for step in range(1, max_steps + 1):
+        current_domains = _unique_domains_from_candidates(all_candidates)
+        heuristic_missing = _identify_missing_subquestions(subquestions, all_facts)
+        missing_subquestions = _combine_missing_subquestions(heuristic_missing, current_domains)
+        llm_gap_queries: list[str] = []
+        follow_up_queries = _build_follow_up_queries(
+            query,
+            missing_subquestions=missing_subquestions,
+            llm_gap_queries=llm_gap_queries,
+            unique_domains=current_domains,
+        )
+        if deep_mode and step > 1 and missing_subquestions:
+            llm_gap_plan = await _aidentify_gap_plan_with_llm(
+                query,
+                subquestions=subquestions or missing_subquestions,
+                facts=all_facts,
+                fallback_missing=missing_subquestions,
+            )
+            if llm_gap_plan:
+                loop_llm_used = True
+                missing_subquestions = _normalize_subquestion_list(
+                    llm_gap_plan.get("missing_subquestions", []),
+                    limit=max(_max_planner_subquestions(), _retrieval_min_unique_domains() + 2),
+                ) or list(missing_subquestions)
+                llm_gap_queries = _normalize_query_list(
+                    llm_gap_plan.get("queries", []),
+                    limit=max(
+                        1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2))
+                    ),
+                )
+                follow_up_queries = _build_follow_up_queries(
+                    query,
+                    missing_subquestions=missing_subquestions,
+                    llm_gap_queries=llm_gap_queries,
+                    unique_domains=current_domains,
+                )
+
+        loop_queries = _next_loop_queries(
+            base_query=query,
+            initial_queries=planned_queries,
+            missing_subquestions=missing_subquestions,
+            llm_gap_queries=llm_gap_queries,
+            follow_up_queries=follow_up_queries,
+            seen_queries=seen_queries,
+            loop_step=step,
+        )
+        if not loop_queries:
+            break
+        executed_queries.extend(loop_queries)
+        emit_trace_event(
+            "search_started",
+            {
+                "step": step,
+                "queries": loop_queries,
+            },
+        )
+
+        search_started_at = time.perf_counter()
+        payloads = await _asearch_payloads(loop_queries, top_k=top_k)
+        search_ms_total += _elapsed_ms(search_started_at)
+
+        rows, relaxed = _collect_search_rows_with_domain_retry(
+            payloads,
+            loop_queries,
+            top_k=top_k,
+            allowed_suffixes=allowed_suffixes,
+        )
+        domain_filter_relaxed = domain_filter_relaxed or relaxed
+        emit_trace_event(
+            "search_results",
+            {
+                "step": step,
+                "result_count": len(rows),
+                "urls": [str(row.get("url", "")).strip() for row in rows[:8]],
+                "domain_filter_relaxed": relaxed,
+            },
+        )
+
+        fetch_started_at = time.perf_counter()
+        if deep_mode:
+            page_data_by_url = await _afetch_organic_pages(rows)
+        else:
+            page_data_by_url = await _afetch_organic_pages(rows, max_pages_to_fetch=1)
+        fetch_ms_total += _elapsed_ms(fetch_started_at)
+        emit_trace_event(
+            "pages_read",
+            {
+                "step": step,
+                "pages_fetched": len(page_data_by_url),
+                "urls": list(page_data_by_url.keys())[:8],
+            },
+        )
+
+        query_tokens = _query_tokens(" ".join(loop_queries))
+        candidates = _build_organic_candidates(
+            rows=rows,
+            page_data_by_url=page_data_by_url,
+            query_tokens=query_tokens,
+            allowed_suffixes=allowed_suffixes,
+        )
+        ai_candidate = _ai_overview_candidate(payloads, allowed_suffixes)
+        if ai_candidate:
+            candidates.append(ai_candidate)
+
+        candidates = _apply_trust_scores(candidates, allowed_suffixes)
+        all_candidates.extend(candidates)
+        all_candidates = _apply_trust_scores(all_candidates, allowed_suffixes)
+        all_facts = _extract_facts(
+            all_candidates,
+            limit=(
+                max(2, int(settings.serpapi.max_context_results) * 3)
+                if deep_mode
+                else max(2, int(settings.serpapi.max_context_results))
+            ),
+        )
+        emit_trace_event(
+            "facts_extracted",
+            {
+                "step": step,
+                "fact_count": len(all_facts),
+                "facts": all_facts[:5],
+            },
+        )
+
+        unique_domains = _unique_domains_from_candidates(all_candidates)
+        next_heuristic_missing = _identify_missing_subquestions(subquestions, all_facts)
+        next_missing = _combine_missing_subquestions(next_heuristic_missing, unique_domains)
+        next_follow_up_queries = _build_follow_up_queries(
+            query,
+            missing_subquestions=next_missing,
+            llm_gap_queries=llm_gap_queries,
+            unique_domains=unique_domains,
+        )
+        retrieval_verified = (not next_missing) if deep_mode else True
+        emit_trace_event(
+            "retrieval_verification",
+            {
+                "step": step,
+                "verified": retrieval_verified,
+                "search_mode": normalized_mode,
+                "min_unique_domains": _retrieval_min_unique_domains(),
+                "unique_domain_count": len(unique_domains),
+                "unique_domains": unique_domains[:8],
+                "missing_subquestions": next_missing,
+            },
+        )
+        gap_iterations.append(
+            {
+                "step": step,
+                "queries": loop_queries,
+                "llm_gap_queries": llm_gap_queries,
+                "follow_up_queries": next_follow_up_queries,
+                "missing_subquestions": next_missing,
+                "unique_domains": unique_domains,
+                "unique_domain_count": len(unique_domains),
+            }
+        )
+        emit_trace_event(
+            "gaps_identified",
+            {
+                "step": step,
+                "missing_subquestions": next_missing,
+                "follow_up_queries": next_follow_up_queries,
+            },
+        )
+        if retrieval_verified:
+            break
+
+    results = _finalize_candidates(all_candidates)
+    extracted_facts = _extract_facts(
+        results,
+        limit=max(1, int(settings.serpapi.max_context_results)),
     )
-    ai_candidate = _ai_overview_candidate(payloads, allowed_suffixes)
-    if ai_candidate:
-        candidates.append(ai_candidate)
-    results = _finalize_candidates(candidates)
+    final_domains = _unique_domains_from_candidates(results)
+    emit_trace_event(
+        "source_ranking_completed",
+        {
+            "result_count": len(results),
+            "facts": extracted_facts,
+            "unique_domain_count": len(final_domains),
+            "unique_domains": final_domains[:8],
+            "urls": [
+                str((item.get("metadata") or {}).get("url", "")).strip()
+                for item in results[:8]
+                if isinstance(item, dict)
+            ],
+        },
+    )
 
     return {
         "query": query,
-        "query_variants": query_variants,
+        "query_variants": executed_queries,
+        "search_mode": normalized_mode,
+        "query_plan": {
+            "planner": str(query_plan.get("planner", "heuristic")),
+            "llm_used": bool(query_plan.get("llm_used", False)),
+            "subquestions": subquestions,
+        },
+        "retrieval_loop": {
+            "enabled": bool(deep_mode and _retrieval_loop_enabled()),
+            "llm_used": loop_llm_used,
+            "iterations": len(gap_iterations),
+            "steps": gap_iterations,
+        },
+        "verification": {
+            "min_unique_domains": _retrieval_min_unique_domains(),
+            "unique_domains": final_domains,
+            "unique_domain_count": len(final_domains),
+            "verified": (
+                (
+                    len(final_domains) >= _retrieval_min_unique_domains()
+                    and not _identify_missing_subquestions(subquestions, extracted_facts)
+                )
+                if deep_mode
+                else bool(results)
+            ),
+        },
+        "facts": extracted_facts,
         "retrieval_strategy": (
             "web_search_domain_relaxed" if domain_filter_relaxed else "web_search"
         ),
         "domain_filter_relaxed": domain_filter_relaxed,
         "timings_ms": {
-            "search": search_ms,
-            "page_fetch": fetch_ms,
+            "search": search_ms_total,
+            "page_fetch": fetch_ms_total,
             "total": _elapsed_ms(started_at),
         },
         "results": results,

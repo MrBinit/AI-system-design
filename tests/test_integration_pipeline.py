@@ -354,8 +354,14 @@ def test_api_to_queue_to_worker_to_memory_update(monkeypatch):
         30,
     )
 
-    def _fake_enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None):
-        answer = asyncio.run(llm_service.generate_response(user_id, prompt))
+    def _fake_enqueue_chat_job(
+        *,
+        user_id: str,
+        prompt: str,
+        session_id: str | None = None,
+        mode: str | None = None,
+    ):
+        answer = asyncio.run(llm_service.generate_response(user_id, prompt, mode=mode or "auto"))
         job_id = "job-0001"
         submitted_at = "2026-03-11T00:00:00+00:00"
         jobs[job_id] = {

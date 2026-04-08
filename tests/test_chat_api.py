@@ -1,3 +1,4 @@
+from decimal import Decimal
 from fastapi.testclient import TestClient
 
 from app.api.v1 import chat as chat_api
@@ -44,10 +45,13 @@ def test_chat_async_status_requires_owner(monkeypatch):
 
 
 def test_chat_stream_endpoint_success(monkeypatch):
-    def fake_enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None) -> dict:
+    def fake_enqueue_chat_job(
+        *, user_id: str, prompt: str, session_id: str | None = None, mode: str | None = None
+    ) -> dict:
         assert user_id == "user-1"
         assert prompt == "hello stream"
         assert session_id is None
+        assert mode == "auto"
         return {
             "job_id": "job-stream-1",
             "status": "queued",
@@ -101,10 +105,13 @@ def test_chat_stream_endpoint_success(monkeypatch):
 
 
 def test_chat_stream_endpoint_forwards_session_id(monkeypatch):
-    def fake_enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None) -> dict:
+    def fake_enqueue_chat_job(
+        *, user_id: str, prompt: str, session_id: str | None = None, mode: str | None = None
+    ) -> dict:
         assert user_id == "user-1"
         assert prompt == "hello stream"
         assert session_id == "session-xyz"
+        assert mode == "auto"
         return {
             "job_id": "job-stream-2",
             "status": "queued",
@@ -135,9 +142,168 @@ def test_chat_stream_endpoint_forwards_session_id(monkeypatch):
     assert response.status_code == 200
 
 
+def test_chat_stream_endpoint_forwards_explicit_mode(monkeypatch):
+    def fake_enqueue_chat_job(
+        *, user_id: str, prompt: str, session_id: str | None = None, mode: str | None = None
+    ) -> dict:
+        assert user_id == "user-1"
+        assert prompt == "hello stream"
+        assert session_id is None
+        assert mode == "deep"
+        return {
+            "job_id": "job-stream-mode",
+            "status": "queued",
+            "submitted_at": "2026-03-10T00:00:00+00:00",
+        }
+
+    def fake_get_chat_job(job_id: str) -> dict:
+        return {
+            "job_id": job_id,
+            "user_id": "user-1",
+            "session_id": "user-1",
+            "status": "completed",
+            "answer": "hello",
+            "error": "",
+        }
+
+    monkeypatch.setattr(chat_api, "enqueue_chat_job", fake_enqueue_chat_job)
+    monkeypatch.setattr(chat_api, "get_chat_job", fake_get_chat_job)
+
+    token = create_access_token(user_id="user-1", roles=["user"])
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/chat/stream",
+        json={"user_id": "user-1", "mode": "deep", "prompt": "hello stream"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_chat_stream_emits_trace_events(monkeypatch):
+    def fake_enqueue_chat_job(
+        *, user_id: str, prompt: str, session_id: str | None = None, mode: str | None = None
+    ) -> dict:
+        _ = user_id, prompt, session_id, mode
+        return {
+            "job_id": "job-trace-1",
+            "status": "queued",
+            "submitted_at": "2026-03-10T00:00:00+00:00",
+        }
+
+    poll_count = {"value": 0}
+
+    def fake_get_chat_job(job_id: str) -> dict:
+        assert job_id == "job-trace-1"
+        poll_count["value"] += 1
+        if poll_count["value"] == 1:
+            return {
+                "job_id": job_id,
+                "user_id": "user-1",
+                "session_id": "user-1",
+                "status": "processing",
+                "answer": "",
+                "error": "",
+                "trace_events": [
+                    {
+                        "type": "search_started",
+                        "timestamp": "2026-03-10T00:00:01+00:00",
+                        "payload": {"queries": ["x"]},
+                    }
+                ],
+            }
+        return {
+            "job_id": job_id,
+            "user_id": "user-1",
+            "session_id": "user-1",
+            "status": "completed",
+            "answer": "hello",
+            "error": "",
+            "trace_events": [
+                {
+                    "type": "search_started",
+                    "timestamp": "2026-03-10T00:00:01+00:00",
+                    "payload": {"queries": ["x"]},
+                },
+                {
+                    "type": "answer_finalized",
+                    "timestamp": "2026-03-10T00:00:02+00:00",
+                    "payload": {"source_urls": ["https://example.edu/evidence"]},
+                },
+            ],
+        }
+
+    monkeypatch.setattr(chat_api, "enqueue_chat_job", fake_enqueue_chat_job)
+    monkeypatch.setattr(chat_api, "get_chat_job", fake_get_chat_job)
+
+    token = create_access_token(user_id="user-1", roles=["user"])
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/chat/stream",
+        json={"user_id": "user-1", "prompt": "hello stream"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert '"type": "trace"' in body
+    assert '"type": "search_started"' in body
+    assert '"type": "answer_finalized"' in body
+
+
+def test_chat_stream_serializes_decimal_trace_payload(monkeypatch):
+    def fake_enqueue_chat_job(
+        *, user_id: str, prompt: str, session_id: str | None = None, mode: str | None = None
+    ) -> dict:
+        _ = user_id, prompt, session_id, mode
+        return {
+            "job_id": "job-trace-decimal",
+            "status": "queued",
+            "submitted_at": "2026-03-10T00:00:00+00:00",
+        }
+
+    def fake_get_chat_job(job_id: str) -> dict:
+        assert job_id == "job-trace-decimal"
+        return {
+            "job_id": job_id,
+            "user_id": "user-1",
+            "session_id": "user-1",
+            "status": "completed",
+            "answer": "ok",
+            "error": "",
+            "trace_events": [
+                {
+                    "type": "search_started",
+                    "timestamp": "2026-03-10T00:00:01+00:00",
+                    "payload": {"step": Decimal("1"), "queries": ["x"]},
+                }
+            ],
+        }
+
+    monkeypatch.setattr(chat_api, "enqueue_chat_job", fake_enqueue_chat_job)
+    monkeypatch.setattr(chat_api, "get_chat_job", fake_get_chat_job)
+
+    token = create_access_token(user_id="user-1", roles=["user"])
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/chat/stream",
+        json={"user_id": "user-1", "prompt": "hello stream"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert '"type": "trace"' in body
+    assert '"step": 1' in body
+    assert '"type":"done"' in body
+    assert '"type": "error"' not in body
+
+
 def test_chat_stream_endpoint_hides_internal_details(monkeypatch):
-    def fake_enqueue_chat_job(*, user_id: str, prompt: str, session_id: str | None = None) -> dict:
-        _ = user_id, prompt, session_id
+    def fake_enqueue_chat_job(
+        *, user_id: str, prompt: str, session_id: str | None = None, mode: str | None = None
+    ) -> dict:
+        _ = user_id, prompt, session_id, mode
         raise RuntimeError("provider timeout at host internal.example")
 
     monkeypatch.setattr(chat_api, "enqueue_chat_job", fake_enqueue_chat_job)
@@ -197,6 +363,42 @@ def test_chat_status_hides_internal_job_error(monkeypatch):
     assert payload["status"] == "failed"
     assert payload["error"] == "Async chat job failed."
     assert internal_ip not in payload["error"]
+
+
+def test_chat_status_includes_trace_events(monkeypatch):
+    monkeypatch.setattr(
+        chat_api,
+        "get_chat_job",
+        lambda _job_id: {
+            "job_id": "job-trace-status",
+            "user_id": "user-1",
+            "session_id": "session-1",
+            "status": "completed",
+            "created_at": "2026-03-10T00:00:00+00:00",
+            "started_at": "2026-03-10T00:00:02+00:00",
+            "completed_at": "2026-03-10T00:00:03+00:00",
+            "answer": "done",
+            "error": "",
+            "trace_events": [
+                {
+                    "type": "search_results",
+                    "timestamp": "2026-03-10T00:00:01+00:00",
+                    "payload": {"urls": ["https://example.edu"]},
+                }
+            ],
+        },
+    )
+
+    token = create_access_token(user_id="user-1", roles=["user"])
+    client = TestClient(app)
+    response = client.get(
+        "/api/v1/chat/job-trace-status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert isinstance(payload.get("trace_events"), list)
+    assert payload["trace_events"][0]["type"] == "search_results"
 
 
 def test_route_matching_middleware_formats_404():

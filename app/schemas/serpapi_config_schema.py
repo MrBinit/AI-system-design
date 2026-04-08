@@ -15,8 +15,22 @@ class SerpApiConfig(BaseModel):
     max_concurrency: int = Field(default=8, ge=1, le=256)
     queue_workers: int = Field(default=4, ge=1, le=256)
     queue_max_size: int = Field(default=200, ge=1, le=100000)
+    always_web_retrieval_enabled: bool = True
+    retrieval_fanout_enabled: bool = True
     fallback_enabled: bool = True
     fallback_similarity_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    query_planner_enabled: bool = True
+    query_planner_use_llm: bool = True
+    query_planner_model_id: str = ""
+    query_planner_max_queries: int = Field(default=5, ge=1, le=12)
+    query_planner_max_subquestions: int = Field(default=4, ge=0, le=12)
+    retrieval_loop_enabled: bool = True
+    retrieval_loop_use_llm: bool = True
+    retrieval_loop_model_id: str = ""
+    retrieval_loop_max_steps: int = Field(default=2, ge=1, le=5)
+    retrieval_loop_max_gap_queries: int = Field(default=2, ge=1, le=8)
+    retrieval_min_unique_domains: int = Field(default=2, ge=1, le=8)
+    retrieval_gap_min_token_coverage: float = Field(default=0.5, ge=0.0, le=1.0)
     multi_query_enabled: bool = True
     max_query_variants: int = Field(default=3, ge=1, le=5)
     allowed_domain_suffixes: list[str] = Field(default_factory=list)
@@ -32,3 +46,7 @@ class SerpApiConfig(BaseModel):
     max_chunks_per_page: int = Field(default=1, ge=1, le=20)
     min_chunk_chars: int = Field(default=140, ge=20, le=2000)
     chunk_dedupe_similarity: float = Field(default=0.9, ge=0.5, le=1.0)
+    trust_relevance_weight: float = Field(default=0.6, ge=0.0, le=1.0)
+    trust_authority_weight: float = Field(default=0.2, ge=0.0, le=1.0)
+    trust_recency_weight: float = Field(default=0.1, ge=0.0, le=1.0)
+    trust_agreement_weight: float = Field(default=0.1, ge=0.0, le=1.0)

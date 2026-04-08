@@ -157,10 +157,48 @@ def _apply_env_overrides(data: dict) -> dict:
     _set(["serpapi", "max_concurrency"], "SERPAPI_MAX_CONCURRENCY", int)
     _set(["serpapi", "queue_workers"], "SERPAPI_QUEUE_WORKERS", int)
     _set(["serpapi", "queue_max_size"], "SERPAPI_QUEUE_MAX_SIZE", int)
+    _set(
+        ["serpapi", "always_web_retrieval_enabled"],
+        "SERPAPI_ALWAYS_WEB_RETRIEVAL_ENABLED",
+        bool,
+    )
+    _set(
+        ["serpapi", "retrieval_fanout_enabled"],
+        "SERPAPI_RETRIEVAL_FANOUT_ENABLED",
+        bool,
+    )
     _set(["serpapi", "fallback_enabled"], "SERPAPI_FALLBACK_ENABLED", bool)
     _set(
         ["serpapi", "fallback_similarity_threshold"],
         "SERPAPI_FALLBACK_SIMILARITY_THRESHOLD",
+        float,
+    )
+    _set(["serpapi", "query_planner_enabled"], "SERPAPI_QUERY_PLANNER_ENABLED", bool)
+    _set(["serpapi", "query_planner_use_llm"], "SERPAPI_QUERY_PLANNER_USE_LLM", bool)
+    _set(["serpapi", "query_planner_model_id"], "SERPAPI_QUERY_PLANNER_MODEL_ID")
+    _set(["serpapi", "query_planner_max_queries"], "SERPAPI_QUERY_PLANNER_MAX_QUERIES", int)
+    _set(
+        ["serpapi", "query_planner_max_subquestions"],
+        "SERPAPI_QUERY_PLANNER_MAX_SUBQUESTIONS",
+        int,
+    )
+    _set(["serpapi", "retrieval_loop_enabled"], "SERPAPI_RETRIEVAL_LOOP_ENABLED", bool)
+    _set(["serpapi", "retrieval_loop_use_llm"], "SERPAPI_RETRIEVAL_LOOP_USE_LLM", bool)
+    _set(["serpapi", "retrieval_loop_model_id"], "SERPAPI_RETRIEVAL_LOOP_MODEL_ID")
+    _set(["serpapi", "retrieval_loop_max_steps"], "SERPAPI_RETRIEVAL_LOOP_MAX_STEPS", int)
+    _set(
+        ["serpapi", "retrieval_loop_max_gap_queries"],
+        "SERPAPI_RETRIEVAL_LOOP_MAX_GAP_QUERIES",
+        int,
+    )
+    _set(
+        ["serpapi", "retrieval_min_unique_domains"],
+        "SERPAPI_RETRIEVAL_MIN_UNIQUE_DOMAINS",
+        int,
+    )
+    _set(
+        ["serpapi", "retrieval_gap_min_token_coverage"],
+        "SERPAPI_RETRIEVAL_GAP_MIN_TOKEN_COVERAGE",
         float,
     )
     _set(["serpapi", "multi_query_enabled"], "SERPAPI_MULTI_QUERY_ENABLED", bool)
@@ -194,6 +232,10 @@ def _apply_env_overrides(data: dict) -> dict:
         "SERPAPI_CHUNK_DEDUPE_SIMILARITY",
         float,
     )
+    _set(["serpapi", "trust_relevance_weight"], "SERPAPI_TRUST_RELEVANCE_WEIGHT", float)
+    _set(["serpapi", "trust_authority_weight"], "SERPAPI_TRUST_AUTHORITY_WEIGHT", float)
+    _set(["serpapi", "trust_recency_weight"], "SERPAPI_TRUST_RECENCY_WEIGHT", float)
+    _set(["serpapi", "trust_agreement_weight"], "SERPAPI_TRUST_AGREEMENT_WEIGHT", float)
 
     # Backward-compatible aliases: old AZURE_OPENAI_* vars still map into bedrock config.
     _set(["bedrock", "primary_model_id"], "AZURE_OPENAI_PRIMARY_DEPLOYMENT")

@@ -10,8 +10,22 @@ serpapi:
   max_concurrency: 8
   queue_workers: 4
   queue_max_size: 200
+  always_web_retrieval_enabled: true
+  retrieval_fanout_enabled: true
   fallback_enabled: true
   fallback_similarity_threshold: 0.35
+  query_planner_enabled: true
+  query_planner_use_llm: true
+  query_planner_model_id: ""
+  query_planner_max_queries: 5
+  query_planner_max_subquestions: 4
+  retrieval_loop_enabled: true
+  retrieval_loop_use_llm: true
+  retrieval_loop_model_id: ""
+  retrieval_loop_max_steps: 2
+  retrieval_loop_max_gap_queries: 2
+  retrieval_min_unique_domains: 2
+  retrieval_gap_min_token_coverage: 0.5
   multi_query_enabled: true
   max_query_variants: 3
   allowed_domain_suffixes:
@@ -29,3 +43,7 @@ serpapi:
   max_chunks_per_page: 2
   min_chunk_chars: 140
   chunk_dedupe_similarity: 0.9
+  trust_relevance_weight: 0.6
+  trust_authority_weight: 0.2
+  trust_recency_weight: 0.1
+  trust_agreement_weight: 0.1

@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import pytest
 from app.services import llm_service
@@ -40,6 +41,18 @@ def _stub_citation_enforcement(monkeypatch):
 @pytest.fixture(autouse=True)
 def _stub_citation_grounding_policy(monkeypatch):
     monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def _disable_always_web_hybrid_by_default(monkeypatch):
+    monkeypatch.setattr(llm_service.settings.serpapi, "always_web_retrieval_enabled", False)
+    monkeypatch.setattr(llm_service.settings.serpapi, "retrieval_min_unique_domains", 1)
+
+
+@pytest.fixture(autouse=True)
+def _disable_agentic_planner_verifier_by_default(monkeypatch):
+    monkeypatch.setattr(llm_service, "_agentic_planner_enabled", lambda: False)
+    monkeypatch.setattr(llm_service, "_agentic_verifier_enabled", lambda: False)
 
 
 class FakeRedis:
@@ -188,6 +201,294 @@ async def test_generate_response_uses_primary_and_updates_memory(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_generate_response_does_not_cache_abstain_answer(monkeypatch):
+    monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: True)
+    monkeypatch.setattr(
+        llm_service, "_enforce_citation_grounding", _REAL_ENFORCE_CITATION_GROUNDING
+    )
+
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    model_calls = {"count": 0}
+
+    async def fake_primary(_messages):
+        model_calls["count"] += 1
+        return FakeResponse("This answer has no citations.")
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {
+            "results": [
+                {
+                    "content": "Admission details for AI program.",
+                    "metadata": {"university": "Sample University"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+
+    result_first = await llm_service.generate_response("user-1", "find university course")
+    assert result_first == llm_service._NO_RELEVANT_INFORMATION_DETAIL
+    calls_after_first = model_calls["count"]
+
+    result_second = await llm_service.generate_response("user-1", "find university course")
+    assert result_second == llm_service._NO_RELEVANT_INFORMATION_DETAIL
+
+    assert model_calls["count"] > calls_after_first
+    cache_key = llm_service._chat_cache_key("user-1", "find university course")
+    assert cache_key not in fake_redis.store
+
+
+@pytest.mark.asyncio
+async def test_generate_response_agentic_retries_when_citations_missing(monkeypatch):
+    monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: True)
+    monkeypatch.setattr(
+        llm_service, "_enforce_citation_grounding", _REAL_ENFORCE_CITATION_GROUNDING
+    )
+
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    model_calls = {"count": 0}
+
+    async def fake_primary(_messages):
+        model_calls["count"] += 1
+        if model_calls["count"] == 1:
+            return FakeResponse("Oxford admission details are available.")
+        return FakeResponse(
+            "Oxford admission details are available. Source: https://example.edu/evidence"
+        )
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {
+            "results": [
+                {
+                    "content": "Oxford AI admission details from official content.",
+                    "metadata": {"university": "Oxford"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+
+    result = await llm_service.generate_response("user-1", "oxford ai admission")
+    assert "https://example.edu/evidence" in result
+    assert model_calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_generate_response_agentic_retries_for_source_diversity(monkeypatch):
+    monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: True)
+    monkeypatch.setattr(
+        llm_service, "_enforce_citation_grounding", _REAL_ENFORCE_CITATION_GROUNDING
+    )
+    monkeypatch.setattr(llm_service.settings.serpapi, "retrieval_min_unique_domains", 2)
+    monkeypatch.setattr(
+        llm_service,
+        "_evidence_urls",
+        lambda _results: [
+            "https://first.example.edu/evidence",
+            "https://second.example.org/evidence",
+        ],
+    )
+
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    model_calls = {"count": 0}
+
+    async def fake_primary(_messages):
+        model_calls["count"] += 1
+        if model_calls["count"] == 1:
+            return FakeResponse(
+                "Admission details summary. Source: https://first.example.edu/evidence"
+            )
+        return FakeResponse(
+            "Admission details summary. "
+            "Sources: https://first.example.edu/evidence and https://second.example.org/evidence"
+        )
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {
+            "results": [
+                {
+                    "content": "Evidence from source one.",
+                    "metadata": {"university": "Example University"},
+                },
+                {
+                    "content": "Evidence from source two.",
+                    "metadata": {"university": "Example University"},
+                },
+            ]
+        }
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+
+    result = await llm_service.generate_response("user-1", "oxford ai admission")
+    assert "https://second.example.org/evidence" in result
+    assert model_calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_generate_response_agentic_planner_and_verifier_orchestration(monkeypatch):
+    monkeypatch.setattr(llm_service, "_agentic_planner_enabled", lambda: True)
+    monkeypatch.setattr(llm_service, "_agentic_verifier_enabled", lambda: True)
+    monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: False)
+
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    responses = [
+        FakeResponse(
+            '{"intent":"south westphalia msc business informatics",'
+            '"subquestions":["admissions","fees"],'
+            '"search_queries":["south westphalia msc business informatics admissions official"],'
+            '"success_criteria":["answer admission requirements","include fees if available"]}'
+        ),
+        FakeResponse("Draft answer without fees."),
+        FakeResponse(
+            '{"pass":false,"coverage_score":0.4,'
+            '"issues":["missing_fees"],'
+            '"missing_points":["tuition and semester contribution"],'
+            '"revision_guidance":"Add fee details with evidence-backed citation."}'
+        ),
+        FakeResponse("Final answer with fees. Source: https://example.edu/evidence"),
+        FakeResponse(
+            '{"pass":true,"coverage_score":0.92,'
+            '"issues":[],"missing_points":[],"revision_guidance":""}'
+        ),
+    ]
+    model_calls = {"count": 0}
+
+    async def fake_primary(_messages):
+        index = model_calls["count"]
+        model_calls["count"] += 1
+        return responses[index]
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {
+            "results": [
+                {
+                    "content": "Admissions and fee details from official page.",
+                    "metadata": {"university": "South Westphalia University"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+
+    result = await llm_service.generate_response(
+        "user-1", "South Westphalia MSc Business Informatics"
+    )
+    assert result == "Final answer with fees. Source: https://example.edu/evidence"
+    assert model_calls["count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_generate_response_returns_best_partial_when_verification_never_passes(monkeypatch):
+    monkeypatch.setattr(llm_service, "_agentic_planner_enabled", lambda: True)
+    monkeypatch.setattr(llm_service, "_agentic_verifier_enabled", lambda: True)
+    monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: False)
+
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    responses = [
+        FakeResponse(
+            '{"intent":"compare programs","subquestions":["deadline","fees"],'
+            '"search_queries":["compare programs official"],'
+            '"success_criteria":["compare both programs","cite sources"]}'
+        ),
+        FakeResponse(
+            "Partial comparison with one verified detail. " "Source: https://example.edu/evidence"
+        ),
+        FakeResponse(
+            '{"pass":false,"coverage_score":0.55,'
+            '"issues":["missing second program details"],'
+            '"missing_points":["second program fees"],'
+            '"revision_guidance":"Add missing details if supported by evidence."}'
+        ),
+        FakeResponse("Sources: https://example.edu/evidence"),
+        FakeResponse(
+            '{"pass":false,"coverage_score":0.25,'
+            '"issues":["no comparison table","missing key details"],'
+            '"missing_points":["deadlines","fees","requirements"],'
+            '"revision_guidance":"Needs substantially more detail."}'
+        ),
+    ]
+    model_calls = {"count": 0}
+
+    async def fake_primary(_messages):
+        idx = model_calls["count"]
+        model_calls["count"] += 1
+        return responses[idx]
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {
+            "results": [
+                {
+                    "content": "Program detail evidence.",
+                    "metadata": {"university": "Example University"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+
+    result = await llm_service.generate_response("user-1", "compare programs", mode="deep")
+
+    assert result.startswith("Partial comparison with one verified detail.")
+    assert result != llm_service._NO_RELEVANT_INFORMATION_DETAIL
+    assert model_calls["count"] == 5
+
+
+@pytest.mark.asyncio
 async def test_generate_response_skips_retrieval_when_disabled(monkeypatch):
     monkeypatch.setenv("RETRIEVAL_DISABLED", "true")
     fake_redis = FakeRedis()
@@ -320,6 +621,269 @@ async def test_generate_response_skips_web_fallback_when_vector_confident(monkey
 
 
 @pytest.mark.asyncio
+async def test_generate_response_always_web_hybrid_runs_web_when_vector_confident(monkeypatch):
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.serpapi, "always_web_retrieval_enabled", True)
+
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    async def fake_primary(messages):
+        assert any(
+            isinstance(message, dict)
+            and "Live web fallback context" in str(message.get("content", ""))
+            for message in messages
+        )
+        return FakeResponse("primary-response")
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {
+            "retrieval_strategy": "ann",
+            "results": [
+                {
+                    "content": "Reliable vector result.",
+                    "distance": 0.1,
+                    "metadata": {"university": "Oxford"},
+                }
+            ],
+        }
+
+    web_calls = {"count": 0}
+
+    async def fake_web_fallback(*_args, **_kwargs):
+        web_calls["count"] += 1
+        return {
+            "results": [
+                {
+                    "content": "Oxford official admissions web evidence.",
+                    "metadata": {"university": "Oxford Web", "url": "https://example.edu/oxford"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+    monkeypatch.setattr(llm_service, "aretrieve_web_chunks", fake_web_fallback)
+
+    result = await llm_service.generate_response("user-1", "oxford ai admission")
+    assert result == "primary-response"
+    assert web_calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_augment_messages_with_retrieval_fanout_prefetches_web(monkeypatch):
+    monkeypatch.setattr(llm_service, "_web_retrieval_ready", lambda: (True, "ready"))
+    monkeypatch.setattr(llm_service, "_should_run_web_retrieval", lambda: True)
+
+    web_started = asyncio.Event()
+    release_web = asyncio.Event()
+
+    async def fake_web_with_mode(_retrieval_query, *, top_k, search_mode):
+        assert top_k == llm_service.settings.postgres.default_top_k
+        assert search_mode == "deep"
+        web_started.set()
+        await release_web.wait()
+        return {
+            "results": [
+                {
+                    "content": "Web evidence.",
+                    "metadata": {"url": "https://web.example.edu/a"},
+                }
+            ],
+            "query_plan": {"planner": "llm", "llm_used": True, "subquestions": []},
+            "query_variants": ["query"],
+            "facts": [],
+            "retrieval_loop": {"enabled": True},
+        }
+
+    async def fake_vector(_retrieval_query, _state):
+        # If fan-out works, web prefetch has already started before vector resolves.
+        await asyncio.wait_for(web_started.wait(), timeout=0.3)
+        release_web.set()
+        return (
+            [
+                {
+                    "content": "Vector evidence.",
+                    "metadata": {"url": "https://vector.example.edu/a"},
+                }
+            ],
+            0.1,
+        )
+
+    async def fake_rerank(_query, merged_results, _state):
+        return merged_results
+
+    def fake_apply_grounded_retrieval_context(*, messages, merged_results, used_web_results, state):
+        _ = state
+        assert used_web_results is True
+        assert len(merged_results) >= 2
+        return messages, None
+
+    monkeypatch.setattr(llm_service, "_aretrieve_web_chunks_with_mode", fake_web_with_mode)
+    monkeypatch.setattr(llm_service, "_retrieve_vector_candidates", fake_vector)
+    monkeypatch.setattr(llm_service, "_rerank_if_configured", fake_rerank)
+    monkeypatch.setattr(
+        llm_service, "_apply_grounded_retrieval_context", fake_apply_grounded_retrieval_context
+    )
+
+    base_messages = [{"role": "user", "content": "hello"}]
+    state = {"safe_user_prompt": "hello"}
+    messages, detail = await llm_service._augment_messages_with_retrieval(
+        messages=base_messages,
+        retrieval_query="hello",
+        search_mode="deep",
+        state=state,
+    )
+
+    assert detail is None
+    assert messages == base_messages
+
+
+@pytest.mark.asyncio
+async def test_prepare_messages_for_model_fanout_prefetches_vector(monkeypatch):
+    monkeypatch.delenv("RETRIEVAL_DISABLED", raising=False)
+    monkeypatch.setattr(llm_service, "_retrieval_fanout_enabled", lambda: True)
+
+    vector_started = asyncio.Event()
+    release_vector = asyncio.Event()
+    captured: dict = {}
+
+    async def fake_vector_retrieval(query, **kwargs):
+        _ = kwargs
+        assert query == "hello"
+        vector_started.set()
+        await release_vector.wait()
+        return {"retrieval_strategy": "ann", "results": []}
+
+    async def fake_build_context(_conversation_user_id, safe_user_prompt):
+        await asyncio.wait_for(vector_started.wait(), timeout=0.3)
+        release_vector.set()
+        return [{"role": "user", "content": safe_user_prompt}]
+
+    async def fake_augment_messages_with_retrieval(
+        *,
+        messages,
+        retrieval_query,
+        search_mode,
+        state,
+        vector_prefetch_result=None,
+    ):
+        _ = (search_mode, state)
+        captured["retrieval_query"] = retrieval_query
+        captured["vector_prefetch_result"] = vector_prefetch_result
+        return messages, None
+
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_vector_retrieval)
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(
+        llm_service, "_augment_messages_with_retrieval", fake_augment_messages_with_retrieval
+    )
+    monkeypatch.setattr(
+        llm_service,
+        "apply_context_guardrails",
+        lambda messages: {"blocked": False, "messages": messages, "reason": ""},
+    )
+
+    state: dict = {}
+    messages, detail = await llm_service._prepare_messages_for_model(
+        user_id="user-1",
+        conversation_user_id="session-1",
+        safe_user_prompt="hello",
+        execution_mode="deep",
+        policy={"web_search_mode": "deep"},
+        state=state,
+    )
+
+    assert detail is None
+    assert messages
+    assert captured["retrieval_query"] == "hello"
+    assert isinstance(captured["vector_prefetch_result"], dict)
+
+
+@pytest.mark.asyncio
+async def test_prepare_messages_for_model_fanout_cancels_vector_prefetch_on_query_mismatch(
+    monkeypatch,
+):
+    monkeypatch.delenv("RETRIEVAL_DISABLED", raising=False)
+    monkeypatch.setattr(llm_service, "_retrieval_fanout_enabled", lambda: True)
+
+    vector_started = asyncio.Event()
+    vector_cancelled = asyncio.Event()
+    captured: dict = {}
+
+    async def fake_vector_retrieval(query, **kwargs):
+        _ = kwargs
+        assert query == "What about RWTH Aachen?"
+        vector_started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            vector_cancelled.set()
+            raise
+
+    async def fake_build_context(_conversation_user_id, _safe_user_prompt):
+        await asyncio.wait_for(vector_started.wait(), timeout=0.3)
+        return [
+            {"role": "user", "content": "What is TU Munich MSc AI deadline?"},
+            {"role": "assistant", "content": "Here is TU Munich info."},
+            {"role": "user", "content": "What about RWTH Aachen?"},
+        ]
+
+    async def fake_augment_messages_with_retrieval(
+        *,
+        messages,
+        retrieval_query,
+        search_mode,
+        state,
+        vector_prefetch_result=None,
+    ):
+        _ = (messages, search_mode, state)
+        captured["retrieval_query"] = retrieval_query
+        captured["vector_prefetch_result"] = vector_prefetch_result
+        return [{"role": "user", "content": "ok"}], None
+
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_vector_retrieval)
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(
+        llm_service, "_augment_messages_with_retrieval", fake_augment_messages_with_retrieval
+    )
+    monkeypatch.setattr(
+        llm_service,
+        "apply_context_guardrails",
+        lambda messages: {"blocked": False, "messages": messages, "reason": ""},
+    )
+
+    state: dict = {}
+    messages, detail = await llm_service._prepare_messages_for_model(
+        user_id="user-1",
+        conversation_user_id="session-1",
+        safe_user_prompt="What about RWTH Aachen?",
+        execution_mode="deep",
+        policy={"web_search_mode": "deep"},
+        state=state,
+    )
+
+    assert detail is None
+    assert any(
+        isinstance(item, dict) and item.get("role") == "user" and item.get("content") == "ok"
+        for item in messages
+    )
+    assert "What is TU Munich MSc AI deadline?" in captured["retrieval_query"]
+    assert captured["vector_prefetch_result"] is None
+    assert vector_cancelled.is_set()
+
+
+@pytest.mark.asyncio
 async def test_generate_response_uses_web_fallback_when_vector_low_confidence(monkeypatch):
     monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
     monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
@@ -444,6 +1008,68 @@ async def test_generate_response_reranks_combined_vector_and_web_results(monkeyp
     monkeypatch.setattr(llm_service, "arerank_retrieval_results", fake_rerank)
 
     result = await llm_service.generate_response("user-1", "best ai program evidence")
+    assert result == "primary-response"
+
+
+@pytest.mark.asyncio
+async def test_generate_response_rerank_restores_domain_diversity(monkeypatch):
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.serpapi, "retrieval_min_unique_domains", 2)
+    monkeypatch.setattr(llm_service.settings.serpapi, "max_context_results", 4)
+
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    async def fake_primary(messages):
+        joined = "\n".join(
+            str(message.get("content", "")) for message in messages if isinstance(message, dict)
+        )
+        assert "Evidence from domain X." in joined
+        assert "Evidence from domain Y." in joined
+        return FakeResponse("primary-response")
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {"retrieval_strategy": "ann", "results": []}
+
+    async def fake_web_fallback(*_args, **_kwargs):
+        return {
+            "results": [
+                {
+                    "content": "Evidence from domain X.",
+                    "metadata": {"university": "Web X", "url": "https://x.de/a"},
+                },
+                {
+                    "content": "Evidence from domain Y.",
+                    "metadata": {"university": "Web Y", "url": "https://y.eu/b"},
+                },
+            ]
+        }
+
+    async def fake_rerank(_query, candidates):
+        assert len(candidates) == 2
+        # Simulate reranker collapse to one domain; pipeline should restore domain diversity.
+        return {
+            "results": [candidates[0]],
+            "applied": True,
+            "timings_ms": {"total": 6},
+        }
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+    monkeypatch.setattr(llm_service, "aretrieve_web_chunks", fake_web_fallback)
+    monkeypatch.setattr(llm_service, "arerank_retrieval_results", fake_rerank)
+
+    result = await llm_service.generate_response("user-1", "compare x and y")
     assert result == "primary-response"
 
 
@@ -955,6 +1581,95 @@ def test_chat_cache_key_changes_across_sessions():
     key_b = llm_service._chat_cache_key("user-1", prompt, "session-b")
 
     assert key_a != key_b
+
+
+def test_chat_cache_key_changes_across_modes():
+    prompt = "same prompt"
+    key_fast = llm_service._chat_cache_key("user-1", prompt, "session-a", "fast")
+    key_auto = llm_service._chat_cache_key("user-1", prompt, "session-a", "auto")
+
+    assert key_fast != key_auto
+    assert "mode:fast" in key_fast
+    assert "mode:auto" in key_auto
+
+
+def test_resolve_initial_execution_mode_routes_auto_queries():
+    assert llm_service._resolve_initial_execution_mode("auto", "hello") == "fast"
+    assert (
+        llm_service._resolve_initial_execution_mode(
+            "auto",
+            "compare top AI universities in germany and include latest deadlines",
+        )
+        == "deep"
+    )
+
+
+def test_build_retrieval_query_uses_only_latest_user_turn_for_new_topic():
+    messages = [
+        {"role": "user", "content": "Compare TU Munich vs RWTH Aachen MSc AI"},
+        {"role": "assistant", "content": "Working on it."},
+        {"role": "user", "content": "tell me about open admission in german universities"},
+    ]
+
+    query = llm_service._build_retrieval_query(messages)
+
+    assert query == "tell me about open admission in german universities"
+
+
+def test_build_retrieval_query_keeps_previous_user_turn_for_followup():
+    messages = [
+        {"role": "user", "content": "What is TU Munich MSc AI deadline?"},
+        {"role": "assistant", "content": "Here is TU Munich info."},
+        {"role": "user", "content": "What about RWTH Aachen?"},
+    ]
+
+    query = llm_service._build_retrieval_query(messages)
+
+    assert "What is TU Munich MSc AI deadline?" in query
+    assert "What about RWTH Aachen?" in query
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_auto_escalates_to_deep_on_context_refusal(monkeypatch):
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_read_cached_response(_cache_key):
+        return None, 0
+
+    call_modes: list[str] = []
+
+    async def fake_prepare_messages_for_model(
+        *,
+        user_id,
+        conversation_user_id,
+        safe_user_prompt,
+        execution_mode,
+        policy,
+        state,
+    ):
+        _ = (user_id, conversation_user_id, policy)
+        call_modes.append(execution_mode)
+        if execution_mode == "fast":
+            state["context_guard_reason"] = "no_relevant_information"
+            return None, llm_service._NO_RELEVANT_INFORMATION_DETAIL
+        return [{"role": "user", "content": safe_user_prompt}], None
+
+    monkeypatch.setattr(llm_service, "_read_cached_response", fake_read_cached_response)
+    monkeypatch.setattr(llm_service, "_prepare_messages_for_model", fake_prepare_messages_for_model)
+
+    context, messages, refusal = await llm_service._prepare_request(
+        "user-1",
+        "hello",
+        None,
+        mode="auto",
+    )
+
+    assert refusal is None
+    assert messages == [{"role": "user", "content": "hello"}]
+    assert call_modes == ["fast", "deep"]
+    assert context["execution_mode"] == "deep"
+    assert context["state"]["auto_escalated"] is True
 
 
 def test_build_json_metrics_record_uses_metrics_state_and_legacy_kwargs():

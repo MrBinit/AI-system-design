@@ -51,3 +51,67 @@ def test_mark_job_failed_preserves_invalid_payload_error(monkeypatch):
     llm_async_queue_service.mark_job_failed("job-3", "Invalid async job payload.")
 
     assert captured[0][1]["error"] == "Invalid async job payload."
+
+
+def test_append_job_trace_event_sanitizes_payload(monkeypatch):
+    captured = {}
+
+    class _FakeTable:
+        def update_item(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(llm_async_queue_service, "_dynamodb_table", lambda: _FakeTable())
+    monkeypatch.setattr(llm_async_queue_service, "_now_iso", lambda: "2026-03-11T00:00:00+00:00")
+
+    llm_async_queue_service.append_job_trace_event(
+        "job-4",
+        {
+            "type": "search_results",
+            "timestamp": "2026-03-11T00:00:01+00:00",
+            "payload": {"urls": ["https://example.edu"], "nested": {"value": "ok"}},
+        },
+    )
+
+    assert captured["Key"] == {"job_id": "job-4"}
+    new_event = captured["ExpressionAttributeValues"][":new_event"][0]
+    assert new_event["type"] == "search_results"
+    assert new_event["payload"]["urls"] == ["https://example.edu"]
+
+
+def test_enqueue_chat_job_persists_normalized_mode(monkeypatch):
+    captured_record = {}
+    captured_send = {}
+
+    monkeypatch.setattr(llm_async_queue_service.settings.queue, "llm_async_enabled", True)
+    monkeypatch.setattr(
+        llm_async_queue_service.settings.queue,
+        "llm_queue_url",
+        "https://sqs.us-east-1.amazonaws.com/123/queue",
+    )
+    monkeypatch.setattr(llm_async_queue_service.settings.queue, "llm_result_table", "tbl")
+    monkeypatch.setattr(llm_async_queue_service.settings.queue, "llm_result_ttl_days", 0)
+    monkeypatch.setattr(llm_async_queue_service, "_now_iso", lambda: "2026-03-30T00:00:00+00:00")
+    monkeypatch.setattr(
+        llm_async_queue_service,
+        "_put_initial_job",
+        lambda record: captured_record.update(record),
+    )
+
+    class _FakeSqs:
+        def send_message(self, **kwargs):
+            captured_send.update(kwargs)
+            return {"MessageId": "mid-1"}
+
+    monkeypatch.setattr(llm_async_queue_service, "_sqs_client", lambda: _FakeSqs())
+    monkeypatch.setattr(llm_async_queue_service, "_update_job", lambda *_args, **_kwargs: None)
+
+    response = llm_async_queue_service.enqueue_chat_job(
+        user_id="user-1",
+        prompt="hello",
+        session_id="session-1",
+        mode="DEEP",
+    )
+
+    assert response["status"] == "queued"
+    assert captured_record["mode"] == "deep"
+    assert '"mode": "deep"' in captured_send["MessageBody"]

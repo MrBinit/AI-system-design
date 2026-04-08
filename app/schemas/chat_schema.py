@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -16,6 +18,7 @@ class ChatRequest(BaseModel):
         pattern=r"^[A-Za-z0-9_.:@\-]+$",
     )
     prompt: str = Field(min_length=1, max_length=8000)
+    mode: Literal["auto", "fast", "deep"] = "auto"
 
 
 class AsyncChatEnqueueResponse(BaseModel):
@@ -38,6 +41,7 @@ class AsyncChatStatusResponse(BaseModel):
     completed_at: str = Field(default="", max_length=64)
     response: str = Field(default="", max_length=12000)
     error: str = Field(default="", max_length=2000)
+    trace_events: list[dict] = Field(default_factory=list)
 
 
 class ChatHistoryClearResponse(BaseModel):

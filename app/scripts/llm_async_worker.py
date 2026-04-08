@@ -11,6 +11,7 @@ import logging
 from app.core.config import get_settings
 from app.core.security import validate_security_configuration
 from app.services.llm_async_queue_service import (
+    append_job_trace_event,
     delete_llm_job_message,
     get_chat_job,
     mark_job_completed,
@@ -18,6 +19,7 @@ from app.services.llm_async_queue_service import (
     mark_job_processing,
     receive_llm_job_messages,
 )
+from app.services.chat_trace_service import trace_scope
 from app.services.llm_service import generate_response
 
 settings = get_settings()
@@ -32,6 +34,13 @@ def _parse_message_body(raw_body: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _safe_append_trace(job_id: str, event: dict) -> None:
+    try:
+        append_job_trace_event(job_id, event)
+    except Exception:
+        logger.warning("AsyncLLMTraceAppendFailed | job_id=%s", job_id)
+
+
 async def _process_message(message: dict) -> None:
     receipt_handle = str(message.get("ReceiptHandle", ""))
     payload = _parse_message_body(str(message.get("Body", "")))
@@ -39,6 +48,7 @@ async def _process_message(message: dict) -> None:
     user_id = str(payload.get("user_id", "")).strip()
     session_id = str(payload.get("session_id", user_id)).strip() or user_id
     prompt = str(payload.get("prompt", "")).strip()
+    mode = str(payload.get("mode", "auto")).strip().lower() or "auto"
 
     if not job_id or not user_id or not prompt:
         if job_id:
@@ -52,13 +62,50 @@ async def _process_message(message: dict) -> None:
         return
 
     mark_job_processing(job_id)
+    _safe_append_trace(
+        job_id,
+        {
+            "type": "job_processing_started",
+            "payload": {
+                "job_id": job_id,
+                "user_id": user_id,
+                "session_id": session_id,
+                "mode": mode,
+            },
+        },
+    )
+
+    def _trace_callback(event: dict) -> None:
+        _safe_append_trace(job_id, event)
+
     try:
-        answer = await generate_response(user_id, prompt, session_id=session_id)
+        with trace_scope(_trace_callback):
+            answer = await generate_response(user_id, prompt, session_id=session_id, mode=mode)
         mark_job_completed(job_id, answer)
+        _safe_append_trace(
+            job_id,
+            {
+                "type": "job_completed",
+                "payload": {
+                    "job_id": job_id,
+                    "answer_chars": len(str(answer)),
+                },
+            },
+        )
         delete_llm_job_message(receipt_handle)
     except Exception as exc:
         # Intentionally do not delete SQS message on failure so queue retries can happen.
         mark_job_failed(job_id, str(exc))
+        _safe_append_trace(
+            job_id,
+            {
+                "type": "job_failed",
+                "payload": {
+                    "job_id": job_id,
+                    "error": "Async chat job failed.",
+                },
+            },
+        )
         logger.exception("AsyncLLMJobFailed | job_id=%s", job_id)
 
 
