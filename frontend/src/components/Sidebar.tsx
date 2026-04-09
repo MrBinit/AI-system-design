@@ -1,7 +1,20 @@
 import { useEffect, useState } from "react";
 
-import { CloseIcon, MoonIcon, MoreHorizontalIcon, PlusIcon, SearchIcon, SettingsIcon, SunIcon, TrashIcon } from "./Icons";
+import {
+  CloseIcon,
+  MoonIcon,
+  MoreHorizontalIcon,
+  PinIcon,
+  PlusIcon,
+  SearchIcon,
+  SettingsIcon,
+  StarIcon,
+  SunIcon,
+  TrashIcon,
+} from "./Icons";
 import type { AuthSession, ConversationItem } from "../types";
+
+type ConversationDateFilter = "all" | "7d" | "30d";
 
 interface SidebarProps {
   auth: AuthSession;
@@ -10,9 +23,16 @@ interface SidebarProps {
   activeConversationId: string;
   searchQuery: string;
   onSearchChange: (value: string) => void;
+  dateFilter: ConversationDateFilter;
+  onDateFilterChange: (value: ConversationDateFilter) => void;
   onNewChat: () => void;
   onDeleteConversation: (conversation: ConversationItem) => Promise<void>;
   deletingConversationId: string | null;
+  isPinned: (conversationId: string) => boolean;
+  isStarred: (conversationId: string) => boolean;
+  onTogglePin: (conversationId: string) => void;
+  onToggleStar: (conversationId: string) => void;
+  onRenameConversation: (conversation: ConversationItem) => void;
   onSelectConversation: (conversation: ConversationItem) => void;
   onToggleTheme: () => void;
   darkMode: boolean;
@@ -31,16 +51,26 @@ function ConversationButton({
   active,
   menuOpen,
   deleting,
+  pinned,
+  starred,
   onToggleMenu,
   onDelete,
+  onTogglePin,
+  onToggleStar,
+  onRename,
   onClick,
 }: {
   item: ConversationItem;
   active: boolean;
   menuOpen: boolean;
   deleting: boolean;
+  pinned: boolean;
+  starred: boolean;
   onToggleMenu: () => void;
   onDelete: () => Promise<void>;
+  onTogglePin: () => void;
+  onToggleStar: () => void;
+  onRename: () => void;
   onClick: () => void;
 }) {
   return (
@@ -54,7 +84,11 @@ function ConversationButton({
             : "bg-white/70 text-slate-700 hover:bg-blue-50 dark:bg-slate-800/60 dark:text-slate-200 dark:hover:bg-slate-700"
         }`}
       >
-        <p className="truncate font-medium">{item.title}</p>
+        <p className="truncate font-medium">
+          {starred ? "★ " : ""}
+          {pinned ? "📌 " : ""}
+          {item.title}
+        </p>
         <p className={`truncate text-xs ${active ? "text-blue-100" : "text-slate-500 dark:text-slate-400"}`}>
           {new Date(item.createdAt).toLocaleDateString()}
         </p>
@@ -77,7 +111,40 @@ function ConversationButton({
       </button>
 
       {menuOpen ? (
-        <div className="absolute right-2 top-11 z-20 w-32 rounded-xl border border-blue-100 bg-white p-1.5 shadow-xl dark:border-slate-700 dark:bg-slate-900">
+        <div className="absolute right-2 top-11 z-20 w-44 rounded-xl border border-blue-100 bg-white p-1.5 shadow-xl dark:border-slate-700 dark:bg-slate-900">
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onTogglePin();
+            }}
+            className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-sm text-slate-700 transition hover:bg-blue-50 dark:text-slate-200 dark:hover:bg-slate-800"
+          >
+            <PinIcon className="h-4 w-4" />
+            {pinned ? "Unpin" : "Pin"}
+          </button>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleStar();
+            }}
+            className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-sm text-slate-700 transition hover:bg-blue-50 dark:text-slate-200 dark:hover:bg-slate-800"
+          >
+            <StarIcon className="h-4 w-4" />
+            {starred ? "Unstar" : "Star"}
+          </button>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onRename();
+            }}
+            className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-sm text-slate-700 transition hover:bg-blue-50 dark:text-slate-200 dark:hover:bg-slate-800"
+          >
+            <SettingsIcon className="h-4 w-4" />
+            Rename
+          </button>
           <button
             type="button"
             onClick={async (event) => {
@@ -103,9 +170,16 @@ export function Sidebar({
   activeConversationId,
   searchQuery,
   onSearchChange,
+  dateFilter,
+  onDateFilterChange,
   onNewChat,
   onDeleteConversation,
   deletingConversationId,
+  isPinned,
+  isStarred,
+  onTogglePin,
+  onToggleStar,
+  onRenameConversation,
   onSelectConversation,
   onToggleTheme,
   darkMode,
@@ -174,6 +248,15 @@ export function Sidebar({
             placeholder="Search conversations"
             className="mb-4 w-full rounded-xl border border-blue-100 bg-white px-3 py-2 text-sm outline-none focus:border-blue-300 focus:ring-2 focus:ring-blue-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
           />
+          <select
+            value={dateFilter}
+            onChange={(event) => onDateFilterChange(event.target.value as ConversationDateFilter)}
+            className="mb-3 w-full rounded-xl border border-blue-100 bg-white px-3 py-2 text-xs text-slate-600 outline-none focus:border-blue-300 focus:ring-2 focus:ring-blue-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+          >
+            <option value="all">All dates</option>
+            <option value="7d">Last 7 days</option>
+            <option value="30d">Last 30 days</option>
+          </select>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto pr-1">
@@ -189,10 +272,24 @@ export function Sidebar({
                   active={item.conversationId === activeConversationId}
                   menuOpen={menuConversationId === `primary-${item.conversationId}`}
                   deleting={deletingConversationId === item.conversationId}
+                  pinned={isPinned(item.conversationId)}
+                  starred={isStarred(item.conversationId)}
                   onToggleMenu={() => {
                     setMenuConversationId((prev) =>
                       prev === `primary-${item.conversationId}` ? null : `primary-${item.conversationId}`
                     );
+                  }}
+                  onTogglePin={() => {
+                    onTogglePin(item.conversationId);
+                    setMenuConversationId(null);
+                  }}
+                  onToggleStar={() => {
+                    onToggleStar(item.conversationId);
+                    setMenuConversationId(null);
+                  }}
+                  onRename={() => {
+                    onRenameConversation(item);
+                    setMenuConversationId(null);
                   }}
                   onDelete={async () => {
                     await onDeleteConversation(item);
@@ -224,10 +321,24 @@ export function Sidebar({
                   active={item.conversationId === activeConversationId}
                   menuOpen={menuConversationId === `recent-${item.conversationId}`}
                   deleting={deletingConversationId === item.conversationId}
+                  pinned={isPinned(item.conversationId)}
+                  starred={isStarred(item.conversationId)}
                   onToggleMenu={() => {
                     setMenuConversationId((prev) =>
                       prev === `recent-${item.conversationId}` ? null : `recent-${item.conversationId}`
                     );
+                  }}
+                  onTogglePin={() => {
+                    onTogglePin(item.conversationId);
+                    setMenuConversationId(null);
+                  }}
+                  onToggleStar={() => {
+                    onToggleStar(item.conversationId);
+                    setMenuConversationId(null);
+                  }}
+                  onRename={() => {
+                    onRenameConversation(item);
+                    setMenuConversationId(null);
                   }}
                   onDelete={async () => {
                     await onDeleteConversation(item);

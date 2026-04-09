@@ -33,6 +33,12 @@ export interface ChatMessage {
   content: string;
   createdAt: string;
   sourcePrompt?: string;
+  executionMode?: ChatExecutionMode;
+  workedForLabel?: string;
+  sourceUrls?: string[];
+  reasoningSteps?: string[];
+  searchedWebsites?: string[];
+  traceEvents?: TraceEventItem[];
   reaction?: ReactionType;
 }
 

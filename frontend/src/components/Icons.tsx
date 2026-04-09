@@ -122,3 +122,55 @@ export function MoreHorizontalIcon(props: IconProps) {
     </BaseIcon>
   );
 }
+
+export function StarIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <path d="m12 3 2.6 5.3L20 9l-4 3.9.9 5.5L12 15.8 7.1 18.4 8 12.9 4 9l5.4-.7L12 3Z" />
+    </BaseIcon>
+  );
+}
+
+export function PinIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <path d="M9 3h6l-1 5 3 3v2H7v-2l3-3-1-5Z" />
+      <path d="M12 13v8" />
+    </BaseIcon>
+  );
+}
+
+export function ActivityIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <path d="M3 12h4l2-4 4 8 2-4h6" />
+    </BaseIcon>
+  );
+}
+
+export function CheckCircleIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="m8.5 12 2.2 2.2 4.8-4.8" />
+    </BaseIcon>
+  );
+}
+
+export function GlobeIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18M12 3a14.5 14.5 0 0 1 0 18M12 3a14.5 14.5 0 0 0 0 18" />
+    </BaseIcon>
+  );
+}
+
+export function LinkIcon(props: IconProps) {
+  return (
+    <BaseIcon {...props}>
+      <path d="M10 13a5 5 0 0 1 0-7l1.5-1.5a5 5 0 1 1 7 7L17 13" />
+      <path d="M14 11a5 5 0 0 1 0 7L12.5 19.5a5 5 0 1 1-7-7L7 11" />
+    </BaseIcon>
+  );
+}

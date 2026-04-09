@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { ChatInput } from "./components/ChatInput";
+import { CheckCircleIcon, CloseIcon, GlobeIcon, LinkIcon, MenuIcon, SparklesIcon } from "./components/Icons";
 import { LoginPanel } from "./components/LoginPanel";
-import { MenuIcon, SparklesIcon } from "./components/Icons";
 import { MessageCard } from "./components/MessageCard";
 import { Sidebar } from "./components/Sidebar";
 import { clearChatHistory, fetchChatJobTrace, fetchConversations, loginWithPassword, streamChatResponse } from "./lib/api";
@@ -20,33 +20,19 @@ const AUTH_STORAGE_KEY = "ai.chat.frontend.auth";
 const THEME_STORAGE_KEY = "ai.chat.frontend.theme";
 const ACTIVE_JOB_STORAGE_KEY = "ai.chat.frontend.active_job_id";
 const CHAT_MODE_STORAGE_KEY = "ai.chat.frontend.mode";
+const CONVERSATION_META_STORAGE_KEY = "ai.chat.frontend.conversation_meta";
 
-type PipelineFinalStage = "pending" | "streaming" | "finalized" | "failed";
+type ConversationDateFilter = "all" | "7d" | "30d";
 
-interface PipelineTimelineItem {
-  key: string;
-  label: string;
-  detail: string;
-  timestamp?: string;
-  websites: string[];
+interface ConversationMeta {
+  pinned?: boolean;
+  starred?: boolean;
+  customTitle?: string;
 }
 
-interface PipelineView {
-  plannerType: string;
-  plannerLlm: string;
-  plannerSkippedReason: string;
-  plannedQueries: string[];
-  subquestions: string[];
-  retrievalQueries: string[];
-  websites: string[];
-  retrievalVerificationPassed: boolean | null;
-  answerVerificationPassed: boolean | null;
-  retrievalIssues: string[];
-  answerIssues: string[];
-  sourceUrls: string[];
-  finalStage: PipelineFinalStage;
-  finalizedAt: string;
-  timeline: PipelineTimelineItem[];
+interface PromptCommandResult {
+  prompt: string;
+  mode: ChatExecutionMode | null;
 }
 
 function makeId(): string {
@@ -86,6 +72,54 @@ function getStoredChatMode(): ChatExecutionMode {
     // ignore localStorage access failures and use default
   }
   return "auto";
+}
+
+function getStoredConversationMeta(): Record<string, ConversationMeta> {
+  try {
+    const raw = localStorage.getItem(CONVERSATION_META_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw) as Record<string, ConversationMeta>;
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function parsePromptCommands(rawInput: string, defaultMode: ChatExecutionMode): PromptCommandResult {
+  const text = rawInput.trim();
+  if (!text.startsWith("/")) {
+    return { prompt: text, mode: null };
+  }
+
+  const [rawCommand, ...rest] = text.split(/\s+/);
+  const command = rawCommand.toLowerCase();
+  const remaining = rest.join(" ").trim();
+  let modeOverride: ChatExecutionMode | null = null;
+  let prompt = remaining;
+
+  if (command === "/fast") {
+    modeOverride = "fast";
+  } else if (command === "/deep") {
+    modeOverride = "deep";
+  } else if (command === "/auto") {
+    modeOverride = "auto";
+  } else if (command === "/cite") {
+    prompt = remaining ? `${remaining}\n\nPlease include clear source citations.` : "";
+  } else if (command === "/summarize") {
+    prompt = remaining ? `Summarize clearly and concisely:\n\n${remaining}` : "";
+  } else if (command === "/web") {
+    prompt = remaining
+      ? `${remaining}\n\nPrioritize web retrieval and provide source links for all key claims.`
+      : "";
+    modeOverride = defaultMode === "fast" ? "fast" : "deep";
+  }
+
+  return { prompt: prompt.trim(), mode: modeOverride };
 }
 
 function mergeStreamText(current: string, incoming: string): string {
@@ -162,6 +196,11 @@ function displayWebsite(value: string): string {
   }
 }
 
+function extractUrlsFromText(input: string): string[] {
+  const matches = input.match(/https?:\/\/[^\s)"']+/gi) ?? [];
+  return Array.from(new Set(matches.map((item) => item.trim())));
+}
+
 const TRACE_EVENT_LABELS: Record<string, string> = {
   request_received: "Request received",
   query_plan_created: "Query plan created",
@@ -207,9 +246,13 @@ function traceTimeLabel(timestamp?: string): string {
   }
   const parsed = new Date(timestamp);
   if (!Number.isFinite(parsed.getTime())) {
-    return timestamp;
+    return "";
   }
-  return parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function compactUrlLabel(url: string): string {
+  return url.replace(/^https?:\/\//i, "").replace(/\/$/, "");
 }
 
 function formatDurationLabel(totalSeconds: number): string {
@@ -273,102 +316,6 @@ function extractTraceWebsites(payload?: Record<string, unknown>): string[] {
   return Array.from(urls);
 }
 
-function payloadString(payload: Record<string, unknown> | undefined, keys: string[]): string {
-  if (!payload) {
-    return "";
-  }
-  for (const key of keys) {
-    const value = payload[key];
-    if (typeof value === "string") {
-      const clean = value.trim();
-      if (clean) {
-        return clean;
-      }
-    }
-  }
-  return "";
-}
-
-function payloadBool(payload: Record<string, unknown> | undefined, keys: string[]): boolean | null {
-  if (!payload) {
-    return null;
-  }
-  for (const key of keys) {
-    const value = payload[key];
-    if (typeof value === "boolean") {
-      return value;
-    }
-    if (typeof value === "string") {
-      const normalized = value.trim().toLowerCase();
-      if (["true", "pass", "passed", "ok", "success"].includes(normalized)) return true;
-      if (["false", "fail", "failed", "error"].includes(normalized)) return false;
-    }
-  }
-  return null;
-}
-
-function payloadStringList(payload: Record<string, unknown> | undefined, keys: string[]): string[] {
-  if (!payload) {
-    return [];
-  }
-  const values: string[] = [];
-  const collect = (input: unknown) => {
-    if (typeof input === "string") {
-      const clean = input.trim();
-      if (clean) values.push(clean);
-      return;
-    }
-    if (Array.isArray(input)) {
-      for (const item of input) collect(item);
-      return;
-    }
-    if (input && typeof input === "object") {
-      const record = input as Record<string, unknown>;
-      const candidateFields = [
-        "text",
-        "query",
-        "question",
-        "issue",
-        "reason",
-        "url",
-        "source_url",
-        "title",
-        "message",
-      ];
-      for (const field of candidateFields) {
-        const value = record[field];
-        if (typeof value === "string") {
-          const clean = value.trim();
-          if (clean) values.push(clean);
-        }
-      }
-    }
-  };
-  for (const key of keys) {
-    collect(payload[key]);
-  }
-  return Array.from(new Set(values));
-}
-
-function payloadNumber(payload: Record<string, unknown> | undefined, keys: string[]): number | null {
-  if (!payload) {
-    return null;
-  }
-  for (const key of keys) {
-    const value = payload[key];
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return value;
-    }
-    if (typeof value === "string") {
-      const parsed = Number(value);
-      if (Number.isFinite(parsed)) {
-        return parsed;
-      }
-    }
-  }
-  return null;
-}
-
 function extractTraceUrls(payload?: Record<string, unknown>): string[] {
   if (!payload) {
     return [];
@@ -402,54 +349,6 @@ function extractTraceUrls(payload?: Record<string, unknown>): string[] {
   return Array.from(urls);
 }
 
-function traceEventDetail(type: string, payload?: Record<string, unknown>): string {
-  const normalized = type.trim().toLowerCase();
-  const query = payloadString(payload, ["query", "search_query"]);
-  const queries = payloadStringList(payload, ["queries", "search_queries", "planned_queries"]).slice(0, 2);
-  const reason = payloadString(payload, ["reason", "skip_reason", "message"]);
-
-  if (normalized === "query_planner_started" || normalized === "query_plan_created") {
-    const planner = payloadString(payload, ["planner_type", "planner", "type", "strategy"]);
-    const llm = payloadString(payload, ["llm_used", "planner_llm", "model", "llm"]);
-    return [planner ? `planner: ${planner}` : "", llm ? `llm: ${llm}` : ""].filter(Boolean).join(" | ");
-  }
-  if (normalized === "query_planner_skipped" || normalized === "web_retrieval_skipped") {
-    return reason ? `reason: ${reason}` : "";
-  }
-  if (normalized === "search_started") {
-    if (query) return `query: ${query}`;
-    if (queries.length) return `queries: ${queries.join(" | ")}`;
-    return "";
-  }
-  if (normalized === "search_results") {
-    const resultCount = payloadNumber(payload, ["result_count", "results_count", "num_results", "count"]);
-    return resultCount !== null ? `${resultCount} results` : "";
-  }
-  if (normalized === "pages_read") {
-    const pages = payloadNumber(payload, ["pages_read", "page_count", "documents_read"]);
-    return pages !== null ? `${pages} pages` : "";
-  }
-  if (normalized === "gaps_identified") {
-    const firstGap = payloadStringList(payload, ["gaps", "issues", "missing_points"])[0];
-    return firstGap ? `gap: ${firstGap}` : "";
-  }
-  if (normalized === "retrieval_verification" || normalized === "answer_verification_completed") {
-    const passed = payloadBool(payload, ["verified", "passed", "ok", "is_valid"]);
-    if (passed === true) return "passed";
-    if (passed === false) return "failed";
-    return "";
-  }
-  if (normalized === "model_round_started" || normalized === "model_round_completed") {
-    const model = payloadString(payload, ["model", "llm", "llm_used"]);
-    const round = payloadString(payload, ["round", "round_id"]);
-    return [round ? `round: ${round}` : "", model ? `model: ${model}` : ""].filter(Boolean).join(" | ");
-  }
-  if (normalized === "job_failed") {
-    return reason ? `error: ${reason}` : "";
-  }
-  return "";
-}
-
 function isLowSignalReasoningStep(step: string): boolean {
   const normalized = step.trim().toLowerCase();
   return (
@@ -475,16 +374,21 @@ export default function App() {
   const [activeJobId, setActiveJobId] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
+  const [conversationMetaById, setConversationMetaById] = useState<Record<string, ConversationMeta>>(
+    () => getStoredConversationMeta()
+  );
   const [searchQuery, setSearchQuery] = useState("");
+  const [conversationDateFilter, setConversationDateFilter] = useState<ConversationDateFilter>("all");
   const [activeConversationId, setActiveConversationId] = useState("");
   const [inputValue, setInputValue] = useState("");
   const [loginError, setLoginError] = useState("");
   const [isLoadingLogin, setIsLoadingLogin] = useState(false);
   const [isSending, setIsSending] = useState(false);
-  const [hasReceivedChunk, setHasReceivedChunk] = useState(false);
   const [deletingConversationId, setDeletingConversationId] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [isWorkLogOpen, setIsWorkLogOpen] = useState(false);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const [autoScrollPaused, setAutoScrollPaused] = useState(false);
+  const [activeActivityMessageId, setActiveActivityMessageId] = useState("");
 
   const chatContainerRef = useRef<HTMLDivElement | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
@@ -492,10 +396,17 @@ export default function App() {
   const streamAbortControllerRef = useRef<AbortController | null>(null);
 
   const scrollToBottom = (behavior: ScrollBehavior, force = false) => {
+    if (!force && autoScrollPaused) {
+      return;
+    }
     if (!force && !shouldAutoScrollRef.current) {
       return;
     }
+    if (force) {
+      shouldAutoScrollRef.current = true;
+    }
     messageEndRef.current?.scrollIntoView({ behavior, block: "end" });
+    setShowJumpToLatest(false);
   };
 
   const handleChatScroll = () => {
@@ -503,10 +414,12 @@ export default function App() {
     if (!container) {
       return;
     }
-    const threshold = 80;
+    const threshold = 120;
     const distanceFromBottom =
       container.scrollHeight - container.scrollTop - container.clientHeight;
-    shouldAutoScrollRef.current = distanceFromBottom <= threshold;
+    const isNearBottom = distanceFromBottom <= threshold;
+    shouldAutoScrollRef.current = isNearBottom;
+    setShowJumpToLatest(!isNearBottom);
   };
 
   useEffect(() => {
@@ -519,8 +432,24 @@ export default function App() {
   }, [chatMode]);
 
   useEffect(() => {
-    scrollToBottom(isSending ? "auto" : "smooth", isSending);
-  }, [messages, isSending]);
+    localStorage.setItem(CONVERSATION_META_STORAGE_KEY, JSON.stringify(conversationMetaById));
+  }, [conversationMetaById]);
+
+  useEffect(() => {
+    scrollToBottom(isSending ? "auto" : "smooth");
+  }, [autoScrollPaused, isSending, messages]);
+
+  useEffect(() => {
+    if (!isSending && !isAwaitingFirstChunk) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      scrollToBottom("auto");
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+    };
+  }, [isAwaitingFirstChunk, isSending, reasoningSteps, searchedWebsites, workLogEvents]);
 
   useEffect(() => {
     const session = auth;
@@ -640,18 +569,67 @@ export default function App() {
     };
   }, [auth, activeJobId, isSending]);
 
+  useEffect(() => {
+    if (!activeActivityMessageId) {
+      return;
+    }
+    const exists = messages.some((message) => message.id === activeActivityMessageId);
+    if (!exists) {
+      setActiveActivityMessageId("");
+    }
+  }, [activeActivityMessageId, messages]);
+
+  const enrichedConversations = useMemo(() => {
+    return conversations.map((item) => {
+      const meta = conversationMetaById[item.conversationId] ?? {};
+      const customTitle = String(meta.customTitle ?? "").trim();
+      return {
+        ...item,
+        title: customTitle || item.title,
+      };
+    });
+  }, [conversationMetaById, conversations]);
+
   const filteredConversations = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
-    if (!query) return conversations;
-    return conversations.filter(
-      (item) =>
-        item.title.toLowerCase().includes(query) ||
-        item.prompt.toLowerCase().includes(query) ||
-        item.answer.toLowerCase().includes(query)
-    );
-  }, [conversations, searchQuery]);
+    const now = Date.now();
+    const cutoffMs =
+      conversationDateFilter === "7d"
+        ? 7 * 24 * 60 * 60 * 1000
+        : conversationDateFilter === "30d"
+          ? 30 * 24 * 60 * 60 * 1000
+          : null;
+    return enrichedConversations
+      .filter((item) => {
+        if (query) {
+          const matches =
+            item.title.toLowerCase().includes(query) ||
+            item.prompt.toLowerCase().includes(query) ||
+            item.answer.toLowerCase().includes(query);
+          if (!matches) {
+            return false;
+          }
+        }
+        if (cutoffMs === null) {
+          return true;
+        }
+        const createdAtMs = new Date(item.createdAt).getTime();
+        return Number.isFinite(createdAtMs) && now - createdAtMs <= cutoffMs;
+      })
+      .sort((a, b) => {
+        const aMeta = conversationMetaById[a.conversationId] ?? {};
+        const bMeta = conversationMetaById[b.conversationId] ?? {};
+        if (Boolean(aMeta.pinned) !== Boolean(bMeta.pinned)) {
+          return aMeta.pinned ? -1 : 1;
+        }
+        if (Boolean(aMeta.starred) !== Boolean(bMeta.starred)) {
+          return aMeta.starred ? -1 : 1;
+        }
+        return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      });
+  }, [conversationDateFilter, conversationMetaById, enrichedConversations, searchQuery]);
 
-  const yourConversations = useMemo(() => filteredConversations.slice(0, 12), [filteredConversations]);
+  const yourConversations = useMemo(() => filteredConversations.slice(0, 24), [filteredConversations]);
 
   const lastSevenDays = useMemo(() => {
     const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
@@ -661,184 +639,36 @@ export default function App() {
     });
   }, [filteredConversations]);
 
-  const pipelineView = useMemo<PipelineView>(() => {
-    const plannedQueries = new Set<string>();
-    const subquestions = new Set<string>();
-    const retrievalQueries = new Set<string>();
-    const websites = new Set<string>();
-    const sourceUrls = new Set<string>();
-    const retrievalIssues = new Set<string>();
-    const answerIssues = new Set<string>();
-    const timeline: PipelineTimelineItem[] = [];
-
-    let plannerType = "";
-    let plannerLlm = "";
-    let plannerSkippedReason = "";
-    let retrievalVerificationPassed: boolean | null = null;
-    let answerVerificationPassed: boolean | null = null;
-    let finalStage: PipelineFinalStage = hasReceivedChunk ? "streaming" : "pending";
-    let finalizedAt = "";
-
-    workLogEvents.forEach((trace, index) => {
-      const eventType = trace.type.trim().toLowerCase();
-      const payload = trace.payload;
-      for (const site of extractTraceWebsites(payload)) {
-        websites.add(site);
-      }
-      for (const url of extractTraceUrls(payload)) {
-        sourceUrls.add(url);
-      }
-
-      if (
-        eventType === "query_plan_created" ||
-        eventType === "query_planner_started" ||
-        eventType === "query_planner_completed"
-      ) {
-        plannerType =
-          plannerType || payloadString(payload, ["planner_type", "planner", "type", "strategy"]);
-        plannerLlm =
-          plannerLlm || payloadString(payload, ["llm_used", "planner_llm", "model", "llm"]);
-        for (const query of payloadStringList(payload, ["planned_queries", "queries"])) {
-          plannedQueries.add(query);
-        }
-        for (const question of payloadStringList(payload, ["subquestions", "sub_questions"])) {
-          subquestions.add(question);
-        }
-      }
-
-      if (eventType === "query_planner_skipped") {
-        plannerSkippedReason =
-          plannerSkippedReason || payloadString(payload, ["reason", "skip_reason", "message"]);
-      }
-
-      if (eventType === "search_started" || eventType === "search_results") {
-        for (const query of payloadStringList(payload, ["query", "queries", "search_queries"])) {
-          retrievalQueries.add(query);
-        }
-      }
-
-      if (eventType === "retrieval_verification") {
-        retrievalVerificationPassed = payloadBool(payload, ["verified", "passed", "ok", "is_valid"]);
-        for (const issue of payloadStringList(payload, ["issues", "gaps", "problems"])) {
-          retrievalIssues.add(issue);
-        }
-      }
-
-      if (eventType === "gaps_identified") {
-        for (const issue of payloadStringList(payload, ["gaps", "issues"])) {
-          retrievalIssues.add(issue);
-        }
-      }
-
-      if (eventType === "answer_verification_completed") {
-        answerVerificationPassed = payloadBool(payload, ["verified", "passed", "ok", "is_valid"]);
-        for (const issue of payloadStringList(payload, ["issues", "problems"])) {
-          answerIssues.add(issue);
-        }
-      }
-
-      if (eventType === "answer_finalized" || eventType === "job_completed") {
-        finalStage = "finalized";
-        finalizedAt = trace.timestamp ?? finalizedAt;
-      }
-      if (eventType === "job_failed") {
-        finalStage = "failed";
-      }
-
-      timeline.push({
-        key: `${trace.type}-${trace.timestamp ?? index}`,
-        label: traceLabel(trace.type),
-        detail: traceEventDetail(trace.type, trace.payload),
-        timestamp: trace.timestamp,
-        websites: extractTraceWebsites(trace.payload).slice(0, 3),
-      });
-    });
-
-    if (hasReceivedChunk && finalStage === "pending") {
-      finalStage = "streaming";
+  const followUpChips = useMemo(() => {
+    const hasAssistantAnswer = messages.some((message) => message.role === "assistant");
+    if (!hasAssistantAnswer) {
+      return [
+        "Give me a quick overview",
+        "What should I ask next?",
+        "Summarize this topic in bullets",
+      ];
     }
-
-    return {
-      plannerType,
-      plannerLlm,
-      plannerSkippedReason,
-      plannedQueries: Array.from(plannedQueries),
-      subquestions: Array.from(subquestions),
-      retrievalQueries: Array.from(retrievalQueries),
-      websites: Array.from(websites),
-      retrievalVerificationPassed,
-      answerVerificationPassed,
-      retrievalIssues: Array.from(retrievalIssues),
-      answerIssues: Array.from(answerIssues),
-      sourceUrls: Array.from(sourceUrls),
-      finalStage,
-      finalizedAt,
-      timeline: timeline.slice(-80),
-    };
-  }, [hasReceivedChunk, workLogEvents]);
-
-  const sourceWebsiteChips = useMemo(
-    () => mergeUniqueStrings(pipelineView.websites, searchedWebsites, 20),
-    [pipelineView.websites, searchedWebsites]
-  );
-  const showPipelinePanel = workLogEvents.length > 0 || pipelineView.sourceUrls.length > 0 || sourceWebsiteChips.length > 0;
-  const workLogEventCount = pipelineView.timeline.length;
-  const workedDurationLabel = useMemo(() => {
-    const traceTimes = workLogEvents
-      .map((event) => (event.timestamp ? new Date(event.timestamp).getTime() : Number.NaN))
-      .filter((value) => Number.isFinite(value));
-    if (!traceTimes.length) {
-      return "0s";
+    return [
+      "Summarize this in 5 bullets",
+      "What are the risks and tradeoffs?",
+      "Compare top options in a table",
+      "Give me a step-by-step action plan",
+    ];
+  }, [messages]);
+  const selectedActivityMessage = useMemo(() => {
+    if (!activeActivityMessageId) {
+      return null;
     }
-    const startedAt = Math.min(...traceTimes);
-    let endedAt = Math.max(...traceTimes);
-    if (pipelineView.finalizedAt) {
-      const finalizedAtMs = new Date(pipelineView.finalizedAt).getTime();
-      if (Number.isFinite(finalizedAtMs)) {
-        endedAt = Math.max(endedAt, finalizedAtMs);
-      }
+    return messages.find((message) => message.id === activeActivityMessageId) ?? null;
+  }, [activeActivityMessageId, messages]);
+  const selectedActivitySources = useMemo(() => {
+    if (!selectedActivityMessage) {
+      return [];
     }
-    if (pipelineView.finalStage === "pending" || pipelineView.finalStage === "streaming") {
-      endedAt = Math.max(endedAt, Date.now());
-    }
-    return formatDurationLabel((endedAt - startedAt) / 1000);
-  }, [pipelineView.finalStage, pipelineView.finalizedAt, workLogEvents]);
-  const plannerSummary = pipelineView.plannerSkippedReason
-    ? `Skipped: ${pipelineView.plannerSkippedReason}`
-    : pipelineView.plannerType
-      ? `${pipelineView.plannerType}${pipelineView.plannerLlm ? ` (${pipelineView.plannerLlm})` : ""}`
-      : "Pending";
-  const retrievalCheckStatus =
-    pipelineView.retrievalVerificationPassed === true
-      ? "Passed"
-      : pipelineView.retrievalVerificationPassed === false
-        ? "Failed"
-        : "Pending";
-  const answerCheckStatus =
-    pipelineView.answerVerificationPassed === true
-      ? "Passed"
-      : pipelineView.answerVerificationPassed === false
-        ? "Failed"
-        : "Pending";
-  const finalStatusLabel =
-    pipelineView.finalStage === "finalized"
-      ? "Finalized"
-      : pipelineView.finalStage === "failed"
-        ? "Failed"
-        : pipelineView.finalStage === "streaming"
-          ? "Streaming"
-          : "Pending";
-  const visitedWebsiteCount = useMemo(() => {
-    const websites = new Set<string>();
-    for (const url of pipelineView.sourceUrls) {
-      websites.add(displayWebsite(url));
-    }
-    for (const site of sourceWebsiteChips) {
-      websites.add(site);
-    }
-    return websites.size;
-  }, [pipelineView.sourceUrls, sourceWebsiteChips]);
-  const verificationIssueCount = pipelineView.retrievalIssues.length + pipelineView.answerIssues.length;
+    const messageSources = selectedActivityMessage.sourceUrls ?? [];
+    const inlineSources = extractUrlsFromText(selectedActivityMessage.content);
+    return Array.from(new Set([...messageSources, ...inlineSources])).slice(0, 30);
+  }, [selectedActivityMessage]);
 
   const updateMessage = (messageId: string, updater: (message: ChatMessage) => ChatMessage) => {
     setMessages((prev) => prev.map((item) => (item.id === messageId ? updater(item) : item)));
@@ -850,7 +680,11 @@ export default function App() {
     setConversations(history);
   };
 
-  const sendPrompt = async (prompt: string, includeUserMessage = true) => {
+  const sendPrompt = async (
+    prompt: string,
+    includeUserMessage = true,
+    options?: { modeOverride?: ChatExecutionMode; statusLabel?: string }
+  ) => {
     if (!auth || isSending) {
       return;
     }
@@ -860,17 +694,18 @@ export default function App() {
       return;
     }
 
+    const requestedMode = options?.modeOverride ?? chatMode;
+
     setIsSending(true);
     setStatusError(false);
-    setStatusText(includeUserMessage ? "Submitting prompt..." : "Regenerating response...");
+    setStatusText(options?.statusLabel ?? (includeUserMessage ? "Submitting prompt..." : "Regenerating response..."));
     setCanCancelQueued(false);
     setIsAwaitingFirstChunk(true);
     setReasoningSteps([]);
     setSearchedWebsites([]);
     setWorkLogEvents([]);
-    setIsWorkLogOpen(false);
+    setActiveActivityMessageId("");
     setActiveJobId("");
-    setHasReceivedChunk(false);
     localStorage.removeItem(ACTIVE_JOB_STORAGE_KEY);
     const streamAbortController = new AbortController();
     streamAbortControllerRef.current = streamAbortController;
@@ -895,6 +730,7 @@ export default function App() {
       content: "Thinking...",
       createdAt: new Date().toISOString(),
       sourcePrompt: cleanPrompt,
+      executionMode: requestedMode,
       reaction: null,
     };
 
@@ -910,6 +746,11 @@ export default function App() {
     const waitingFrames = ["", ".", "..", "..."];
     let waitingFrameIndex = 0;
     const pendingStartedAt = Date.now();
+    const traceSourceUrls = new Set<string>();
+    const traceTimestampMs: number[] = [];
+    let messageReasoningSteps: string[] = [];
+    let messageSearchedWebsites: string[] = [];
+    const messageTraceEvents: TraceEventItem[] = [];
     let latestServerStatus = "queued";
     const thinkingInterval = window.setInterval(() => {
       if (firstTokenReceived) {
@@ -940,6 +781,7 @@ export default function App() {
       if (!filtered.length) {
         return;
       }
+      messageReasoningSteps = mergeUniqueStrings(messageReasoningSteps, filtered, 12);
       setReasoningSteps((prev) => mergeUniqueStrings(prev, filtered, 8));
     };
     const addSearchedWebsites = (websites: string[] | undefined) => {
@@ -947,6 +789,7 @@ export default function App() {
         return;
       }
       const normalized = websites.map(displayWebsite);
+      messageSearchedWebsites = mergeUniqueStrings(messageSearchedWebsites, normalized, 15);
       setSearchedWebsites((prev) => mergeUniqueStrings(prev, normalized, 8));
     };
     const setCurrentJob = (jobId: string | undefined) => {
@@ -961,11 +804,38 @@ export default function App() {
       if (!trace) {
         return;
       }
+      messageTraceEvents.push(trace);
+      for (const url of extractTraceUrls(trace.payload)) {
+        traceSourceUrls.add(url);
+      }
+      if (trace.timestamp) {
+        const traceTimeMs = new Date(trace.timestamp).getTime();
+        if (Number.isFinite(traceTimeMs)) {
+          traceTimestampMs.push(traceTimeMs);
+        }
+      }
       setWorkLogEvents((prev) => mergeTraceEvents(prev, [trace]));
       addReasoningSteps([traceLabel(trace.type)]);
       addSearchedWebsites(extractTraceWebsites(trace.payload));
       setStatusText(`Status: ${traceLabel(trace.type)}`);
       setStatusError(false);
+    };
+    const finalizeAssistantMeta = (content: string) => {
+      const finalizedAt = Date.now();
+      const startedAt = traceTimestampMs.length ? Math.min(pendingStartedAt, ...traceTimestampMs) : pendingStartedAt;
+      const endedAt = traceTimestampMs.length ? Math.max(finalizedAt, ...traceTimestampMs) : finalizedAt;
+      const workedForLabel = formatDurationLabel((endedAt - startedAt) / 1000);
+      const sourceUrls = Array.from(
+        new Set([...traceSourceUrls, ...extractUrlsFromText(content)])
+      ).slice(0, 12);
+      updateMessage(assistantId, (item) => ({
+        ...item,
+        workedForLabel,
+        sourceUrls,
+        reasoningSteps: messageReasoningSteps,
+        searchedWebsites: messageSearchedWebsites,
+        traceEvents: messageTraceEvents.slice(-50),
+      }));
     };
     const maybeResolvePump = () => {
       if (pumpResolved || !doneReceived) {
@@ -1006,7 +876,7 @@ export default function App() {
           userId: auth.userId,
           sessionId: auth.sessionId || auth.userId,
           prompt: cleanPrompt,
-          mode: chatMode,
+          mode: requestedMode,
         },
         (event: StreamEvent) => {
           if (event.type === "queued") {
@@ -1060,7 +930,6 @@ export default function App() {
               startRenderPump();
               setCanCancelQueued(false);
               setIsAwaitingFirstChunk(false);
-              setHasReceivedChunk(true);
             }
             streamTargetText = mergeStreamText(streamTargetText, delta);
             setStatusText("Streaming response...");
@@ -1101,6 +970,7 @@ export default function App() {
         setStatusText("Complete");
         setStatusError(false);
       }
+      finalizeAssistantMeta(streamTargetText || streamRenderedText);
 
       setInputValue("");
       await refreshHistory();
@@ -1113,14 +983,31 @@ export default function App() {
         (error instanceof DOMException && error.name === "AbortError") ||
         (error instanceof Error && error.name === "AbortError");
       if (isAbortError) {
-        updateMessage(assistantId, (item) => ({ ...item, content: "Request canceled." }));
+        updateMessage(assistantId, (item) => ({
+          ...item,
+          content: "Request canceled.",
+          workedForLabel: formatDurationLabel((Date.now() - pendingStartedAt) / 1000),
+          sourceUrls: Array.from(traceSourceUrls),
+          reasoningSteps: messageReasoningSteps,
+          searchedWebsites: messageSearchedWebsites,
+          traceEvents: messageTraceEvents.slice(-50),
+        }));
         setActiveJobId("");
         localStorage.removeItem(ACTIVE_JOB_STORAGE_KEY);
         setStatusText("Request canceled.");
         setStatusError(false);
       } else {
         const message = error instanceof Error ? error.message : "Chat request failed.";
-        updateMessage(assistantId, (item) => ({ ...item, content: `Error: ${message}` }));
+        const errorText = `Error: ${message}`;
+        updateMessage(assistantId, (item) => ({
+          ...item,
+          content: errorText,
+          workedForLabel: formatDurationLabel((Date.now() - pendingStartedAt) / 1000),
+          sourceUrls: Array.from(new Set([...traceSourceUrls, ...extractUrlsFromText(errorText)])).slice(0, 12),
+          reasoningSteps: messageReasoningSteps,
+          searchedWebsites: messageSearchedWebsites,
+          traceEvents: messageTraceEvents.slice(-50),
+        }));
         setActiveJobId("");
         localStorage.removeItem(ACTIVE_JOB_STORAGE_KEY);
         setStatusText(message);
@@ -1177,9 +1064,8 @@ export default function App() {
     setReasoningSteps([]);
     setSearchedWebsites([]);
     setWorkLogEvents([]);
-    setIsWorkLogOpen(false);
+    setActiveActivityMessageId("");
     setActiveJobId("");
-    setHasReceivedChunk(false);
     localStorage.removeItem(ACTIVE_JOB_STORAGE_KEY);
     setMessages([
       {
@@ -1196,6 +1082,7 @@ export default function App() {
         content: conversation.answer,
         createdAt: conversation.createdAt,
         sourcePrompt: conversation.prompt,
+        sourceUrls: extractUrlsFromText(conversation.answer).slice(0, 12),
         reaction: null,
       },
     ]);
@@ -1207,8 +1094,47 @@ export default function App() {
     await sendPrompt(sourcePrompt, false);
   };
 
+  const handleRegenerateInDeep = async (sourcePrompt: string) => {
+    await sendPrompt(sourcePrompt, false, { modeOverride: "deep", statusLabel: "Regenerating in deep mode..." });
+  };
+
+  const handleRetryWebOnly = async (sourcePrompt: string) => {
+    const webFirstPrompt = `${sourcePrompt}\n\nPrioritize web retrieval and include direct source URLs for key claims.`;
+    await sendPrompt(webFirstPrompt, false, { modeOverride: "deep", statusLabel: "Retrying with web-first strategy..." });
+  };
+
   const handleReaction = (messageId: string, reaction: ReactionType) => {
     updateMessage(messageId, (item) => ({ ...item, reaction }));
+  };
+
+  const handleOpenActivity = (messageId: string) => {
+    setActiveActivityMessageId(messageId);
+  };
+
+  const handleSubmitFromComposer = async (rawInput: string) => {
+    const parsed = parsePromptCommands(rawInput, chatMode);
+    if (!parsed.prompt) {
+      setStatusText("Write a prompt after the slash command.");
+      setStatusError(true);
+      return;
+    }
+    if (parsed.mode && parsed.mode !== chatMode) {
+      setChatMode(parsed.mode);
+    }
+    await sendPrompt(parsed.prompt, true, {
+      modeOverride: parsed.mode ?? chatMode,
+      statusLabel: parsed.mode ? `Submitting prompt in ${parsed.mode} mode...` : "Submitting prompt...",
+    });
+  };
+
+  const handleStopGeneration = () => {
+    if (!isSending) {
+      return;
+    }
+    setStatusText("Stopping generation...");
+    setStatusError(false);
+    setCanCancelQueued(false);
+    streamAbortControllerRef.current?.abort();
   };
 
   const handleDeleteConversation = async (conversation: ConversationItem) => {
@@ -1225,6 +1151,11 @@ export default function App() {
       setConversations((prev) =>
         prev.filter((item) => item.conversationId !== conversation.conversationId)
       );
+      setConversationMetaById((prev) => {
+        const next = { ...prev };
+        delete next[conversation.conversationId];
+        return next;
+      });
       if (activeConversationId === conversation.conversationId) {
         setMessages([]);
         setActiveConversationId("");
@@ -1241,6 +1172,55 @@ export default function App() {
     }
   };
 
+  const isPinnedConversation = (conversationId: string) =>
+    Boolean(conversationMetaById[conversationId]?.pinned);
+  const isStarredConversation = (conversationId: string) =>
+    Boolean(conversationMetaById[conversationId]?.starred);
+
+  const handleTogglePinnedConversation = (conversationId: string) => {
+    setConversationMetaById((prev) => {
+      const current = prev[conversationId] ?? {};
+      return {
+        ...prev,
+        [conversationId]: {
+          ...current,
+          pinned: !current.pinned,
+        },
+      };
+    });
+  };
+
+  const handleToggleStarredConversation = (conversationId: string) => {
+    setConversationMetaById((prev) => {
+      const current = prev[conversationId] ?? {};
+      return {
+        ...prev,
+        [conversationId]: {
+          ...current,
+          starred: !current.starred,
+        },
+      };
+    });
+  };
+
+  const handleRenameConversation = (conversation: ConversationItem) => {
+    const nextTitle = window.prompt("Rename conversation", conversation.title);
+    if (nextTitle === null) {
+      return;
+    }
+    const trimmed = nextTitle.trim();
+    setConversationMetaById((prev) => {
+      const current = prev[conversation.conversationId] ?? {};
+      return {
+        ...prev,
+        [conversation.conversationId]: {
+          ...current,
+          customTitle: trimmed || undefined,
+        },
+      };
+    });
+  };
+
   const handleLogout = () => {
     streamAbortControllerRef.current?.abort();
     streamAbortControllerRef.current = null;
@@ -1254,9 +1234,8 @@ export default function App() {
     setReasoningSteps([]);
     setSearchedWebsites([]);
     setWorkLogEvents([]);
-    setIsWorkLogOpen(false);
+    setActiveActivityMessageId("");
     setActiveJobId("");
-    setHasReceivedChunk(false);
     setCanCancelQueued(false);
     setIsAwaitingFirstChunk(false);
     setStatusText("Signed out");
@@ -1276,15 +1255,16 @@ export default function App() {
         activeConversationId={activeConversationId}
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
+        dateFilter={conversationDateFilter}
+        onDateFilterChange={setConversationDateFilter}
         onNewChat={() => {
           setMessages([]);
           setActiveConversationId("");
           setReasoningSteps([]);
           setSearchedWebsites([]);
           setWorkLogEvents([]);
-          setIsWorkLogOpen(false);
+          setActiveActivityMessageId("");
           setActiveJobId("");
-          setHasReceivedChunk(false);
           localStorage.removeItem(ACTIVE_JOB_STORAGE_KEY);
           setStatusText("New chat started");
           setStatusError(false);
@@ -1295,6 +1275,11 @@ export default function App() {
           setIsSidebarOpen(false);
         }}
         deletingConversationId={deletingConversationId}
+        isPinned={isPinnedConversation}
+        isStarred={isStarredConversation}
+        onTogglePin={handleTogglePinnedConversation}
+        onToggleStar={handleToggleStarredConversation}
+        onRenameConversation={handleRenameConversation}
         onSelectConversation={handleConversationSelect}
         onToggleTheme={() => setDarkMode((prev) => !prev)}
         darkMode={darkMode}
@@ -1357,13 +1342,13 @@ export default function App() {
                   </details>
                 ) : null}
               </div>
-              {canCancelQueued ? (
+              {isSending ? (
                 <button
                   type="button"
-                  onClick={handleCancelQueuedRequest}
+                  onClick={canCancelQueued ? handleCancelQueuedRequest : handleStopGeneration}
                   className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100 dark:border-amber-800 dark:bg-amber-900/30 dark:text-amber-200 dark:hover:bg-amber-900/40"
                 >
-                  Cancel
+                  {canCancelQueued ? "Cancel queued" : "Stop generation"}
                 </button>
               ) : null}
               <button
@@ -1382,122 +1367,7 @@ export default function App() {
           onScroll={handleChatScroll}
           className="h-[calc(100vh-154px)] overflow-y-auto"
         >
-          <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col gap-6 px-4 pb-44 pt-8">
-            {showPipelinePanel ? (
-              <section className="rounded-2xl border border-blue-200 bg-white/80 p-4 shadow-soft dark:border-slate-700 dark:bg-slate-900/70">
-                <button
-                  type="button"
-                  onClick={() => setIsWorkLogOpen((prev) => !prev)}
-                  className="flex w-full items-center gap-3 text-left"
-                >
-                  <span className="h-px flex-1 bg-blue-100 dark:bg-slate-700" />
-                  <span className="inline-flex items-center gap-2 rounded-full border border-blue-200 bg-white px-4 py-1.5 text-base font-medium text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200">
-                    Worked for {workedDurationLabel}
-                    <span aria-hidden="true" className="text-base leading-none text-slate-500 dark:text-slate-300">
-                      {isWorkLogOpen ? "▾" : "▸"}
-                    </span>
-                  </span>
-                  <span className="h-px flex-1 bg-blue-100 dark:bg-slate-700" />
-                </button>
-
-                {isWorkLogOpen ? (
-                  <div className="mt-3 max-h-[44vh] space-y-3 overflow-y-auto pr-1">
-                    <div className="grid gap-2 sm:grid-cols-2">
-                      <article className="rounded-xl border border-blue-100 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                          Planner
-                        </p>
-                        <p className="mt-1 text-sm text-slate-700 dark:text-slate-200">{plannerSummary}</p>
-                      </article>
-                      <article className="rounded-xl border border-blue-100 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                          Retrieval
-                        </p>
-                        <p className="mt-1 text-sm text-slate-700 dark:text-slate-200">
-                          {pipelineView.retrievalQueries.length} queries, {visitedWebsiteCount} websites
-                        </p>
-                      </article>
-                      <article className="rounded-xl border border-blue-100 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                          Verification
-                        </p>
-                        <p className="mt-1 text-sm text-slate-700 dark:text-slate-200">
-                          Retrieval {retrievalCheckStatus}, Answer {answerCheckStatus}
-                        </p>
-                        {verificationIssueCount ? (
-                          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                            {verificationIssueCount} issues flagged
-                          </p>
-                        ) : null}
-                      </article>
-                      <article className="rounded-xl border border-blue-100 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                          Final
-                        </p>
-                        <p className="mt-1 text-sm text-slate-700 dark:text-slate-200">{finalStatusLabel}</p>
-                        <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                          {workLogEventCount} events
-                          {pipelineView.finalizedAt ? ` · ${traceTimeLabel(pipelineView.finalizedAt)}` : ""}
-                        </p>
-                      </article>
-                    </div>
-
-                    {pipelineView.retrievalQueries.length ? (
-                      <div className="rounded-xl border border-blue-100 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                          Top queries
-                        </p>
-                        <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-slate-700 dark:text-slate-200">
-                          {pipelineView.retrievalQueries.slice(0, 3).map((query) => (
-                            <li key={query}>{query}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    ) : null}
-
-                    {sourceWebsiteChips.length ? (
-                      <div className="rounded-xl border border-blue-100 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                          Websites searched
-                        </p>
-                        <div className="mt-1 flex flex-wrap gap-1.5">
-                          {sourceWebsiteChips.slice(0, 8).map((site) => (
-                            <code
-                              key={site}
-                              className="rounded bg-blue-50 px-1.5 py-0.5 text-[11px] text-blue-700 dark:bg-slate-800 dark:text-slate-200"
-                            >
-                              {site}
-                            </code>
-                          ))}
-                        </div>
-                      </div>
-                    ) : null}
-
-                    {pipelineView.sourceUrls.length ? (
-                      <div className="rounded-xl border border-blue-100 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                          Key sources
-                        </p>
-                        <ul className="mt-1 space-y-1 text-sm text-slate-700 dark:text-slate-200">
-                          {pipelineView.sourceUrls.slice(0, 3).map((url) => (
-                            <li key={`source-${url}`}>
-                              <a
-                                href={url}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="break-all text-blue-700 hover:underline dark:text-blue-300"
-                              >
-                                {url}
-                              </a>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    ) : null}
-                  </div>
-                ) : null}
-              </section>
-            ) : null}
+          <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col gap-4 px-4 pb-44 pt-6">
 
             {messages.length ? (
               messages.map((message) => (
@@ -1505,6 +1375,9 @@ export default function App() {
                   key={message.id}
                   message={message}
                   onRegenerate={handleRegenerate}
+                  onRegenerateInDeep={handleRegenerateInDeep}
+                  onRetryWebOnly={handleRetryWebOnly}
+                  onOpenActivity={handleOpenActivity}
                   onReaction={handleReaction}
                 />
               ))
@@ -1520,15 +1393,185 @@ export default function App() {
           </div>
         </main>
 
+        {selectedActivityMessage ? (
+          <>
+            <button
+              type="button"
+              className="fixed inset-0 z-30 bg-slate-950/25 lg:hidden"
+              aria-label="Close activity panel"
+              onClick={() => setActiveActivityMessageId("")}
+            />
+            <aside className="fixed right-0 top-0 z-40 h-full w-full max-w-[392px] border-l border-blue-100 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-950 lg:right-3 lg:top-3 lg:h-[calc(100%-1.5rem)] lg:rounded-2xl lg:border">
+              <div className="flex h-full flex-col">
+                <div className="flex items-center justify-between border-b border-blue-100 bg-gradient-to-b from-blue-50/70 to-white px-4 py-3.5 dark:border-slate-800 dark:from-slate-900/90 dark:to-slate-950">
+                  <div>
+                    <p className="text-[15px] font-semibold text-slate-800 dark:text-slate-100">
+                      Activity {selectedActivityMessage.workedForLabel ? `· ${selectedActivityMessage.workedForLabel}` : ""}
+                    </p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      {new Date(selectedActivityMessage.createdAt).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveActivityMessageId("")}
+                    className="rounded-lg border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                    aria-label="Close activity panel"
+                  >
+                    <CloseIcon className="h-4 w-4" />
+                  </button>
+                </div>
+
+                <div className="flex-1 space-y-5 overflow-y-auto px-4 py-4">
+                  <section className="rounded-2xl border border-blue-100 bg-blue-50/35 p-3 dark:border-slate-800 dark:bg-slate-900/40">
+                    <div className="mb-2.5 flex items-center gap-2 text-[15px] font-semibold text-slate-800 dark:text-slate-100">
+                      <CheckCircleIcon className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                      Thinking
+                    </div>
+                    {selectedActivityMessage.traceEvents?.length ? (
+                      <ul className="space-y-1.5">
+                        {selectedActivityMessage.traceEvents.slice(-14).map((event, index) => {
+                          const websites = extractTraceWebsites(event.payload).slice(0, 4);
+                          return (
+                            <li
+                              key={`${event.type}-${event.timestamp ?? index}`}
+                              className="rounded-xl border border-blue-100 bg-white p-2.5 dark:border-slate-700 dark:bg-slate-900"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <p className="text-[13px] font-medium capitalize text-slate-700 dark:text-slate-200">
+                                  {traceLabel(event.type)}
+                                </p>
+                                <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                                  {traceTimeLabel(event.timestamp)}
+                                </span>
+                              </div>
+                              {websites.length ? (
+                                <div className="mt-1.5 flex flex-wrap gap-1">
+                                  {websites.map((site) => (
+                                    <span
+                                      key={`${event.type}-${site}`}
+                                      className="rounded bg-white px-1.5 py-0.5 text-[10px] text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                                    >
+                                      {site}
+                                    </span>
+                                  ))}
+                                </div>
+                              ) : null}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    ) : selectedActivityMessage.reasoningSteps?.length ? (
+                      <ul className="space-y-1.5">
+                        {selectedActivityMessage.reasoningSteps.slice(-10).map((step) => (
+                          <li key={step} className="rounded-xl border border-blue-100 bg-white px-2.5 py-2 text-[13px] text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200">
+                            {step}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="text-xs text-slate-500 dark:text-slate-400">No thought details captured for this response.</p>
+                    )}
+                  </section>
+
+                  <section className="rounded-2xl border border-blue-100 bg-blue-50/35 p-3 dark:border-slate-800 dark:bg-slate-900/40">
+                    <div className="mb-2.5 flex items-center gap-2 text-[15px] font-semibold text-slate-800 dark:text-slate-100">
+                      <GlobeIcon className="h-4 w-4 text-blue-600 dark:text-blue-400" />
+                      Websites searched
+                    </div>
+                    {selectedActivityMessage.searchedWebsites?.length ? (
+                      <div className="flex flex-wrap gap-1.5">
+                        {selectedActivityMessage.searchedWebsites.map((site) => (
+                          <span
+                            key={site}
+                            className="rounded-full border border-blue-200 bg-white px-2 py-0.5 text-[11px] text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+                          >
+                            {site}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-slate-500 dark:text-slate-400">No website list available.</p>
+                    )}
+                  </section>
+
+                  <section className="rounded-2xl border border-blue-100 bg-blue-50/35 p-3 dark:border-slate-800 dark:bg-slate-900/40">
+                    <div className="mb-2.5 flex items-center gap-2 text-[15px] font-semibold text-slate-800 dark:text-slate-100">
+                      <LinkIcon className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />
+                      Sources · {selectedActivitySources.length}
+                    </div>
+                    {selectedActivitySources.length ? (
+                      <div className="space-y-1.5">
+                        {selectedActivitySources.slice(0, 20).map((url) => (
+                          <a
+                            key={url}
+                            href={url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="block rounded-xl border border-blue-100 bg-white px-2.5 py-2 text-xs hover:bg-blue-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"
+                          >
+                            <span className="block text-[12px] font-medium text-slate-700 dark:text-slate-200">
+                              {displayWebsite(url)}
+                            </span>
+                            <span className="mt-0.5 block truncate text-[11px] text-blue-700 dark:text-blue-300">
+                              {compactUrlLabel(url)}
+                            </span>
+                          </a>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-slate-500 dark:text-slate-400">No citations were captured.</p>
+                    )}
+                  </section>
+                </div>
+              </div>
+            </aside>
+          </>
+        ) : null}
+
+        {showJumpToLatest && messages.length ? (
+          <button
+            type="button"
+            onClick={() => {
+              shouldAutoScrollRef.current = true;
+              scrollToBottom("smooth", true);
+            }}
+            className="fixed bottom-28 right-4 z-30 rounded-full border border-blue-200 bg-white/95 px-3 py-1.5 text-xs font-medium text-blue-700 shadow-soft hover:bg-blue-50 dark:border-slate-700 dark:bg-slate-900/95 dark:text-blue-300 dark:hover:bg-slate-800 md:right-8"
+          >
+            Jump to latest
+          </button>
+        ) : null}
+
         <div className="fixed bottom-0 left-0 right-0 border-t border-blue-100 bg-white/75 backdrop-blur-md dark:border-slate-800 dark:bg-slate-950/80 md:left-[260px]">
           <ChatInput
             value={inputValue}
             disabled={isSending}
             mode={chatMode}
+            suggestionChips={followUpChips}
+            autoScrollPaused={autoScrollPaused}
             onChange={setInputValue}
             onModeChange={setChatMode}
+            onSuggestionClick={async (chip) => {
+              await handleSubmitFromComposer(chip);
+            }}
+            onToggleAutoScroll={() => {
+              setAutoScrollPaused((prev) => {
+                const next = !prev;
+                if (next) {
+                  shouldAutoScrollRef.current = false;
+                  setShowJumpToLatest(true);
+                } else {
+                  shouldAutoScrollRef.current = true;
+                  scrollToBottom("smooth", true);
+                }
+                return next;
+              });
+            }}
             onSubmit={async () => {
-              await sendPrompt(inputValue, true);
+              await handleSubmitFromComposer(inputValue);
             }}
           />
         </div>
