@@ -1,7 +1,9 @@
 io:
-  llm_max_concurrency: 50
+  llm_max_concurrency: 4
+  llm_answer_max_concurrency: 3
+  llm_planner_max_concurrency: 4
   embedding_max_concurrency: 8
   retrieval_max_concurrency: 32
   reranker_max_concurrency: 8
   redis_max_concurrency: 200
-  bedrock_executor_workers: 64
+  bedrock_executor_workers: 20

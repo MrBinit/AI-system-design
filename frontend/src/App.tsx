@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { BrandIcon, BrandLogo } from "./components/Brand";
 import { ChatInput } from "./components/ChatInput";
-import { CheckCircleIcon, CloseIcon, GlobeIcon, LinkIcon, MenuIcon, SparklesIcon } from "./components/Icons";
+import { CheckCircleIcon, CloseIcon, GlobeIcon, LinkIcon, MenuIcon } from "./components/Icons";
 import { LoginPanel } from "./components/LoginPanel";
 import { MessageCard } from "./components/MessageCard";
 import { Sidebar } from "./components/Sidebar";
@@ -65,7 +66,10 @@ function getStoredChatMode(): ChatExecutionMode {
     const candidate = String(localStorage.getItem(CHAT_MODE_STORAGE_KEY) ?? "")
       .trim()
       .toLowerCase();
-    if (candidate === "fast" || candidate === "deep" || candidate === "auto") {
+    if (candidate === "fast" || candidate === "standard") {
+      return "standard";
+    }
+    if (candidate === "deep" || candidate === "auto") {
       return candidate;
     }
   } catch {
@@ -102,8 +106,8 @@ function parsePromptCommands(rawInput: string, defaultMode: ChatExecutionMode): 
   let modeOverride: ChatExecutionMode | null = null;
   let prompt = remaining;
 
-  if (command === "/fast") {
-    modeOverride = "fast";
+  if (command === "/standard" || command === "/fast") {
+    modeOverride = "standard";
   } else if (command === "/deep") {
     modeOverride = "deep";
   } else if (command === "/auto") {
@@ -116,7 +120,7 @@ function parsePromptCommands(rawInput: string, defaultMode: ChatExecutionMode): 
     prompt = remaining
       ? `${remaining}\n\nPrioritize web retrieval and provide source links for all key claims.`
       : "";
-    modeOverride = defaultMode === "fast" ? "fast" : "deep";
+    modeOverride = defaultMode === "fast" || defaultMode === "standard" ? "standard" : "deep";
   }
 
   return { prompt: prompt.trim(), mode: modeOverride };
@@ -202,38 +206,128 @@ function extractUrlsFromText(input: string): string[] {
 }
 
 const TRACE_EVENT_LABELS: Record<string, string> = {
-  request_received: "Request received",
-  query_plan_created: "Query plan created",
-  query_planner_started: "Query planner started",
-  query_planner_completed: "Query planner completed",
-  query_planner_skipped: "Query planner skipped",
-  search_started: "Search started",
-  search_results: "Search results collected",
-  pages_read: "Pages read",
-  facts_extracted: "Facts extracted",
-  gaps_identified: "Gaps identified",
-  retrieval_verification: "Retrieval verification",
-  source_ranking_completed: "Source ranking completed",
-  retrieval_vector_started: "Vector retrieval started",
-  retrieval_vector_completed: "Vector retrieval completed",
-  web_retrieval_skipped: "Web retrieval skipped",
-  web_fallback_started: "Web fallback started",
-  web_fallback_completed: "Web fallback completed",
-  retrieval_reranked: "Retrieval reranked",
-  evidence_selected: "Evidence selected",
-  citation_grounding_ready: "Citation grounding ready",
-  answer_planning_started: "Answer planning started",
-  answer_plan_created: "Answer plan created",
-  answer_planning_completed: "Answer planning completed",
-  model_round_started: "Model round started",
-  model_round_completed: "Model round completed",
-  answer_verification_completed: "Answer verification completed",
-  answer_synthesis_completed: "Answer synthesis completed",
+  request_received: "Question received",
+  query_intent_classified: "Detected query intent",
+  retrieval_query_decomposed: "Expanded search queries",
+  query_plan_created: "Search strategy decided",
+  query_planner_started: "Planning the search",
+  query_planner_completed: "Search plan ready",
+  query_planner_skipped: "Skipped planning",
+  search_started: "Searching trusted sources",
+  search_results: "Collected candidate sources",
+  pages_read: "Read top pages",
+  facts_extracted: "Extracted evidence",
+  gaps_identified: "Found evidence gaps",
+  retrieval_verification: "Coverage check",
+  source_ranking_completed: "Ranked source quality",
+  retrieval_vector_started: "Checking memory index",
+  retrieval_vector_completed: "Memory results ready",
+  web_retrieval_skipped: "Skipped web expansion",
+  web_fallback_started: "Expanded to web search",
+  web_fallback_completed: "Web evidence collected",
+  retrieval_reranked: "Prioritized strongest evidence",
+  retrieval_selective_filter: "Kept highest-signal evidence",
+  evidence_selected: "Final evidence selected",
+  evidence_trust_scored: "Scored evidence trust",
+  citation_grounding_ready: "Citation mapping ready",
+  answer_planning_started: "Planning answer structure",
+  answer_plan_created: "Answer plan drafted",
+  answer_planning_completed: "Answer plan approved",
+  model_round_started: "Drafting answer",
+  model_round_completed: "Draft completed",
+  answer_verification_completed: "Checked claims and citations",
+  fast_refine_started: "Refining draft with citations",
+  fast_refine_completed: "Refinement completed",
+  fast_refine_failed: "Refinement skipped",
+  answer_uncertainty_flagged: "Marked uncertainty",
+  answer_synthesis_completed: "Answer synthesized",
   answer_finalized: "Answer finalized",
-  job_processing_started: "Job processing started",
+  job_processing_started: "Job started",
   job_completed: "Job completed",
   job_failed: "Job failed",
 };
+
+const ESSENTIAL_TRACE_TYPES = new Set<string>([
+  "request_received",
+  "query_plan_created",
+  "search_started",
+  "search_results",
+  "retrieval_verification",
+  "retrieval_reranked",
+  "retrieval_selective_filter",
+  "evidence_selected",
+  "evidence_trust_scored",
+  "citation_grounding_ready",
+  "answer_planning_completed",
+  "fast_refine_started",
+  "fast_refine_completed",
+  "answer_verification_completed",
+  "answer_uncertainty_flagged",
+  "answer_finalized",
+  "job_completed",
+  "job_failed",
+]);
+
+const DECISION_TRACE_TYPES = new Set<string>([
+  "query_intent_classified",
+  "retrieval_query_decomposed",
+  "query_plan_created",
+  "web_fallback_started",
+  "web_retrieval_skipped",
+  "retrieval_reranked",
+  "retrieval_selective_filter",
+  "evidence_selected",
+  "evidence_trust_scored",
+  "fast_refine_started",
+  "fast_refine_completed",
+  "answer_verification_completed",
+  "answer_uncertainty_flagged",
+  "answer_finalized",
+]);
+
+function normalizeConfidence(value: unknown): number | undefined {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return undefined;
+  }
+  return Math.max(0, Math.min(1, numeric));
+}
+
+function normalizeCoverage(value: unknown): number | undefined {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return undefined;
+  }
+  return Math.max(0, Math.min(1, numeric));
+}
+
+function extractTraceTrustSignals(payload?: Record<string, unknown>) {
+  if (!payload) {
+    return {};
+  }
+  const freshnessRaw = String(payload.freshness ?? "").trim().toLowerCase();
+  const trustFreshness =
+    freshnessRaw && freshnessRaw !== "unknown" ? freshnessRaw : undefined;
+  const uncertaintyRaw = payload.uncertainty_reasons;
+  const uncertaintyReasons = Array.isArray(uncertaintyRaw)
+    ? uncertaintyRaw
+        .map((item) => String(item).trim())
+        .filter((item) => Boolean(item))
+        .slice(0, 3)
+    : [];
+  return {
+    trustConfidence: normalizeConfidence(payload.confidence),
+    trustFreshness,
+    trustContradiction:
+      typeof payload.contradiction_flag === "boolean" ? payload.contradiction_flag : undefined,
+    claimCitationCoverage: normalizeCoverage(payload.claim_citation_coverage),
+    uncertaintyReasons: uncertaintyReasons.length ? uncertaintyReasons : undefined,
+  };
+}
+
+function isEssentialTraceEvent(event: TraceEventItem): boolean {
+  return ESSENTIAL_TRACE_TYPES.has(String(event.type).trim().toLowerCase());
+}
 
 function traceLabel(type: string): string {
   const normalized = type.trim().toLowerCase();
@@ -253,6 +347,156 @@ function traceTimeLabel(timestamp?: string): string {
 
 function compactUrlLabel(url: string): string {
   return url.replace(/^https?:\/\//i, "").replace(/\/$/, "");
+}
+
+interface SourceCardItem {
+  url: string;
+  domain: string;
+  title: string;
+  publishedDate: string;
+  trustScore?: number;
+}
+
+function normalizeHttpUrl(value: unknown): string {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return "";
+  }
+  if (!/^https?:\/\//i.test(text)) {
+    return "";
+  }
+  return text;
+}
+
+function normalizeTrustScore(value: unknown): number | undefined {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return undefined;
+  }
+  if (numeric < 0) {
+    return 0;
+  }
+  if (numeric <= 1) {
+    return numeric;
+  }
+  if (numeric <= 100) {
+    return numeric / 100;
+  }
+  return 1;
+}
+
+function formatPublishedDate(value: string): string {
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime())) {
+    return "";
+  }
+  return parsed.toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
+}
+
+function sourceTitleFromUrl(url: string): string {
+  const raw = compactUrlLabel(url).split("/").slice(1).join(" ");
+  const cleaned = raw.replace(/[-_]+/g, " ").trim();
+  if (!cleaned) {
+    return compactUrlLabel(url);
+  }
+  return cleaned.slice(0, 72);
+}
+
+function buildSourceCardsFromTrace(
+  traceEvents: TraceEventItem[] | undefined,
+  fallbackUrls: string[]
+): SourceCardItem[] {
+  const byUrl = new Map<string, SourceCardItem>();
+  const upsert = (item: Partial<SourceCardItem> & { url: string }) => {
+    const url = normalizeHttpUrl(item.url);
+    if (!url) {
+      return;
+    }
+    const existing = byUrl.get(url);
+    const merged: SourceCardItem = {
+      url,
+      domain: item.domain || existing?.domain || displayWebsite(url),
+      title: item.title || existing?.title || sourceTitleFromUrl(url),
+      publishedDate: item.publishedDate || existing?.publishedDate || "",
+      trustScore: item.trustScore ?? existing?.trustScore,
+    };
+    byUrl.set(url, merged);
+  };
+
+  const tryObject = (value: unknown) => {
+    if (!value || typeof value !== "object") {
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    const url =
+      normalizeHttpUrl(record.url) ||
+      normalizeHttpUrl(record.source_url) ||
+      normalizeHttpUrl(record.link) ||
+      normalizeHttpUrl(record.href);
+    if (!url) {
+      return;
+    }
+    upsert({
+      url,
+      title: String(record.title ?? "").trim(),
+      publishedDate: String(record.published_date ?? record.date ?? "").trim(),
+      trustScore: normalizeTrustScore(record.trust_score),
+    });
+  };
+
+  for (const event of traceEvents ?? []) {
+    const payload = event.payload;
+    if (!payload || typeof payload !== "object") {
+      continue;
+    }
+    const record = payload as Record<string, unknown>;
+    const keys = ["source_urls", "urls", "sources", "results", "facts", "items", "citations"];
+    for (const key of keys) {
+      const value = record[key];
+      if (!value) {
+        continue;
+      }
+      if (typeof value === "string") {
+        const urls = value.match(/https?:\/\/[^\s)"']+/gi) ?? [];
+        for (const url of urls) {
+          upsert({ url });
+        }
+        continue;
+      }
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          if (typeof entry === "string") {
+            upsert({ url: entry });
+          } else {
+            tryObject(entry);
+          }
+        }
+        continue;
+      }
+      tryObject(value);
+    }
+  }
+
+  for (const url of fallbackUrls) {
+    upsert({ url });
+  }
+
+  return Array.from(byUrl.values())
+    .sort((a, b) => {
+      const aTrust = a.trustScore ?? -1;
+      const bTrust = b.trustScore ?? -1;
+      if (aTrust !== bTrust) {
+        return bTrust - aTrust;
+      }
+      if (a.publishedDate && !b.publishedDate) {
+        return -1;
+      }
+      if (!a.publishedDate && b.publishedDate) {
+        return 1;
+      }
+      return a.domain.localeCompare(b.domain);
+    })
+    .slice(0, 24);
 }
 
 function formatDurationLabel(totalSeconds: number): string {
@@ -389,6 +633,8 @@ export default function App() {
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [autoScrollPaused, setAutoScrollPaused] = useState(false);
   const [activeActivityMessageId, setActiveActivityMessageId] = useState("");
+  const [showAllActivityEvents, setShowAllActivityEvents] = useState(false);
+  const [showAllActivitySources, setShowAllActivitySources] = useState(false);
 
   const chatContainerRef = useRef<HTMLDivElement | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
@@ -573,6 +819,14 @@ export default function App() {
     if (!activeActivityMessageId) {
       return;
     }
+    setShowAllActivityEvents(false);
+    setShowAllActivitySources(false);
+  }, [activeActivityMessageId]);
+
+  useEffect(() => {
+    if (!activeActivityMessageId) {
+      return;
+    }
     const exists = messages.some((message) => message.id === activeActivityMessageId);
     if (!exists) {
       setActiveActivityMessageId("");
@@ -661,14 +915,54 @@ export default function App() {
     }
     return messages.find((message) => message.id === activeActivityMessageId) ?? null;
   }, [activeActivityMessageId, messages]);
-  const selectedActivitySources = useMemo(() => {
+  const selectedActivityEvents = useMemo(() => {
+    if (!selectedActivityMessage?.traceEvents?.length) {
+      return [];
+    }
+    const allEvents = selectedActivityMessage.traceEvents.slice(-40);
+    if (showAllActivityEvents) {
+      return allEvents.slice(-20);
+    }
+    return allEvents.filter((event) => isEssentialTraceEvent(event)).slice(-12);
+  }, [selectedActivityMessage, showAllActivityEvents]);
+  const selectedDecisionEvents = useMemo(() => {
+    return selectedActivityEvents.filter((event) =>
+      DECISION_TRACE_TYPES.has(String(event.type).trim().toLowerCase())
+    );
+  }, [selectedActivityEvents]);
+  const selectedTimelineEvents = useMemo(() => {
+    if (showAllActivityEvents) {
+      return selectedActivityEvents;
+    }
+    return selectedActivityEvents
+      .filter(
+        (event) => !DECISION_TRACE_TYPES.has(String(event.type).trim().toLowerCase())
+      )
+      .slice(-6);
+  }, [selectedActivityEvents, showAllActivityEvents]);
+  const selectedActivityAllSources = useMemo(() => {
     if (!selectedActivityMessage) {
       return [];
     }
     const messageSources = selectedActivityMessage.sourceUrls ?? [];
     const inlineSources = extractUrlsFromText(selectedActivityMessage.content);
-    return Array.from(new Set([...messageSources, ...inlineSources])).slice(0, 30);
+    return Array.from(new Set([...messageSources, ...inlineSources])).slice(0, 24);
   }, [selectedActivityMessage]);
+  const selectedActivitySourceCards = useMemo(() => {
+    if (!selectedActivityMessage) {
+      return [];
+    }
+    return buildSourceCardsFromTrace(
+      selectedActivityMessage.traceEvents,
+      selectedActivityAllSources
+    );
+  }, [selectedActivityAllSources, selectedActivityMessage]);
+  const selectedActivitySources = useMemo(() => {
+    if (showAllActivitySources) {
+      return selectedActivitySourceCards;
+    }
+    return selectedActivitySourceCards.slice(0, 8);
+  }, [selectedActivitySourceCards, showAllActivitySources]);
 
   const updateMessage = (messageId: string, updater: (message: ChatMessage) => ChatMessage) => {
     setMessages((prev) => prev.map((item) => (item.id === messageId ? updater(item) : item)));
@@ -751,6 +1045,11 @@ export default function App() {
     let messageReasoningSteps: string[] = [];
     let messageSearchedWebsites: string[] = [];
     const messageTraceEvents: TraceEventItem[] = [];
+    let trustConfidence: number | undefined;
+    let trustFreshness: string | undefined;
+    let trustContradiction: boolean | undefined;
+    let claimCitationCoverage: number | undefined;
+    let uncertaintyReasons: string[] | undefined;
     let latestServerStatus = "queued";
     const thinkingInterval = window.setInterval(() => {
       if (firstTokenReceived) {
@@ -805,6 +1104,14 @@ export default function App() {
         return;
       }
       messageTraceEvents.push(trace);
+      if (String(trace.type).trim().toLowerCase() === "answer_finalized") {
+        const trustSignals = extractTraceTrustSignals(trace.payload);
+        trustConfidence = trustSignals.trustConfidence ?? trustConfidence;
+        trustFreshness = trustSignals.trustFreshness ?? trustFreshness;
+        trustContradiction = trustSignals.trustContradiction ?? trustContradiction;
+        claimCitationCoverage = trustSignals.claimCitationCoverage ?? claimCitationCoverage;
+        uncertaintyReasons = trustSignals.uncertaintyReasons ?? uncertaintyReasons;
+      }
       for (const url of extractTraceUrls(trace.payload)) {
         traceSourceUrls.add(url);
       }
@@ -835,6 +1142,11 @@ export default function App() {
         reasoningSteps: messageReasoningSteps,
         searchedWebsites: messageSearchedWebsites,
         traceEvents: messageTraceEvents.slice(-50),
+        trustConfidence,
+        trustFreshness,
+        trustContradiction,
+        claimCitationCoverage,
+        uncertaintyReasons,
       }));
     };
     const maybeResolvePump = () => {
@@ -1108,6 +1420,8 @@ export default function App() {
   };
 
   const handleOpenActivity = (messageId: string) => {
+    setShowAllActivityEvents(false);
+    setShowAllActivitySources(false);
     setActiveActivityMessageId(messageId);
   };
 
@@ -1288,19 +1602,19 @@ export default function App() {
       />
 
       <div className="md:ml-[260px]">
-        <header className="sticky top-0 z-20 border-b border-blue-100 bg-white/85 px-5 py-4 backdrop-blur dark:border-slate-800 dark:bg-slate-950/75">
+        <header className="sticky top-0 z-20 border-b border-blue-100/80 bg-white/90 px-5 py-4 backdrop-blur dark:border-slate-800 dark:bg-slate-950/80">
           <div className="mx-auto flex w-full max-w-4xl items-center justify-between gap-4">
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                className="rounded-lg p-1.5 text-slate-600 hover:bg-blue-50 hover:text-blue-700 dark:text-slate-300 dark:hover:bg-slate-800 md:hidden"
+                className="rounded-lg p-1.5 text-slate-600 hover:bg-blue-50 hover:text-brand-blue dark:text-slate-300 dark:hover:bg-slate-800 md:hidden"
                 onClick={() => setIsSidebarOpen(true)}
                 aria-label="Open sidebar"
               >
                 <MenuIcon className="h-5 w-5" />
               </button>
-              <SparklesIcon className="h-5 w-5 text-blue-600" />
-              <h1 className="text-lg font-semibold">UNIGRAPH</h1>
+              <BrandIcon className="h-7 w-7 rounded-md" />
+              <BrandLogo compact className="hidden sm:block" />
             </div>
             <div className="flex items-start gap-3 text-sm text-slate-500 dark:text-slate-400">
               <div className="max-w-[320px]">
@@ -1312,7 +1626,7 @@ export default function App() {
                     {[0, 1, 2].map((index) => (
                       <span
                         key={index}
-                        className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500/80 dark:bg-blue-300/80"
+                        className="h-1.5 w-1.5 animate-pulse rounded-full bg-brand-blue/80 dark:bg-brand-red/80"
                         style={{ animationDelay: `${index * 160}ms` }}
                       />
                     ))}
@@ -1322,7 +1636,7 @@ export default function App() {
                 {reasoningSteps.length ? (
                   <details className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
                     <summary className="cursor-pointer select-none">Reasoning progress</summary>
-                    <ul className="mt-1 space-y-0.5 rounded bg-slate-100 px-2 py-1 text-[11px] text-slate-700 dark:bg-slate-800 dark:text-slate-200">
+                    <ul className="mt-1 space-y-0.5 rounded bg-blue-50/70 px-2 py-1 text-[11px] text-slate-700 dark:bg-slate-800 dark:text-slate-200">
                       {reasoningSteps.map((step) => (
                         <li key={step}>- {step}</li>
                       ))}
@@ -1332,9 +1646,12 @@ export default function App() {
                 {searchedWebsites.length ? (
                   <details className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
                     <summary className="cursor-pointer select-none">Websites searched</summary>
-                    <div className="mt-1 flex flex-wrap gap-1 rounded bg-slate-100 px-2 py-1 dark:bg-slate-800">
+                    <div className="mt-1 flex flex-wrap gap-1 rounded bg-blue-50/70 px-2 py-1 dark:bg-slate-800">
                       {searchedWebsites.map((site) => (
-                        <code key={site} className="rounded bg-white px-1.5 py-0.5 text-[11px] text-slate-700 dark:bg-slate-900 dark:text-slate-200">
+                        <code
+                          key={site}
+                          className="rounded border border-blue-100 bg-white px-1.5 py-0.5 text-[11px] text-brand-blue dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+                        >
                           {site}
                         </code>
                       ))}
@@ -1403,7 +1720,7 @@ export default function App() {
             />
             <aside className="fixed right-0 top-0 z-40 h-full w-full max-w-[392px] border-l border-blue-100 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-950 lg:right-3 lg:top-3 lg:h-[calc(100%-1.5rem)] lg:rounded-2xl lg:border">
               <div className="flex h-full flex-col">
-                <div className="flex items-center justify-between border-b border-blue-100 bg-gradient-to-b from-blue-50/70 to-white px-4 py-3.5 dark:border-slate-800 dark:from-slate-900/90 dark:to-slate-950">
+                <div className="flex items-center justify-between border-b border-blue-100 bg-gradient-to-b from-blue-50/75 to-rose-50/30 px-4 py-3.5 dark:border-slate-800 dark:from-slate-900/90 dark:to-slate-950">
                   <div>
                     <p className="text-[15px] font-semibold text-slate-800 dark:text-slate-100">
                       Activity {selectedActivityMessage.workedForLabel ? `· ${selectedActivityMessage.workedForLabel}` : ""}
@@ -1426,99 +1743,163 @@ export default function App() {
                 </div>
 
                 <div className="flex-1 space-y-5 overflow-y-auto px-4 py-4">
+                  <section className="rounded-2xl border border-blue-100 bg-blue-50/40 p-3 dark:border-slate-800 dark:bg-slate-900/40">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                      Summary
+                    </p>
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                      {typeof selectedActivityMessage.trustConfidence === "number" ? (
+                        <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:border-emerald-900/70 dark:bg-emerald-950/40 dark:text-emerald-200">
+                          Confidence {(selectedActivityMessage.trustConfidence * 100).toFixed(0)}%
+                        </span>
+                      ) : null}
+                      {selectedActivityMessage.trustFreshness ? (
+                        <span className="rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[11px] font-medium capitalize text-brand-blue dark:border-blue-900/70 dark:bg-blue-950/40 dark:text-blue-200">
+                          Freshness {selectedActivityMessage.trustFreshness}
+                        </span>
+                      ) : null}
+                      {typeof selectedActivityMessage.claimCitationCoverage === "number" ? (
+                        <span className="rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-700 dark:border-rose-900/70 dark:bg-rose-950/40 dark:text-rose-200">
+                          Claim citations {(selectedActivityMessage.claimCitationCoverage * 100).toFixed(0)}%
+                        </span>
+                      ) : null}
+                      {selectedActivityMessage.trustContradiction ? (
+                        <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:border-amber-900/70 dark:bg-amber-950/40 dark:text-amber-200">
+                          Conflict detected
+                        </span>
+                      ) : null}
+                    </div>
+                    {selectedDecisionEvents.length ? (
+                      <p className="mt-2 text-[12px] text-slate-600 dark:text-slate-300">
+                        Latest decision:{" "}
+                        <span className="font-medium text-slate-800 dark:text-slate-100">
+                          {traceLabel(selectedDecisionEvents[selectedDecisionEvents.length - 1].type)}
+                        </span>
+                      </p>
+                    ) : null}
+                    {selectedActivityMessage.uncertaintyReasons?.length ? (
+                      <ul className="mt-2 space-y-1 rounded-lg border border-amber-200/70 bg-amber-50/70 px-2.5 py-2 text-[11px] text-amber-800 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-200">
+                        {selectedActivityMessage.uncertaintyReasons.map((reason) => (
+                          <li key={reason}>- {reason}</li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </section>
+
                   <section className="rounded-2xl border border-blue-100 bg-blue-50/35 p-3 dark:border-slate-800 dark:bg-slate-900/40">
                     <div className="mb-2.5 flex items-center gap-2 text-[15px] font-semibold text-slate-800 dark:text-slate-100">
                       <CheckCircleIcon className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-                      Thinking
+                      Decisions
                     </div>
-                    {selectedActivityMessage.traceEvents?.length ? (
+                    {selectedDecisionEvents.length ? (
                       <ul className="space-y-1.5">
-                        {selectedActivityMessage.traceEvents.slice(-14).map((event, index) => {
-                          const websites = extractTraceWebsites(event.payload).slice(0, 4);
-                          return (
-                            <li
-                              key={`${event.type}-${event.timestamp ?? index}`}
-                              className="rounded-xl border border-blue-100 bg-white p-2.5 dark:border-slate-700 dark:bg-slate-900"
-                            >
-                              <div className="flex items-start justify-between gap-2">
-                                <p className="text-[13px] font-medium capitalize text-slate-700 dark:text-slate-200">
-                                  {traceLabel(event.type)}
-                                </p>
-                                <span className="text-[10px] text-slate-500 dark:text-slate-400">
-                                  {traceTimeLabel(event.timestamp)}
-                                </span>
-                              </div>
-                              {websites.length ? (
-                                <div className="mt-1.5 flex flex-wrap gap-1">
-                                  {websites.map((site) => (
-                                    <span
-                                      key={`${event.type}-${site}`}
-                                      className="rounded bg-white px-1.5 py-0.5 text-[10px] text-slate-600 dark:bg-slate-800 dark:text-slate-300"
-                                    >
-                                      {site}
-                                    </span>
-                                  ))}
-                                </div>
-                              ) : null}
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    ) : selectedActivityMessage.reasoningSteps?.length ? (
-                      <ul className="space-y-1.5">
-                        {selectedActivityMessage.reasoningSteps.slice(-10).map((step) => (
-                          <li key={step} className="rounded-xl border border-blue-100 bg-white px-2.5 py-2 text-[13px] text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200">
-                            {step}
+                        {selectedDecisionEvents.slice(-8).map((event, index) => (
+                          <li
+                            key={`${event.type}-${event.timestamp ?? index}`}
+                            className="rounded-xl border border-blue-100 bg-white px-2.5 py-2 dark:border-slate-700 dark:bg-slate-900"
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <p className="text-[13px] font-medium text-slate-700 dark:text-slate-200">
+                                {traceLabel(event.type)}
+                              </p>
+                              <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                                {traceTimeLabel(event.timestamp)}
+                              </span>
+                            </div>
                           </li>
                         ))}
                       </ul>
                     ) : (
-                      <p className="text-xs text-slate-500 dark:text-slate-400">No thought details captured for this response.</p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">No decision log captured.</p>
                     )}
                   </section>
 
                   <section className="rounded-2xl border border-blue-100 bg-blue-50/35 p-3 dark:border-slate-800 dark:bg-slate-900/40">
-                    <div className="mb-2.5 flex items-center gap-2 text-[15px] font-semibold text-slate-800 dark:text-slate-100">
-                      <GlobeIcon className="h-4 w-4 text-blue-600 dark:text-blue-400" />
-                      Websites searched
-                    </div>
-                    {selectedActivityMessage.searchedWebsites?.length ? (
-                      <div className="flex flex-wrap gap-1.5">
-                        {selectedActivityMessage.searchedWebsites.map((site) => (
-                          <span
-                            key={site}
-                            className="rounded-full border border-blue-200 bg-white px-2 py-0.5 text-[11px] text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
-                          >
-                            {site}
-                          </span>
-                        ))}
+                    <div className="mb-2.5 flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2 text-[15px] font-semibold text-slate-800 dark:text-slate-100">
+                        <GlobeIcon className="h-4 w-4 text-brand-blue dark:text-blue-400" />
+                        Timeline
                       </div>
+                      {selectedActivityMessage.traceEvents?.length ? (
+                        <button
+                          type="button"
+                          onClick={() => setShowAllActivityEvents((prev) => !prev)}
+                          className="rounded-full border border-blue-200 bg-white px-2 py-0.5 text-[10px] font-medium text-brand-blue hover:bg-blue-50 dark:border-slate-700 dark:bg-slate-900 dark:text-blue-300 dark:hover:bg-slate-800"
+                        >
+                          {showAllActivityEvents ? "Decision view" : "Full timeline"}
+                        </button>
+                      ) : null}
+                    </div>
+                    {selectedTimelineEvents.length ? (
+                      <ul className="space-y-1.5">
+                        {selectedTimelineEvents.map((event, index) => (
+                          <li
+                            key={`${event.type}-${event.timestamp ?? index}`}
+                            className="rounded-lg border border-blue-100 bg-white px-2 py-1.5 text-[12px] dark:border-slate-700 dark:bg-slate-900"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="text-slate-700 dark:text-slate-200">{traceLabel(event.type)}</p>
+                              <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                                {traceTimeLabel(event.timestamp)}
+                              </span>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
                     ) : (
-                      <p className="text-xs text-slate-500 dark:text-slate-400">No website list available.</p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">Timeline condensed into decisions.</p>
                     )}
                   </section>
 
                   <section className="rounded-2xl border border-blue-100 bg-blue-50/35 p-3 dark:border-slate-800 dark:bg-slate-900/40">
-                    <div className="mb-2.5 flex items-center gap-2 text-[15px] font-semibold text-slate-800 dark:text-slate-100">
-                      <LinkIcon className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />
-                      Sources · {selectedActivitySources.length}
+                    <div className="mb-2.5 flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2 text-[15px] font-semibold text-slate-800 dark:text-slate-100">
+                        <LinkIcon className="h-4 w-4 text-brand-red dark:text-rose-300" />
+                        Sources · {selectedActivitySourceCards.length}
+                      </div>
+                      {selectedActivitySourceCards.length > 8 ? (
+                        <button
+                          type="button"
+                          onClick={() => setShowAllActivitySources((prev) => !prev)}
+                          className="rounded-full border border-blue-200 bg-white px-2 py-0.5 text-[10px] font-medium text-brand-blue hover:bg-blue-50 dark:border-slate-700 dark:bg-slate-900 dark:text-blue-300 dark:hover:bg-slate-800"
+                        >
+                          {showAllActivitySources ? "Less" : "More"}
+                        </button>
+                      ) : null}
                     </div>
                     {selectedActivitySources.length ? (
                       <div className="space-y-1.5">
-                        {selectedActivitySources.slice(0, 20).map((url) => (
+                        {selectedActivitySources.map((source) => (
                           <a
-                            key={url}
-                            href={url}
+                            key={source.url}
+                            href={source.url}
                             target="_blank"
                             rel="noreferrer"
                             className="block rounded-xl border border-blue-100 bg-white px-2.5 py-2 text-xs hover:bg-blue-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"
                           >
-                            <span className="block text-[12px] font-medium text-slate-700 dark:text-slate-200">
-                              {displayWebsite(url)}
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300">
+                                {source.domain}
+                              </span>
+                              {typeof source.trustScore === "number" ? (
+                                <span className="rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:border-emerald-900/70 dark:bg-emerald-950/40 dark:text-emerald-200">
+                                  {(source.trustScore * 100).toFixed(0)}%
+                                </span>
+                              ) : null}
+                            </div>
+                            <span className="mt-1 block text-[12px] leading-4 text-slate-700 dark:text-slate-200">
+                              {source.title}
                             </span>
-                            <span className="mt-0.5 block truncate text-[11px] text-blue-700 dark:text-blue-300">
-                              {compactUrlLabel(url)}
-                            </span>
+                            <div className="mt-1 flex items-center justify-between gap-2">
+                              <span className="truncate text-[11px] text-brand-blue dark:text-blue-300">
+                                {compactUrlLabel(source.url)}
+                              </span>
+                              {source.publishedDate ? (
+                                <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                                  {formatPublishedDate(source.publishedDate)}
+                                </span>
+                              ) : null}
+                            </div>
                           </a>
                         ))}
                       </div>
@@ -1539,7 +1920,7 @@ export default function App() {
               shouldAutoScrollRef.current = true;
               scrollToBottom("smooth", true);
             }}
-            className="fixed bottom-28 right-4 z-30 rounded-full border border-blue-200 bg-white/95 px-3 py-1.5 text-xs font-medium text-blue-700 shadow-soft hover:bg-blue-50 dark:border-slate-700 dark:bg-slate-900/95 dark:text-blue-300 dark:hover:bg-slate-800 md:right-8"
+            className="fixed bottom-28 right-4 z-30 rounded-full border border-blue-200 bg-white/95 px-3 py-1.5 text-xs font-medium text-brand-blue shadow-soft hover:bg-blue-50 dark:border-slate-700 dark:bg-slate-900/95 dark:text-blue-300 dark:hover:bg-slate-800 md:right-8"
           >
             Jump to latest
           </button>

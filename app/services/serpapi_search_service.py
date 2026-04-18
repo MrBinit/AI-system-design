@@ -1,7 +1,10 @@
 import asyncio
 import json
 import os
+import random
+import time
 import urllib.parse
+import urllib.error
 import urllib.request
 
 from app.core.config import get_settings
@@ -30,17 +33,71 @@ def _search_url() -> str:
     return url
 
 
+def _retry_attempts() -> int:
+    configured = int(getattr(settings.serpapi, "retry_max_attempts", 3) or 3)
+    return max(1, min(6, configured))
+
+
+def _retry_base_backoff_seconds() -> float:
+    configured = float(getattr(settings.serpapi, "retry_base_backoff_seconds", 0.8) or 0.8)
+    return max(0.1, min(5.0, configured))
+
+
+def _is_retryable_http_status(status_code: int) -> bool:
+    return status_code in {429, 500, 502, 503, 504}
+
+
+def _sleep_for_retry(attempt: int) -> None:
+    base = _retry_base_backoff_seconds()
+    delay = (base * (2 ** max(0, attempt - 1))) + random.uniform(0.0, 0.25)
+    time.sleep(min(delay, 8.0))
+
+
 def _request_json(url: str, params: dict, timeout_seconds: float) -> dict:
     request_url = f"{url}?{urllib.parse.urlencode(params)}"
-    request = urllib.request.Request(
-        request_url,
-        headers={"User-Agent": "unigraph-serpapi-client/1.0"},
-    )
-    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    if not isinstance(payload, dict):
-        raise RuntimeError("SerpAPI response must be a JSON object.")
-    return payload
+    attempts = _retry_attempts()
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(
+            request_url,
+            headers={"User-Agent": "unigraph-serpapi-client/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise RuntimeError("SerpAPI response must be a JSON object.")
+            error_text = " ".join(str(payload.get("error", "")).split()).strip()
+            if error_text:
+                lower = error_text.lower()
+                if "rate limit" in lower and attempt < attempts:
+                    _sleep_for_retry(attempt)
+                    continue
+                raise RuntimeError(error_text)
+            return payload
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if _is_retryable_http_status(int(exc.code)) and attempt < attempts:
+                _sleep_for_retry(attempt)
+                continue
+            raise RuntimeError(f"SerpAPI HTTP {exc.code}: {exc.reason}") from exc
+        except urllib.error.URLError as exc:
+            last_error = exc
+            if attempt < attempts:
+                _sleep_for_retry(attempt)
+                continue
+            raise RuntimeError(f"SerpAPI connection failed: {exc.reason}") from exc
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts:
+                _sleep_for_retry(attempt)
+                continue
+            raise
+
+    if last_error is not None:
+        raise RuntimeError(f"SerpAPI request failed after retries: {last_error}")
+    raise RuntimeError("SerpAPI request failed after retries.")
 
 
 def _search_google_sync(

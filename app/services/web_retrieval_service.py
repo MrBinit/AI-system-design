@@ -1,4 +1,8 @@
 import asyncio
+import contextvars
+import hashlib
+import io
+import inspect
 import json
 import logging
 import re
@@ -9,9 +13,16 @@ from html import unescape
 from urllib.parse import urlparse
 
 from app.core.config import get_settings
-from app.infra.io_limiters import dependency_limiter
+from app.infra.io_limiters import DependencyBackpressureError, dependency_limiter
+from app.infra.redis_client import app_scoped_key, async_redis_client
 from app.services.chat_trace_service import emit_trace_event
-from app.services.serpapi_search_service import asearch_google, asearch_google_batch
+from app.services.tavily_search_service import asearch_google, asearch_google_batch
+from redis.exceptions import RedisError
+
+try:
+    from pypdf import PdfReader
+except Exception:  # pragma: no cover - optional dependency guard
+    PdfReader = None
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -30,6 +41,26 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
 _QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_DEADLINE_HINT_RE = re.compile(
+    r"\b(deadline|apply by|last date|closing date|intake)\b",
+    flags=re.IGNORECASE,
+)
+_REQUIREMENTS_HINT_RE = re.compile(
+    r"\b(requirement|eligibility|admission|documents|language)\b",
+    flags=re.IGNORECASE,
+)
+_LANGUAGE_HINT_RE = re.compile(
+    r"\b(language|ielts|toefl|english|german|international students?)\b",
+    flags=re.IGNORECASE,
+)
+_CURRICULUM_HINT_RE = re.compile(
+    r"\b(curriculum|module|course structure|syllabus)\b",
+    flags=re.IGNORECASE,
+)
+_TUITION_HINT_RE = re.compile(
+    r"\b(tuition|fees|semester contribution|cost)\b",
+    flags=re.IGNORECASE,
+)
 _META_PUBLISHED_RE = [
     re.compile(
         r"<meta[^>]+(?:property|name)\s*=\s*[\"']"
@@ -91,10 +122,287 @@ _HIGH_AUTHORITY_SUFFIXES = (
     ".ac.uk",
     ".europa.eu",
 )
+_OFFICIAL_SOURCE_HOST_MARKERS = (
+    "uni",
+    "university",
+    "universit",
+    "universitaet",
+    "hochschule",
+    "college",
+)
+_OFFICIAL_SOURCE_HOST_PREFIXES = ("uni", "tu", "th", "fh", "hs")
+_OFFICIAL_SOURCE_TEXT_MARKERS = (
+    "university",
+    "universität",
+    "universitaet",
+    "hochschule",
+    "faculty",
+    "department",
+    "school of",
+    "institute",
+)
+_ACADEMIC_PAGE_MARKERS = (
+    "master",
+    "m.sc",
+    "msc",
+    "admission",
+    "requirements",
+    "application",
+    "deadline",
+    "study program",
+    "programme",
+    "studium",
+    "bewerbung",
+)
+_NON_OFFICIAL_HOST_MARKERS = (
+    "blog",
+    "forum",
+    "wiki",
+    "ranking",
+    "rankings",
+    "portal",
+    "directory",
+    "listing",
+    "review",
+    "consult",
+    "newsroom",
+)
+_PLANNER_CACHE_VERSION = "v2"
+_RETRIEVAL_MODE_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "web_retrieval_mode",
+    default="deep",
+)
+_STANDARD_SEARCH_MODES = {"fast", "standard"}
+
+
+def _normalized_search_mode(search_mode: str | None) -> str:
+    candidate = str(search_mode or "").strip().lower()
+    if candidate in {"deep", "fast", "standard"}:
+        return candidate
+    return "deep"
+
+
+def _current_search_mode() -> str:
+    return _normalized_search_mode(_RETRIEVAL_MODE_CTX.get())
+
+
+def _is_deep_search_mode(search_mode: str | None = None) -> bool:
+    mode = _normalized_search_mode(search_mode) if search_mode is not None else _current_search_mode()
+    return mode not in _STANDARD_SEARCH_MODES
+
+
+def _search_depth_for_mode(search_mode: str | None = None) -> str:
+    return "advanced" if _is_deep_search_mode(search_mode) else "basic"
+
+
+def _deep_mode_int_override(
+    attr_name: str,
+    configured: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if not _is_deep_search_mode():
+        return configured
+    override = getattr(settings.web_search, attr_name, configured)
+    try:
+        candidate = int(override)
+    except (TypeError, ValueError):
+        candidate = configured
+    candidate = max(minimum, min(maximum, candidate))
+    return max(configured, candidate)
+
+
+def _default_num_for_mode(top_k: int) -> int:
+    configured = max(1, int(settings.web_search.default_num))
+    base = max(top_k, configured)
+    return _deep_mode_int_override("deep_default_num", base, minimum=1, maximum=100)
+
+
+def _max_query_variants_for_mode() -> int:
+    configured = max(1, int(settings.web_search.max_query_variants))
+    if _is_deep_search_mode():
+        return _deep_mode_int_override("deep_max_query_variants", configured, minimum=1, maximum=8)
+    # Standard/Fast mode stays lightweight for lower API credit burn.
+    return min(2, configured)
+
+
+def _max_context_results_for_mode() -> int:
+    configured = max(1, int(settings.web_search.max_context_results))
+    return _deep_mode_int_override("deep_max_context_results", configured, minimum=1, maximum=20)
+
+
+def _max_pages_to_fetch_for_mode() -> int:
+    configured = max(0, int(settings.web_search.max_pages_to_fetch))
+    if configured <= 0:
+        return 0
+    return _deep_mode_int_override("deep_max_pages_to_fetch", configured, minimum=0, maximum=20)
+
+
+def _max_chunks_per_page_for_mode() -> int:
+    configured = max(1, int(settings.web_search.max_chunks_per_page))
+    return _deep_mode_int_override("deep_max_chunks_per_page", configured, minimum=1, maximum=20)
 
 
 def _elapsed_ms(started_at: float) -> int:
     return max(0, int((time.perf_counter() - started_at) * 1000))
+
+
+async def _redis_call(method, *args, **kwargs):
+    """Execute one Redis operation behind the shared Redis dependency limiter."""
+    async with dependency_limiter("redis"):
+        result = method(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+
+def _planner_cache_key(*, model_id: str, query: str, allowed_suffixes: list[str]) -> str:
+    payload = {
+        "version": _PLANNER_CACHE_VERSION,
+        "model_id": model_id,
+        "query": " ".join(str(query).split()).strip(),
+        "allowed_suffixes": list(allowed_suffixes),
+        "max_queries": _max_planner_queries(),
+        "max_subquestions": _max_planner_subquestions(),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    return app_scoped_key("cache", "web_search", "query_planner", f"sha256:{digest}")
+
+
+def _gap_planner_cache_key(
+    *,
+    model_id: str,
+    query: str,
+    subquestions: list[str],
+    facts: list[dict],
+    fallback_missing: list[str],
+) -> str:
+    compact_facts: list[dict[str, str]] = []
+    for item in facts[:12]:
+        if not isinstance(item, dict):
+            continue
+        compact_facts.append(
+            {
+                "fact": " ".join(str(item.get("fact", "")).split())[:180],
+                "url": str(item.get("url", "")).strip()[:180],
+            }
+        )
+    payload = {
+        "version": _PLANNER_CACHE_VERSION,
+        "model_id": model_id,
+        "query": " ".join(str(query).split()).strip(),
+        "subquestions": _normalize_subquestion_list(
+            subquestions,
+            limit=max(1, _max_planner_subquestions() or 1),
+        ),
+        "fallback_missing": _normalize_subquestion_list(
+            fallback_missing,
+            limit=max(1, _max_planner_subquestions() or 1),
+        ),
+        "facts": compact_facts,
+        "max_gap_queries": max(
+            1,
+            int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2)),
+        ),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    return app_scoped_key("cache", "web_search", "gap_planner", f"sha256:{digest}")
+
+
+def _official_domains_for_query(query: str) -> list[str]:
+    text = " ".join(str(query).split()).strip().lower()
+    if not text:
+        return []
+    matches = re.findall(r"\b(?:[a-z0-9-]+\.)+(?:de|eu)\b", text)
+    domains: list[str] = []
+    seen: set[str] = set()
+    for domain in matches:
+        normalized = str(domain).strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        domains.append(normalized)
+    return domains
+
+
+def _comparison_entities_from_query(query: str) -> list[str]:
+    text = " ".join(str(query or "").split()).strip()
+    if not text:
+        return []
+    match = re.search(
+        r"(?:compare\s+)?(.+?)\s+(?:vs|versus)\s+(.+?)(?:,| for | including |$)",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return []
+    candidates = [match.group(1).strip(), match.group(2).strip()]
+    entities: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        compact = " ".join(str(candidate).split()).strip()
+        key = compact.lower()
+        if not compact or key in seen:
+            continue
+        seen.add(key)
+        entities.append(compact[:120])
+    return entities[:2]
+
+
+def _entity_focus_query(entity: str) -> str:
+    compact_entity = " ".join(str(entity).split()).strip()
+    if not compact_entity:
+        return ""
+    return (
+        f"{compact_entity} data science master's program "
+        "admission requirements application deadline"
+    )
+
+
+def _domain_group_key(host: str) -> str:
+    normalized = str(host or "").strip().lower()
+    if normalized.startswith("www."):
+        normalized = normalized[4:]
+    if not normalized:
+        return ""
+    parts = [segment for segment in normalized.split(".") if segment]
+    if len(parts) <= 2:
+        return normalized
+    return ".".join(parts[-2:])
+
+
+async def _read_cache_json(cache_key: str) -> dict | None:
+    try:
+        raw = await _redis_call(async_redis_client.get, cache_key)
+    except RedisError as exc:
+        logger.warning("Web-search planner cache read failed. %s", exc)
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+async def _write_cache_json(cache_key: str, payload: dict, *, ttl_seconds: int) -> None:
+    if ttl_seconds <= 0:
+        return
+    try:
+        await _redis_call(
+            async_redis_client.setex,
+            cache_key,
+            ttl_seconds,
+            json.dumps(payload, ensure_ascii=True, sort_keys=True),
+        )
+    except RedisError as exc:
+        logger.warning("Web-search planner cache write failed. %s", exc)
 
 
 def _extract_published_date(raw_html: str) -> str:
@@ -122,12 +430,12 @@ def _is_boilerplate_line(line: str) -> bool:
 def _clean_html_text(raw_html: str, max_chars: int) -> str:
     text = _COMMENT_RE.sub(" ", raw_html)
     text = _SCRIPT_STYLE_RE.sub("\n", text)
-    if settings.serpapi.strip_boilerplate:
+    if settings.web_search.strip_boilerplate:
         text = _BOILERPLATE_BLOCK_RE.sub("\n", text)
     text = _BLOCK_BREAK_RE.sub("\n", text)
     text = _TAG_RE.sub(" ", text)
     text = unescape(text).replace("\xa0", " ")
-    min_line_chars = max(0, int(settings.serpapi.min_clean_line_chars))
+    min_line_chars = max(0, int(settings.web_search.min_clean_line_chars))
 
     lines: list[str] = []
     used_chars = 0
@@ -137,13 +445,59 @@ def _clean_html_text(raw_html: str, max_chars: int) -> str:
             continue
         if min_line_chars and len(line) < min_line_chars:
             continue
-        if settings.serpapi.strip_boilerplate and _is_boilerplate_line(line):
+        if settings.web_search.strip_boilerplate and _is_boilerplate_line(line):
             continue
         lines.append(line)
         used_chars += len(line) + 1
         if used_chars >= max_chars:
             break
     return "\n".join(lines)[:max_chars]
+
+
+def _clean_plain_text(raw_text: str, max_chars: int) -> str:
+    min_line_chars = max(0, int(settings.web_search.min_clean_line_chars))
+    lines: list[str] = []
+    used_chars = 0
+    for raw_line in str(raw_text).splitlines():
+        line = _WHITESPACE_RE.sub(" ", raw_line).strip(" |-\t")
+        if not line:
+            continue
+        if min_line_chars and len(line) < min_line_chars:
+            continue
+        if settings.web_search.strip_boilerplate and _is_boilerplate_line(line):
+            continue
+        lines.append(line)
+        used_chars += len(line) + 1
+        if used_chars >= max_chars:
+            break
+    return "\n".join(lines)[:max_chars]
+
+
+def _extract_pdf_text(raw_bytes: bytes, *, max_chars: int) -> str:
+    if not raw_bytes or PdfReader is None:
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(raw_bytes))
+    except Exception:
+        return ""
+
+    chunks: list[str] = []
+    used_chars = 0
+    for page in reader.pages:
+        try:
+            page_text = str(page.extract_text() or "").strip()
+        except Exception:
+            continue
+        if not page_text:
+            continue
+        cleaned = _clean_plain_text(page_text, max_chars=max_chars)
+        if not cleaned:
+            continue
+        chunks.append(cleaned)
+        used_chars += len(cleaned) + 1
+        if used_chars >= max_chars:
+            break
+    return "\n".join(chunks)[:max_chars]
 
 
 def _fetch_page_data_sync(url: str, timeout_seconds: float, max_chars: int) -> dict:
@@ -153,13 +507,30 @@ def _fetch_page_data_sync(url: str, timeout_seconds: float, max_chars: int) -> d
     )
     with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         content_type = str(response.headers.get("Content-Type", "")).lower()
-        if "text/html" not in content_type:
-            return {"content": "", "published_date": ""}
-        raw = response.read(max_chars * 8).decode("utf-8", errors="ignore")
+        max_bytes = max(4_000_000, max_chars * 24)
+        raw_bytes = response.read(max_bytes)
+
+    if "application/pdf" in content_type or str(url).lower().endswith(".pdf"):
+        return {
+            "content": _extract_pdf_text(raw_bytes, max_chars=max_chars),
+            "published_date": "",
+        }
+    if "text/html" in content_type:
+        raw = raw_bytes.decode("utf-8", errors="ignore")
+        return {
+            "content": _clean_html_text(raw, max_chars=max_chars),
+            "published_date": _extract_published_date(raw),
+        }
+    if "text/" in content_type:
+        raw = raw_bytes.decode("utf-8", errors="ignore")
+        return {
+            "content": _clean_plain_text(raw, max_chars=max_chars),
+            "published_date": "",
+        }
 
     return {
-        "content": _clean_html_text(raw, max_chars=max_chars),
-        "published_date": _extract_published_date(raw),
+        "content": "",
+        "published_date": "",
     }
 
 
@@ -243,33 +614,33 @@ def _ai_overview_text(payload: dict) -> str:
 
 
 async def _afetch_page_data(url: str) -> dict:
-    async with dependency_limiter("serpapi"):
+    async with dependency_limiter("web_search"):
         return await asyncio.to_thread(
             _fetch_page_data_sync,
             url,
-            float(settings.serpapi.page_fetch_timeout_seconds),
-            int(settings.serpapi.max_page_chars),
+            float(settings.web_search.page_fetch_timeout_seconds),
+            int(settings.web_search.max_page_chars),
         )
 
 
 async def _afetch_organic_pages(
     rows: list[dict], *, max_pages_to_fetch: int | None = None
 ) -> dict[str, dict]:
-    if not settings.serpapi.fetch_page_content:
+    if not settings.web_search.fetch_page_content:
         return {}
 
     targets = [row for row in rows if row.get("url")]
     page_limit = (
         max(0, int(max_pages_to_fetch))
         if max_pages_to_fetch is not None
-        else int(settings.serpapi.max_pages_to_fetch)
+        else _max_pages_to_fetch_for_mode()
     )
     targets = targets[:page_limit]
     if not targets:
         return {}
 
-    queue: asyncio.Queue = asyncio.Queue(maxsize=settings.serpapi.queue_max_size)
-    worker_count = min(settings.serpapi.queue_workers, len(targets))
+    queue: asyncio.Queue = asyncio.Queue(maxsize=settings.web_search.queue_max_size)
+    worker_count = min(settings.web_search.queue_workers, len(targets))
     fetched: dict[str, dict] = {}
 
     async def _worker():
@@ -323,17 +694,21 @@ def _compact_query_keywords(query: str) -> str:
 
 
 def _normalized_allowed_domain_suffixes() -> list[str]:
-    raw = getattr(settings.serpapi, "allowed_domain_suffixes", [])
-    if not isinstance(raw, list):
-        return []
+    raw_values = getattr(settings.web_search, "allowed_domain_suffixes", [".de", ".eu"])
+    if raw_values is None:
+        raw_values = [".de", ".eu"]
+    if isinstance(raw_values, str):
+        values = [item.strip() for item in raw_values.split(",") if item.strip()]
+    elif isinstance(raw_values, list):
+        values = [str(item).strip() for item in raw_values if str(item).strip()]
+    else:
+        values = [".de", ".eu"]
     normalized: list[str] = []
     seen: set[str] = set()
-    for entry in raw:
-        suffix = str(entry).strip().lower()
-        if not suffix:
-            continue
+    for value in values:
+        suffix = value.lower()
         if not suffix.startswith("."):
-            suffix = f".{suffix.lstrip('.')}"
+            suffix = f".{suffix}"
         if suffix in seen:
             continue
         seen.add(suffix)
@@ -341,15 +716,138 @@ def _normalized_allowed_domain_suffixes() -> list[str]:
     return normalized
 
 
+def _normalized_official_source_allowlist() -> list[str]:
+    raw_values = getattr(settings.web_search, "official_source_allowlist", [])
+    if isinstance(raw_values, str):
+        values = [item.strip().lower() for item in raw_values.split(",") if item.strip()]
+    elif isinstance(raw_values, list):
+        values = [str(item).strip().lower() for item in raw_values if str(item).strip()]
+    else:
+        values = []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        domain = value[4:] if value.startswith("www.") else value
+        if domain in seen:
+            continue
+        seen.add(domain)
+        normalized.append(domain)
+    return normalized
+
+
+def _host_matches_domain(host: str, domain: str) -> bool:
+    normalized_host = _normalized_host(host)
+    if not normalized_host:
+        normalized_host = str(host or "").strip().lower()
+        if normalized_host.startswith("www."):
+            normalized_host = normalized_host[4:]
+    normalized_domain = _normalized_host(domain)
+    if not normalized_domain:
+        normalized_domain = str(domain or "").strip().lower()
+        if normalized_domain.startswith("www."):
+            normalized_domain = normalized_domain[4:]
+    if not normalized_host or not normalized_domain:
+        return False
+    return normalized_host == normalized_domain or normalized_host.endswith(f".{normalized_domain}")
+
+
+def _contains_marker(text: str, markers: tuple[str, ...]) -> bool:
+    lowered = str(text).lower()
+    return any(marker in lowered for marker in markers)
+
+
+def _host_looks_non_official(host: str) -> bool:
+    grouped = _domain_group_key(host)
+    if not grouped:
+        return True
+    host_text = grouped.replace("-", " ")
+    return any(marker in host_text for marker in _NON_OFFICIAL_HOST_MARKERS)
+
+
+def _host_looks_official_institution(host: str) -> bool:
+    grouped = _domain_group_key(host)
+    if not grouped:
+        return False
+    host_text = grouped.replace("-", " ")
+    if any(marker in host_text for marker in _OFFICIAL_SOURCE_HOST_MARKERS):
+        return True
+    labels = [label for label in grouped.split(".") if label]
+    return any(label.startswith(_OFFICIAL_SOURCE_HOST_PREFIXES) for label in labels)
+
+
+def _source_url_allowed(
+    *,
+    url: str,
+    title: str,
+    snippet: str,
+    allowed_suffixes: list[str],
+) -> bool:
+    if not _url_matches_allowed_suffix(url, allowed_suffixes):
+        return False
+    if not bool(getattr(settings.web_search, "official_source_filter_enabled", True)):
+        return True
+    host = _normalized_host(url)
+    if not host:
+        return False
+
+    allowlist = _normalized_official_source_allowlist()
+    if any(_host_matches_domain(host, domain) for domain in allowlist):
+        return True
+
+    if _host_looks_non_official(host):
+        return False
+    if _host_looks_official_institution(host):
+        return True
+
+    evidence_text = f"{title} {snippet}"
+    if not _contains_marker(evidence_text, _OFFICIAL_SOURCE_TEXT_MARKERS):
+        return False
+    return _contains_marker(evidence_text, _ACADEMIC_PAGE_MARKERS)
+
+
 def _build_query_variants(query: str, allowed_suffixes: list[str]) -> list[str]:
     base = " ".join(str(query).split()).strip()
     if not base:
         return []
 
-    if not settings.serpapi.multi_query_enabled:
+    if not settings.web_search.multi_query_enabled:
         return [base]
 
-    candidates: list[str] = [base, f"{base} official information"]
+    if not _is_deep_search_mode():
+        official_domains = _official_domains_for_query(base)[:1]
+        candidates = [base]
+        if official_domains:
+            candidates.append(f"{base} site:{official_domains[0]}")
+        else:
+            candidates.append(f"{base} official information")
+
+        max_variants = _max_query_variants_for_mode()
+        variants: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            normalized = " ".join(str(candidate).split()).strip()
+            key = normalized.lower()
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            variants.append(normalized)
+            if len(variants) >= max_variants:
+                break
+        return variants or [base]
+
+    official_domains = _official_domains_for_query(base)[:3]
+    comparison_entities = _comparison_entities_from_query(base)
+    candidates: list[str] = [base]
+    for entity in comparison_entities:
+        entity_focus = _entity_focus_query(entity)
+        if not entity_focus:
+            continue
+        candidates.append(entity_focus)
+        for domain in _official_domains_for_query(entity)[:1]:
+            candidates.append(f"{entity_focus} site:{domain}")
+    for domain in official_domains:
+        candidates.append(f"{base} site:{domain}")
+    candidates.append(f"{base} official information")
     compact = _compact_query_keywords(base)
     if compact and compact != base.lower():
         candidates.append(compact)
@@ -357,8 +855,16 @@ def _build_query_variants(query: str, allowed_suffixes: list[str]) -> list[str]:
     if allowed_suffixes:
         site_terms = " OR ".join(f"site:{suffix}" for suffix in allowed_suffixes[:2])
         candidates.append(f"{base} ({site_terms})")
+    if _DEADLINE_HINT_RE.search(base):
+        candidates.append(f"{base} application deadline official")
+    if _REQUIREMENTS_HINT_RE.search(base):
+        candidates.append(f"{base} admission requirements official")
 
-    max_variants = max(1, int(settings.serpapi.max_query_variants))
+    for domain in official_domains:
+        if compact:
+            candidates.append(f"{compact} site:{domain}")
+
+    max_variants = _max_query_variants_for_mode()
     variants: list[str] = []
     seen: set[str] = set()
     for candidate in candidates:
@@ -397,30 +903,61 @@ def _normalize_subquestion_list(values, *, limit: int) -> list[str]:
 
 
 def _planner_model_id() -> str:
-    configured = str(getattr(settings.serpapi, "query_planner_model_id", "")).strip()
+    configured = str(getattr(settings.web_search, "query_planner_model_id", "")).strip()
     return configured or str(settings.bedrock.primary_model_id).strip()
 
 
 def _max_planner_queries() -> int:
-    return max(1, int(getattr(settings.serpapi, "query_planner_max_queries", 5)))
+    return max(1, int(getattr(settings.web_search, "query_planner_max_queries", 5)))
 
 
 def _max_planner_subquestions() -> int:
-    return max(0, int(getattr(settings.serpapi, "query_planner_max_subquestions", 4)))
+    return max(0, int(getattr(settings.web_search, "query_planner_max_subquestions", 4)))
+
+
+def _coverage_subquestions_from_query(query: str) -> list[str]:
+    compact = " ".join(str(query or "").split()).strip().lower()
+    if not compact:
+        return []
+    candidates: list[str] = []
+    if _REQUIREMENTS_HINT_RE.search(compact):
+        candidates.append("course requirements and eligibility criteria")
+    if _LANGUAGE_HINT_RE.search(compact):
+        candidates.append("language requirements and accepted English test minimum scores")
+    if _DEADLINE_HINT_RE.search(compact):
+        candidates.append("application deadline and intake timeline")
+    if _CURRICULUM_HINT_RE.search(compact):
+        candidates.append("curriculum structure and core modules")
+    if _TUITION_HINT_RE.search(compact):
+        candidates.append("tuition and semester fees")
+    if not candidates:
+        candidates.extend(
+            [
+                "program overview and duration",
+                "admission requirements",
+            ]
+        )
+    return _normalize_subquestion_list(candidates, limit=_max_planner_subquestions())
 
 
 def _build_query_planner_messages(query: str, allowed_suffixes: list[str]) -> list[dict]:
     max_queries = _max_planner_queries()
     max_subquestions = _max_planner_subquestions()
     suffix_clause = ", ".join(allowed_suffixes[:3]) if allowed_suffixes else "none"
+    focus_subquestions = _coverage_subquestions_from_query(query)
+    focus_text = "\n".join(f"- {item}" for item in focus_subquestions) or "- (none)"
     system_prompt = (
-        "You are a web search query planner. "
+        "You are a web search query planner for high-coverage deep retrieval. "
+        "Think in phases: plan -> search fan-out -> evidence fan-in. "
         "Return strict JSON only with keys: queries, subquestions. "
-        "queries must preserve key entities, numbers, dates, and negations from the user query."
+        "queries must preserve key entities, numbers, dates, and negations from the user query. "
+        "Make queries independent and non-overlapping so they can run in parallel."
     )
     user_prompt = (
         f"User query: {query}\n"
         f"Allowed domain suffixes (optional): {suffix_clause}\n"
+        f"Coverage dimensions to include when relevant:\n{focus_text}\n"
+        "Prioritize official university pages and DAAD pages.\n"
         f"Return at most {max_queries} queries and at most {max_subquestions} subquestions."
     )
     return [
@@ -478,36 +1015,86 @@ def _normalize_query_plan_payload(
     max_subquestions = _max_planner_subquestions()
     base_queries = [query] + _build_query_variants(query, allowed_suffixes)
     llm_queries = _normalize_query_list(payload.get("queries"), limit=max_queries)
+    focus_queries = _build_gap_queries(query, _coverage_subquestions_from_query(query))
     merged_queries = _normalize_query_list(
-        base_queries + llm_queries,
+        base_queries + llm_queries + focus_queries,
         limit=max_queries,
     )
-    return {
-        "queries": merged_queries or _build_query_variants(query, allowed_suffixes),
-        "subquestions": _normalize_subquestion_list(
+    merged_subquestions = _normalize_subquestion_list(
+        _coverage_subquestions_from_query(query)
+        + _normalize_subquestion_list(
             payload.get("subquestions"),
             limit=max_subquestions,
         ),
+        limit=max_subquestions,
+    )
+    return {
+        "queries": merged_queries or _build_query_variants(query, allowed_suffixes),
+        "subquestions": merged_subquestions,
         "planner": "llm",
         "llm_used": True,
     }
 
 
 async def _aplan_queries_with_llm(query: str, allowed_suffixes: list[str]) -> dict | None:
-    if not bool(getattr(settings.serpapi, "query_planner_use_llm", False)):
+    if not bool(getattr(settings.web_search, "query_planner_use_llm", False)):
         return None
 
     model_id = _planner_model_id()
     if not model_id:
         return None
 
+    cache_key = _planner_cache_key(model_id=model_id, query=query, allowed_suffixes=allowed_suffixes)
+    if bool(getattr(settings.web_search, "query_planner_cache_enabled", True)):
+        cached = await _read_cache_json(cache_key)
+        if cached:
+            cached_plan = _normalize_query_plan_payload(
+                query=query,
+                allowed_suffixes=allowed_suffixes,
+                payload=cached,
+            )
+            cached_plan["planner"] = "llm_cache"
+            cached_plan["llm_used"] = True
+            emit_trace_event(
+                "query_plan_cache_hit",
+                {
+                    "query": query[:220],
+                    "model_id": model_id,
+                },
+            )
+            return cached_plan
+
     try:
         messages = _build_query_planner_messages(query, allowed_suffixes)
         from app.infra.bedrock_chat_client import client
 
-        response = await client.chat.completions.create(model=model_id, messages=messages)
+        response = await client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            limiter_name="llm_planner",
+            limiter_acquire_timeout_seconds=float(
+                getattr(settings.web_search, "query_planner_acquire_timeout_seconds", 0.0)
+            ),
+            rate_limit_profile="planner",
+        )
+    except DependencyBackpressureError as exc:
+        logger.warning(
+            "Web-search query planner backpressure; falling back to heuristic variants. %s",
+            exc,
+        )
+        emit_trace_event(
+            "query_plan_backpressure",
+            {
+                "query": query[:220],
+                "retry_after_seconds": round(float(exc.retry_after_seconds), 3),
+            },
+        )
+        return None
     except Exception as exc:
-        logger.warning("SerpApi query planner failed; falling back to heuristic variants. %s", exc)
+        logger.warning(
+            "Web-search query planner failed; falling back to heuristic variants. %s",
+            exc,
+        )
         return None
 
     if not response or not getattr(response, "choices", None):
@@ -516,15 +1103,25 @@ async def _aplan_queries_with_llm(query: str, allowed_suffixes: list[str]) -> di
     payload = _extract_json_object(content)
     if not payload:
         return None
-    return _normalize_query_plan_payload(
+    plan = _normalize_query_plan_payload(
         query=query,
         allowed_suffixes=allowed_suffixes,
         payload=payload,
     )
+    if bool(getattr(settings.web_search, "query_planner_cache_enabled", True)):
+        await _write_cache_json(
+            cache_key,
+            {
+                "queries": plan.get("queries", []),
+                "subquestions": plan.get("subquestions", []),
+            },
+            ttl_seconds=int(getattr(settings.web_search, "query_planner_cache_ttl_seconds", 900)),
+        )
+    return plan
 
 
 def _planner_enabled() -> bool:
-    return bool(getattr(settings.serpapi, "query_planner_enabled", True))
+    return _is_deep_search_mode() and bool(getattr(settings.web_search, "query_planner_enabled", True))
 
 
 async def _resolve_query_plan(query: str, allowed_suffixes: list[str]) -> dict:
@@ -537,12 +1134,12 @@ async def _resolve_query_plan(query: str, allowed_suffixes: list[str]) -> dict:
 
 
 def _retrieval_loop_model_id() -> str:
-    configured = str(getattr(settings.serpapi, "retrieval_loop_model_id", "")).strip()
+    configured = str(getattr(settings.web_search, "retrieval_loop_model_id", "")).strip()
     return configured or _planner_model_id()
 
 
 def _loop_llm_enabled() -> bool:
-    return bool(getattr(settings.serpapi, "retrieval_loop_use_llm", False))
+    return _is_deep_search_mode() and bool(getattr(settings.web_search, "retrieval_loop_use_llm", False))
 
 
 def _compact_facts_for_prompt(facts: list[dict], *, limit: int) -> list[str]:
@@ -569,7 +1166,7 @@ def _build_gap_analyzer_messages(
     subquestions: list[str],
     facts: list[dict],
 ) -> list[dict]:
-    max_gap_queries = max(1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2)))
+    max_gap_queries = max(1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2)))
     compact_facts = _compact_facts_for_prompt(facts, limit=12)
     subquestion_text = "\n".join(f"- {item}" for item in subquestions) or "- (none)"
     facts_text = "\n".join(compact_facts) or "- (none)"
@@ -591,7 +1188,7 @@ def _build_gap_analyzer_messages(
 
 
 def _normalize_gap_plan_payload(payload: dict, *, query: str, fallback_missing: list[str]) -> dict:
-    max_gap_queries = max(1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2)))
+    max_gap_queries = max(1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2)))
     missing = _normalize_subquestion_list(
         payload.get("missing_subquestions"), limit=_max_planner_subquestions()
     )
@@ -618,6 +1215,31 @@ async def _aidentify_gap_plan_with_llm(
     model_id = _retrieval_loop_model_id()
     if not model_id:
         return None
+
+    cache_key = _gap_planner_cache_key(
+        model_id=model_id,
+        query=query,
+        subquestions=subquestions,
+        facts=facts,
+        fallback_missing=fallback_missing,
+    )
+    if bool(getattr(settings.web_search, "retrieval_loop_cache_enabled", True)):
+        cached = await _read_cache_json(cache_key)
+        if cached:
+            plan = _normalize_gap_plan_payload(
+                cached,
+                query=query,
+                fallback_missing=fallback_missing,
+            )
+            emit_trace_event(
+                "retrieval_gap_plan_cache_hit",
+                {
+                    "query": query[:220],
+                    "model_id": model_id,
+                },
+            )
+            return plan
+
     try:
         messages = _build_gap_analyzer_messages(
             query,
@@ -626,10 +1248,31 @@ async def _aidentify_gap_plan_with_llm(
         )
         from app.infra.bedrock_chat_client import client
 
-        response = await client.chat.completions.create(model=model_id, messages=messages)
+        response = await client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            limiter_name="llm_planner",
+            limiter_acquire_timeout_seconds=float(
+                getattr(settings.web_search, "retrieval_loop_acquire_timeout_seconds", 0.0)
+            ),
+            rate_limit_profile="planner",
+        )
+    except DependencyBackpressureError as exc:
+        logger.warning(
+            "Web-search retrieval-loop backpressure; falling back to heuristic gap detection. %s",
+            exc,
+        )
+        emit_trace_event(
+            "retrieval_gap_plan_backpressure",
+            {
+                "query": query[:220],
+                "retry_after_seconds": round(float(exc.retry_after_seconds), 3),
+            },
+        )
+        return None
     except Exception as exc:
         logger.warning(
-            "SerpApi retrieval-loop gap analysis failed; "
+            "Web-search retrieval-loop gap analysis failed; "
             "falling back to heuristic gap detection. %s",
             exc,
         )
@@ -641,11 +1284,21 @@ async def _aidentify_gap_plan_with_llm(
     payload = _extract_json_object(content)
     if not payload:
         return None
-    return _normalize_gap_plan_payload(
+    plan = _normalize_gap_plan_payload(
         payload,
         query=query,
         fallback_missing=fallback_missing,
     )
+    if bool(getattr(settings.web_search, "retrieval_loop_cache_enabled", True)):
+        await _write_cache_json(
+            cache_key,
+            {
+                "missing_subquestions": plan.get("missing_subquestions", []),
+                "queries": plan.get("queries", []),
+            },
+            ttl_seconds=int(getattr(settings.web_search, "retrieval_loop_cache_ttl_seconds", 300)),
+        )
+    return plan
 
 
 def _subquestion_token_coverage(subquestion: str, evidence_text: str) -> float:
@@ -662,7 +1315,7 @@ def _identify_missing_subquestions(subquestions: list[str], facts: list[dict]) -
     if not subquestions:
         return []
     evidence_text = " ".join(str(item.get("fact", "")) for item in facts if isinstance(item, dict))
-    threshold = float(getattr(settings.serpapi, "retrieval_gap_min_token_coverage", 0.5))
+    threshold = float(getattr(settings.web_search, "retrieval_gap_min_token_coverage", 0.5))
     missing: list[str] = []
     for subquestion in subquestions:
         if _subquestion_token_coverage(subquestion, evidence_text) >= threshold:
@@ -674,15 +1327,20 @@ def _identify_missing_subquestions(subquestions: list[str], facts: list[dict]) -
 def _build_gap_queries(query: str, missing_subquestions: list[str]) -> list[str]:
     if not missing_subquestions:
         return []
-    max_gap_queries = max(1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2)))
+    max_gap_queries = max(1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2)))
     candidates = [
         f"{query} {subquestion}".strip() for subquestion in missing_subquestions[:max_gap_queries]
     ]
     return _normalize_query_list(candidates, limit=max_gap_queries)
 
 
-def _next_queries_for_loop(planned_queries: list[str], seen_queries: set[str]) -> list[str]:
-    max_queries = _max_planner_queries()
+def _next_queries_for_loop(
+    planned_queries: list[str],
+    seen_queries: set[str],
+    *,
+    max_queries: int | None = None,
+) -> list[str]:
+    query_limit = max_queries if isinstance(max_queries, int) and max_queries > 0 else _max_planner_queries()
     next_queries: list[str] = []
     for query in planned_queries:
         key = str(query).strip().lower()
@@ -690,7 +1348,7 @@ def _next_queries_for_loop(planned_queries: list[str], seen_queries: set[str]) -
             continue
         seen_queries.add(key)
         next_queries.append(str(query).strip())
-        if len(next_queries) >= max_queries:
+        if len(next_queries) >= query_limit:
             break
     return next_queries
 
@@ -705,13 +1363,22 @@ def _url_matches_allowed_suffix(url: str, allowed_suffixes: list[str]) -> bool:
 
 
 def _filter_rows_by_allowed_domains(rows: list[dict], allowed_suffixes: list[str]) -> list[dict]:
-    if not allowed_suffixes:
-        return rows
-    return [
-        row
-        for row in rows
-        if _url_matches_allowed_suffix(str(row.get("url", "")), allowed_suffixes)
-    ]
+    filtered: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = str(row.get("url", "")).strip()
+        title = str(row.get("title", "")).strip()
+        snippet = str(row.get("snippet", "")).strip()
+        if not _source_url_allowed(
+            url=url,
+            title=title,
+            snippet=snippet,
+            allowed_suffixes=allowed_suffixes,
+        ):
+            continue
+        filtered.append(row)
+    return filtered
 
 
 def _dedupe_rows(rows: list[dict], limit: int) -> list[dict]:
@@ -808,10 +1475,10 @@ def _finalize_chunks(
 
 
 def _chunk_clean_text(clean_text: str) -> list[str]:
-    max_chars = max(120, int(settings.serpapi.page_chunk_chars))
-    overlap = max(0, min(int(settings.serpapi.page_chunk_overlap_chars), max_chars // 2))
-    max_chunks = max(1, int(settings.serpapi.max_chunks_per_page))
-    min_chunk_chars = max(20, int(settings.serpapi.min_chunk_chars))
+    max_chars = max(120, int(settings.web_search.page_chunk_chars))
+    overlap = max(0, min(int(settings.web_search.page_chunk_overlap_chars), max_chars // 2))
+    max_chunks = _max_chunks_per_page_for_mode()
+    min_chunk_chars = max(20, int(settings.web_search.min_chunk_chars))
     segments = _segment_text_for_chunking(clean_text, max_chars=max_chars)
     if not segments:
         return []
@@ -865,7 +1532,7 @@ def _jaccard_similarity(left: set[str], right: set[str]) -> float:
 
 
 def _dedupe_chunk_candidates(candidates: list[dict]) -> list[dict]:
-    threshold = float(settings.serpapi.chunk_dedupe_similarity)
+    threshold = float(settings.web_search.chunk_dedupe_similarity)
     deduped: list[dict] = []
     signatures: list[tuple[set[str], str]] = []
     for candidate in candidates:
@@ -938,10 +1605,10 @@ def _domain_authority_score(url: str, allowed_suffixes: list[str]) -> float:
     host = str(urlparse(url).hostname or "").strip().lower()
     if not host:
         return 0.35
+    if allowed_suffixes and any(host.endswith(suffix) for suffix in allowed_suffixes):
+        return 0.82
     if any(host.endswith(suffix) for suffix in _HIGH_AUTHORITY_SUFFIXES):
         return 0.95
-    if allowed_suffixes and any(host.endswith(suffix) for suffix in allowed_suffixes):
-        return 0.85
     if host.endswith(".org"):
         return 0.7
     if host.endswith(".com") or host.endswith(".net"):
@@ -1007,10 +1674,10 @@ def _agreement_score(candidate: dict, candidates: list[dict]) -> float:
 
 
 def _normalized_trust_weights() -> tuple[float, float, float, float]:
-    relevance = max(0.0, float(getattr(settings.serpapi, "trust_relevance_weight", 0.6)))
-    authority = max(0.0, float(getattr(settings.serpapi, "trust_authority_weight", 0.2)))
-    recency = max(0.0, float(getattr(settings.serpapi, "trust_recency_weight", 0.1)))
-    agreement = max(0.0, float(getattr(settings.serpapi, "trust_agreement_weight", 0.1)))
+    relevance = max(0.0, float(getattr(settings.web_search, "trust_relevance_weight", 0.6)))
+    authority = max(0.0, float(getattr(settings.web_search, "trust_authority_weight", 0.2)))
+    recency = max(0.0, float(getattr(settings.web_search, "trust_recency_weight", 0.1)))
+    agreement = max(0.0, float(getattr(settings.web_search, "trust_agreement_weight", 0.1)))
     total = relevance + authority + recency + agreement
     if total <= 0:
         return 0.6, 0.2, 0.1, 0.1
@@ -1059,20 +1726,24 @@ async def _asearch_payloads(query_variants: list[str], *, top_k: int) -> list[di
     if not query_variants:
         return []
 
+    search_depth = _search_depth_for_mode()
+    num_results = _default_num_for_mode(top_k)
     if len(query_variants) == 1:
         payload = await asearch_google(
             query_variants[0],
-            gl=settings.serpapi.default_gl,
-            hl=settings.serpapi.default_hl,
-            num=max(top_k, settings.serpapi.default_num),
+            gl=settings.web_search.default_gl,
+            hl=settings.web_search.default_hl,
+            num=num_results,
+            search_depth=search_depth,
         )
         return [payload] if isinstance(payload, dict) else []
 
     batch = await asearch_google_batch(
         query_variants,
-        gl=settings.serpapi.default_gl,
-        hl=settings.serpapi.default_hl,
-        num=max(top_k, settings.serpapi.default_num),
+        gl=settings.web_search.default_gl,
+        hl=settings.web_search.default_hl,
+        num=num_results,
+        search_depth=search_depth,
     )
 
     payloads: list[dict] = []
@@ -1100,11 +1771,11 @@ def _collect_search_rows(
     top_k: int,
     allowed_suffixes: list[str],
 ) -> list[dict]:
-    per_query_limit = max(top_k, settings.serpapi.default_num)
+    per_query_limit = _default_num_for_mode(top_k)
     merged_rows: list[dict] = []
     for payload in payloads:
         merged_rows.extend(_organic_rows(payload, limit=per_query_limit))
-    dedupe_limit = max(top_k, settings.serpapi.max_context_results) * max(1, len(query_variants))
+    dedupe_limit = max(top_k, _max_context_results_for_mode()) * max(1, len(query_variants))
     rows = _dedupe_rows(merged_rows, limit=dedupe_limit)
     return _filter_rows_by_allowed_domains(rows, allowed_suffixes)
 
@@ -1116,22 +1787,14 @@ def _collect_search_rows_with_domain_retry(
     top_k: int,
     allowed_suffixes: list[str],
 ) -> tuple[list[dict], bool]:
-    """Collect rows with a fallback pass when strict domain suffix filtering is too narrow."""
+    """Collect rows with strict source filtering and no domain-relax fallback."""
     rows = _collect_search_rows(
         payloads,
         query_variants,
         top_k=top_k,
         allowed_suffixes=allowed_suffixes,
     )
-    if rows or not allowed_suffixes:
-        return rows, False
-    relaxed_rows = _collect_search_rows(
-        payloads,
-        query_variants,
-        top_k=top_k,
-        allowed_suffixes=[],
-    )
-    return relaxed_rows, bool(relaxed_rows)
+    return rows, False
 
 
 def _ai_overview_candidate(payloads: list[dict], allowed_suffixes: list[str]) -> dict | None:
@@ -1144,9 +1807,9 @@ def _ai_overview_candidate(payloads: list[dict], allowed_suffixes: list[str]) ->
         return {
             "_score": 1.5,
             "chunk_id": "web:ai_overview",
-            "source_path": "serpapi://google/ai_overview",
+            "source_path": "web_search://google/ai_overview",
             "distance": 0.0,
-            "content": ai_text[: settings.serpapi.max_page_chars],
+            "content": ai_text[: settings.web_search.max_page_chars],
             "metadata": {
                 "university": "Google AI Overview",
                 "title": "Google AI Overview",
@@ -1213,10 +1876,15 @@ def _organic_row_candidates(
 ) -> list[dict]:
     title = str(row.get("title", "")).strip()
     url = str(row.get("url", "")).strip()
-    if not _url_matches_allowed_suffix(url, allowed_suffixes):
+    snippet = str(row.get("snippet", "")).strip()
+    if not _source_url_allowed(
+        url=url,
+        title=title,
+        snippet=snippet,
+        allowed_suffixes=allowed_suffixes,
+    ):
         return []
 
-    snippet = str(row.get("snippet", "")).strip()
     row_published_date = str(row.get("published_date", "")).strip()
     page_text, page_published_date = _page_text_and_date(page_data_by_url.get(url, {}))
     published_date = row_published_date or page_published_date
@@ -1230,7 +1898,7 @@ def _organic_row_candidates(
     if not chunk_texts:
         return []
 
-    max_chunks = max(1, int(settings.serpapi.max_chunks_per_page))
+    max_chunks = _max_chunks_per_page_for_mode()
     ranked = _ranked_page_candidates(
         chunk_texts=chunk_texts,
         query_tokens=query_tokens,
@@ -1243,9 +1911,9 @@ def _organic_row_candidates(
             {
                 "_score": score,
                 "chunk_id": f"web:organic:{index}:{chunk_index}",
-                "source_path": url or f"serpapi://google/organic/{index}",
+                "source_path": url or f"web_search://google/organic/{index}",
                 "distance": round(max(0.0, 1.0 - min(1.0, score)), 4),
-                "content": content[: settings.serpapi.max_page_chars],
+                "content": content[: settings.web_search.max_page_chars],
                 "metadata": {
                     "university": title or _host_label(url),
                     "title": title or _host_label(url),
@@ -1287,7 +1955,7 @@ def _finalize_candidates(candidates: list[dict]) -> list[dict]:
         key=lambda item: float(item.get("_final_score", item.get("_score", 0.0))), reverse=True
     )
     deduped = _dedupe_chunk_candidates(candidates)
-    max_results = max(1, int(settings.serpapi.max_context_results))
+    max_results = _max_context_results_for_mode()
     min_unique_domains = _retrieval_min_unique_domains()
 
     selected_indexes: set[int] = set()
@@ -1298,7 +1966,8 @@ def _finalize_candidates(candidates: list[dict]) -> list[dict]:
         for index, item in enumerate(deduped):
             metadata = item.get("metadata")
             metadata = metadata if isinstance(metadata, dict) else {}
-            domain = _normalized_host(str(metadata.get("url", "")))
+            domain = _domain_group_key(_normalized_host(str(metadata.get("url", "")))
+            )
             if not domain or domain in selected_domains:
                 continue
             selected_domains.add(domain)
@@ -1378,7 +2047,7 @@ def _unique_domains_from_candidates(candidates: list[dict]) -> list[str]:
             continue
         metadata = candidate.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
-        host = _normalized_host(str(metadata.get("url", "")))
+        host = _domain_group_key(_normalized_host(str(metadata.get("url", ""))))
         if not host or host in seen:
             continue
         seen.add(host)
@@ -1387,7 +2056,11 @@ def _unique_domains_from_candidates(candidates: list[dict]) -> list[str]:
 
 
 def _retrieval_min_unique_domains() -> int:
-    return max(1, int(getattr(settings.serpapi, "retrieval_min_unique_domains", 2)))
+    configured = max(1, int(getattr(settings.web_search, "retrieval_min_unique_domains", 2)))
+    if not _is_deep_search_mode():
+        return configured
+    deep_override = max(1, int(getattr(settings.web_search, "deep_min_unique_domains", configured)))
+    return max(configured, deep_override)
 
 
 def _domain_diversity_gap(unique_domains: list[str]) -> int:
@@ -1406,6 +2079,26 @@ def _build_domain_gap_queries(query: str, unique_domains: list[str]) -> list[str
     if gap <= 0:
         return []
     candidates: list[str] = []
+    seen_domains = {
+        _domain_group_key(str(host).strip().lower())
+        for host in unique_domains
+        if str(host).strip()
+    }
+    seen_domains.discard("")
+    for entity in _comparison_entities_from_query(query):
+        entity_focus = _entity_focus_query(entity)
+        if not entity_focus:
+            continue
+        for domain in _official_domains_for_query(entity)[:1]:
+            grouped = _domain_group_key(domain)
+            if grouped in seen_domains:
+                continue
+            candidates.append(f"{entity_focus} site:{domain}")
+    for domain in _official_domains_for_query(query):
+        grouped = _domain_group_key(domain)
+        if grouped in seen_domains:
+            continue
+        candidates.append(f"{query} admission requirements application deadline site:{domain}")
     for _ in range(gap):
         candidates.extend(
             [
@@ -1416,7 +2109,7 @@ def _build_domain_gap_queries(query: str, unique_domains: list[str]) -> list[str
         )
     return _normalize_query_list(
         candidates,
-        limit=max(1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2))),
+        limit=max(1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2))),
     )
 
 
@@ -1440,7 +2133,7 @@ def _build_follow_up_queries(
     domain_queries = _build_domain_gap_queries(query, unique_domains)
     return _normalize_query_list(
         heuristic_queries + domain_queries,
-        limit=max(1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2))),
+        limit=max(1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2))),
     )
 
 
@@ -1448,22 +2141,48 @@ def _next_loop_queries(
     *,
     base_query: str,
     initial_queries: list[str],
+    first_wave_queries: list[str],
     missing_subquestions: list[str],
     llm_gap_queries: list[str],
     follow_up_queries: list[str],
     seen_queries: set[str],
     loop_step: int,
+    deep_mode: bool,
 ) -> list[str]:
     if loop_step <= 1:
-        return _next_queries_for_loop(initial_queries, seen_queries)
+        if not deep_mode:
+            return _next_queries_for_loop(
+                initial_queries,
+                seen_queries,
+                max_queries=min(2, _max_planner_queries()),
+            )
+        first_wave_limit = max(
+            _max_planner_queries(),
+            _max_planner_queries() + max(
+                1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2))
+            ),
+        )
+        first_wave_queries = _normalize_query_list(
+            list(initial_queries) + list(first_wave_queries),
+            limit=first_wave_limit,
+        )
+        return _next_queries_for_loop(
+            first_wave_queries,
+            seen_queries,
+            max_queries=first_wave_limit,
+        )
     gap_queries = (
         llm_gap_queries or follow_up_queries or _build_gap_queries(base_query, missing_subquestions)
     )
-    return _next_queries_for_loop(gap_queries, seen_queries)
+    return _next_queries_for_loop(
+        gap_queries,
+        seen_queries,
+        max_queries=max(1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2))),
+    )
 
 
 def _retrieval_loop_enabled() -> bool:
-    return bool(getattr(settings.serpapi, "retrieval_loop_enabled", True))
+    return _is_deep_search_mode() and bool(getattr(settings.web_search, "retrieval_loop_enabled", True))
 
 
 async def aretrieve_web_chunks(
@@ -1472,11 +2191,29 @@ async def aretrieve_web_chunks(
     top_k: int = 3,
     search_mode: str = "deep",
 ) -> dict:
-    """Retrieve fallback web evidence from Google via SerpAPI."""
+    normalized_mode = _normalized_search_mode(search_mode)
+    mode_token = _RETRIEVAL_MODE_CTX.set(normalized_mode)
+    try:
+        return await _aretrieve_web_chunks_impl(
+            query,
+            top_k=top_k,
+            search_mode=normalized_mode,
+        )
+    finally:
+        _RETRIEVAL_MODE_CTX.reset(mode_token)
+
+
+async def _aretrieve_web_chunks_impl(
+    query: str,
+    *,
+    top_k: int = 3,
+    search_mode: str = "deep",
+) -> dict:
+    """Retrieve fallback web evidence from Tavily."""
     started_at = time.perf_counter()
     allowed_suffixes = _normalized_allowed_domain_suffixes()
-    normalized_mode = str(search_mode or "deep").strip().lower()
-    deep_mode = normalized_mode != "fast"
+    normalized_mode = _normalized_search_mode(search_mode)
+    deep_mode = _is_deep_search_mode(normalized_mode)
     if deep_mode:
         query_plan = await _resolve_query_plan(query, allowed_suffixes)
     else:
@@ -1518,7 +2255,7 @@ async def aretrieve_web_chunks(
     executed_queries: list[str] = []
     loop_llm_used = False
 
-    max_steps = max(1, int(getattr(settings.serpapi, "retrieval_loop_max_steps", 2)))
+    max_steps = max(1, int(getattr(settings.web_search, "retrieval_loop_max_steps", 2)))
     if not deep_mode or not _retrieval_loop_enabled():
         max_steps = 1
 
@@ -1549,7 +2286,7 @@ async def aretrieve_web_chunks(
                 llm_gap_queries = _normalize_query_list(
                     llm_gap_plan.get("queries", []),
                     limit=max(
-                        1, int(getattr(settings.serpapi, "retrieval_loop_max_gap_queries", 2))
+                        1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2))
                     ),
                 )
                 follow_up_queries = _build_follow_up_queries(
@@ -1562,11 +2299,15 @@ async def aretrieve_web_chunks(
         loop_queries = _next_loop_queries(
             base_query=query,
             initial_queries=planned_queries,
+            first_wave_queries=(
+                _build_gap_queries(query, subquestions) if deep_mode else []
+            ),
             missing_subquestions=missing_subquestions,
             llm_gap_queries=llm_gap_queries,
             follow_up_queries=follow_up_queries,
             seen_queries=seen_queries,
             loop_step=step,
+            deep_mode=deep_mode,
         )
         if not loop_queries:
             break
@@ -1632,9 +2373,9 @@ async def aretrieve_web_chunks(
         all_facts = _extract_facts(
             all_candidates,
             limit=(
-                max(2, int(settings.serpapi.max_context_results) * 3)
+                max(2, _max_context_results_for_mode() * 3)
                 if deep_mode
-                else max(2, int(settings.serpapi.max_context_results))
+                else max(2, _max_context_results_for_mode())
             ),
         )
         emit_trace_event(
@@ -1693,7 +2434,7 @@ async def aretrieve_web_chunks(
     results = _finalize_candidates(all_candidates)
     extracted_facts = _extract_facts(
         results,
-        limit=max(1, int(settings.serpapi.max_context_results)),
+        limit=_max_context_results_for_mode(),
     )
     final_domains = _unique_domains_from_candidates(results)
     emit_trace_event(

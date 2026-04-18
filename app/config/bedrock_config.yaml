@@ -1,13 +1,23 @@
 # Bedrock generation configuration.
 bedrock:
-  primary_model_id: "us.anthropic.claude-sonnet-4-20250514-v1:0"
-  fallback_model_id: "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+  primary_model_id: "us.anthropic.claude-opus-4-6-v1"
+  fallback_model_id: "us.amazon.nova-2-lite-v1:0"
   timeout: 30
-  max_concurrency: 50
+  max_concurrency: 4
+  web_grounding_enabled: true
+  web_grounding_include_sources: true
+  throttle_retry_max_attempts: 2
+  throttle_retry_base_backoff_seconds: 0.4
+  throttle_retry_max_backoff_seconds: 8.0
+  throttle_retry_jitter_seconds: 0.25
+  answer_rate_limit_rps: 1.5
+  answer_rate_limit_burst: 2
+  planner_rate_limit_rps: 4.0
+  planner_rate_limit_burst: 8
   reranker_enabled: true
   reranker_model_id: "cohere.rerank-v3-5:0"
   reranker_api_version: 2
-  reranker_top_n: 2
+  reranker_top_n: 3
   reranker_min_documents: 2
   reranker_max_documents: 12
   reranker_max_query_chars: 700

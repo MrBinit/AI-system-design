@@ -5,11 +5,14 @@
 @tailwind utilities;
 
 :root {
-  --app-bg: #f8fbff;
+  --app-bg: #f6f9ff;
   --app-text: #0f172a;
-  --blue-200: #bfdbfe;
-  --blue-500: #3b82f6;
-  --blue-700: #1d4ed8;
+  --brand-blue: #0c4da2;
+  --brand-red: #e41e3f;
+  --brand-sky: #1d84e2;
+  --ui-border: #cfe0ff;
+  --ui-soft: #edf4ff;
+  --ui-soft-alt: #fff1f4;
   font-family: "Plus Jakarta Sans", "Avenir Next", "Segoe UI", sans-serif;
 }
 
@@ -21,7 +24,7 @@ body {
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--blue-200) transparent;
+  scrollbar-color: var(--ui-border) transparent;
 }
 
 *::-webkit-scrollbar {
@@ -34,7 +37,7 @@ body {
 }
 
 *::-webkit-scrollbar-thumb {
-  background: var(--blue-200);
+  background: var(--ui-border);
   border-radius: 9999px;
 }
 

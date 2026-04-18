@@ -6,11 +6,18 @@ chat:
       Use a single concise pass over available evidence.
       Avoid unnecessary reflection or verification loops.
       Prioritize low latency while keeping factual claims citation-grounded.
+      Cover only the user-requested dimensions; avoid over-expanding scope.
+      Keep output compact and readable (short sections, no snippet dumping, no long caveat blocks).
+      For unavailable facts, write "Not verified from sources." inline.
+      Avoid markdown tables unless the user explicitly asks for a table.
     deep_system_prompt: |
       Execution mode: deep.
       Perform multi-step synthesis across evidence.
       Resolve conflicts, maximize source corroboration, and verify citation coverage before finalizing.
       Use an additional refinement pass when quality checks fail.
+      Prioritize readability: synthesize instead of repeating snippets, and avoid duplicate evidence lines.
+      Plan-first behavior: decide coverage dimensions before writing, then synthesize only after evidence is collected.
+      Do not output internal planning steps.
   agentic:
     enabled: true
     max_reflection_rounds: 1
@@ -23,10 +30,11 @@ chat:
       {
         "intent": "short statement of user goal",
         "subquestions": ["what must be answered"],
-        "search_queries": ["targeted follow-up queries if evidence is weak"],
         "success_criteria": ["checks answer must satisfy before finalization"]
       }
       Keep entities, numbers, dates, and constraints from the user query unchanged.
+      Cover user-requested dimensions explicitly (for example: eligibility, language, deadlines, fees, curriculum).
+      Prefer independent and non-overlapping subquestions.
       Do not output explanations or markdown.
     verifier_system_prompt: |
       You are an internal answer verifier.
@@ -40,6 +48,7 @@ chat:
       }
       Mark pass=false when the draft does not sufficiently answer the query, lacks evidence support,
       or fails citation grounding constraints.
+      Mark pass=false when the draft is low-readability (snippet dumping, repetition, or poor structure).
       Do not output explanations or markdown.
     system_prompt: |
       Work as an internal retrieval agent:
@@ -71,8 +80,10 @@ chat:
 
     Response format:
     - Start with a direct answer in 1-2 lines.
-    - Then provide concise bullets for the most important facts.
-    - End with a "Sources:" section listing the cited URLs.
+    - Then provide concise sections for requested dimensions (for example: Program, Eligibility, Language, Deadlines, Fees).
+    - For unavailable facts, write "Not verified from sources." inline under the relevant section.
+    - Avoid long caveat blocks, duplication, or snippet dumps.
+    - End with a "Sources:" section listing only the URLs used in the answer.
 
 memory:
   summary_system_prompt: |

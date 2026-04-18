@@ -29,18 +29,12 @@ From repo root:
 
 ```bash
 chmod +x loadtest/run_local_mock_chat_load.sh
-LOCAL_REDIS_PORT=6380 REQUESTS=300 CONCURRENCY=24 API_WORKERS=1 ./loadtest/run_local_mock_chat_load.sh
+REQUESTS=300 CONCURRENCY=24 API_WORKERS=1 ./loadtest/run_local_mock_chat_load.sh
 ```
 
 ## Custom run (manual)
 
-1. Start Redis:
-
-```bash
-docker compose -f docker-compose.yml --profile local-redis up -d redis
-```
-
-2. Start API with safe local flags:
+1. Start API with safe local flags:
 
 ```bash
 export SECURITY_JWT_SECRET='01234567890123456789012345678901'
@@ -55,17 +49,11 @@ export LLM_MOCK_MODE=true
 export RETRIEVAL_DISABLED=true
 export LLM_MOCK_DELAY_MS=80
 export LLM_MOCK_STREAM_CHUNK_CHARS=16
-export REDIS_APP_HOST=127.0.0.1
-export REDIS_WORKER_HOST=127.0.0.1
-export REDIS_APP_TLS=false
-export REDIS_WORKER_TLS=false
-export REDIS_APP_SSL_CERT_REQS=none
-export REDIS_WORKER_SSL_CERT_REQS=none
 
 ./venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
-3. In another terminal, generate token:
+2. In another terminal, generate token:
 
 ```bash
 TOKEN="$(./venv/bin/python - <<'PY'
@@ -75,7 +63,7 @@ PY
 )"
 ```
 
-4. Run load:
+3. Run load:
 
 ```bash
 ./venv/bin/python loadtest/http_load.py \
@@ -139,6 +127,7 @@ Requirements:
 - Valid AWS credentials in shell.
 - Working Postgres credentials for your configured DB (`POSTGRES_PASSWORD` or Secrets Manager path).
 - Existing configured AWS resources (SQS queues + DynamoDB tables).
+- Redis must point to AWS ElastiCache (`*.cache.amazonaws.com`) with TLS enabled.
 
 Tip: if your shared queue already has traffic, set dedicated queue URLs in YAML (`runtime.llm_queue_url`, `runtime.metrics_queue_url`) to isolate load-test results.
 

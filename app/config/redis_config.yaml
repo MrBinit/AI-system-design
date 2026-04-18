@@ -1,4 +1,8 @@
 redis:
+  allow_local_redis: false
+  local_tunnel_enabled: false
+  tunnel_local_port: 6380
+  tunnel_instance_id: "i-00ac2c35d69cd4b7a"
   app:
     host: "ai-redis-cache-vho1b2.serverless.use1.cache.amazonaws.com"
     port: 6379

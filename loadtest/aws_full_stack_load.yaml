@@ -20,7 +20,6 @@ assertions:
 runtime:
   api_workers: 5
   api_port: 18000
-  local_redis_port: 6380
   llm_async_workers: 6
   metrics_workers: 3
   wait_for_metrics_drain_seconds: 120

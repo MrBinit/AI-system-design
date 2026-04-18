@@ -1,0 +1,15 @@
+redis:
+  allow_local_redis: true
+  local_tunnel_enabled: false
+  app:
+    host: "redis"
+    port: 6379
+    tls: false
+    ssl_cert_reqs: "none"
+    ssl_ca_certs: ""
+  worker:
+    host: "redis"
+    port: 6379
+    tls: false
+    ssl_cert_reqs: "none"
+    ssl_ca_certs: ""

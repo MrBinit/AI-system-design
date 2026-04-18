@@ -35,10 +35,19 @@ def _parse_message_body(raw_body: str) -> dict:
 
 
 def _safe_append_trace(job_id: str, event: dict) -> None:
+    event_type = ""
+    if isinstance(event, dict):
+        event_type = str(event.get("type", "")).strip()
     try:
         append_job_trace_event(job_id, event)
-    except Exception:
-        logger.warning("AsyncLLMTraceAppendFailed | job_id=%s", job_id)
+    except Exception as exc:
+        logger.warning(
+            "AsyncLLMTraceAppendFailed | job_id=%s | event_type=%s | error_type=%s | error=%s",
+            job_id,
+            event_type or "event",
+            type(exc).__name__,
+            str(exc)[:240],
+        )
 
 
 async def _process_message(message: dict) -> None:

@@ -40,6 +40,23 @@ class _FakeBedrockRuntimeClient:
         }
 
 
+class _ThrottlingError(Exception):
+    def __init__(self):
+        super().__init__("Too many requests")
+        self.response = {"Error": {"Code": "ThrottlingException"}}
+
+
+class _FlakyBedrockRuntimeClient(_FakeBedrockRuntimeClient):
+    def __init__(self):
+        self.calls = 0
+
+    def converse(self, **payload):
+        self.calls += 1
+        if self.calls == 1:
+            raise _ThrottlingError()
+        return super().converse(**payload)
+
+
 async def _run_inline(fn):
     return fn()
 
@@ -61,6 +78,24 @@ def test_aconverse_uses_model_scoped_circuit_breaker(monkeypatch):
     assert len(fake_breaker.calls) == 1
     _fn, _args, kwargs = fake_breaker.calls[0]
     assert kwargs["modelId"] == "test-model"
+
+
+def test_aconverse_retries_throttling_errors(monkeypatch):
+    fake_breaker = _FakeBreaker()
+    flaky_client = _FlakyBedrockRuntimeClient()
+    monkeypatch.setattr(bedrock_client, "_run_in_bedrock_executor", _run_inline)
+    monkeypatch.setattr(bedrock_client, "get_bedrock_runtime_client", lambda: flaky_client)
+    monkeypatch.setattr(bedrock_client, "get_llm_breaker", lambda _model_id: fake_breaker)
+    monkeypatch.setattr(bedrock_client.time, "sleep", lambda _seconds: None)
+
+    payload = {
+        "modelId": "test-model",
+        "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+    }
+    response = asyncio.run(bedrock_client.aconverse(payload, rate_limit_profile="planner"))
+
+    assert response["output"]["message"]["content"][0]["text"] == "ok"
+    assert flaky_client.calls == 2
 
 
 def test_ainvoke_model_json_uses_embedding_circuit_breaker(monkeypatch):

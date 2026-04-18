@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
-export LOCAL_REDIS_PORT="${LOCAL_REDIS_PORT:-6380}"
 export GRADIO_PORT="${GRADIO_PORT:-7860}"
 export ENV_FILE="${ENV_FILE:-.env.local}"
 
@@ -20,7 +19,6 @@ fi
 COMPOSE_ARGS=(
   -f docker-compose.yml
   -f docker-compose.local.yml
-  --profile local-redis
 )
 
 HOST_METRICS_DIR="${ROOT_DIR}/data/metrics"

@@ -9,8 +9,13 @@ This module supports the async chat flow:
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
+import random
+import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from functools import lru_cache
 from uuid import uuid4
 
@@ -20,6 +25,7 @@ from botocore.exceptions import ClientError
 from app.core.config import get_settings
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 _JOB_STATUS_QUEUED = "queued"
 _JOB_STATUS_PROCESSING = "processing"
@@ -28,6 +34,8 @@ _JOB_STATUS_FAILED = "failed"
 _PUBLIC_JOB_ERROR = "Async chat job failed."
 _TRACE_EVENT_MAX_PAYLOAD_CHARS = 800
 _TRACE_MAX_EVENTS_PER_JOB = 120
+_TRACE_APPEND_MAX_ATTEMPTS = 4
+_TRACE_APPEND_BASE_DELAY_SECONDS = 0.05
 _VALID_STATUSES = {
     _JOB_STATUS_QUEUED,
     _JOB_STATUS_PROCESSING,
@@ -103,7 +111,11 @@ def _sanitize_job_error(error_message: str) -> str:
 
 
 def _safe_trace_value(value):
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return str(value)
+        return Decimal(str(value))
+    if isinstance(value, (str, int, bool)) or value is None:
         text = str(value) if value is not None else ""
         return text[:_TRACE_EVENT_MAX_PAYLOAD_CHARS] if isinstance(value, str) else value
     if isinstance(value, list):
@@ -161,6 +173,8 @@ def _update_job(job_id: str, updates: dict) -> None:
 
 def _normalized_mode(value: str | None) -> str:
     candidate = str(value or "").strip().lower()
+    if candidate == "standard":
+        return "fast"
     if candidate in {"fast", "deep", "auto"}:
         return candidate
     return "auto"
@@ -318,22 +332,55 @@ def mark_job_failed(job_id: str, error_message: str) -> None:
 
 def append_job_trace_event(job_id: str, event: dict) -> None:
     safe_event = _sanitize_trace_event(event)
-    _dynamodb_table().update_item(
-        Key={"job_id": job_id},
-        UpdateExpression=(
-            "SET trace_events=list_append(if_not_exists(trace_events, :empty_events), :new_event), "
-            "updated_at=:updated_at"
-        ),
-        ConditionExpression=(
-            "attribute_exists(job_id) AND "
-            "(attribute_not_exists(trace_events) OR size(trace_events) < :max_events)"
-        ),
-        ExpressionAttributeValues={
-            ":empty_events": [],
-            ":new_event": [safe_event],
-            ":updated_at": _now_iso(),
-            ":max_events": _TRACE_MAX_EVENTS_PER_JOB,
-        },
+    for attempt in range(1, _TRACE_APPEND_MAX_ATTEMPTS + 1):
+        try:
+            _dynamodb_table().update_item(
+                Key={"job_id": job_id},
+                UpdateExpression=(
+                    "SET trace_events=list_append(if_not_exists(trace_events, :empty_events), :new_event), "
+                    "updated_at=:updated_at"
+                ),
+                ConditionExpression=(
+                    "attribute_exists(job_id) AND "
+                    "(attribute_not_exists(trace_events) OR size(trace_events) < :max_events)"
+                ),
+                ExpressionAttributeValues={
+                    ":empty_events": [],
+                    ":new_event": [safe_event],
+                    ":updated_at": _now_iso(),
+                    ":max_events": _TRACE_MAX_EVENTS_PER_JOB,
+                },
+            )
+            return
+        except ClientError as exc:
+            error_code = str(exc.response.get("Error", {}).get("Code", "")).strip()
+            if error_code == "ConditionalCheckFailedException":
+                # Trace append is best-effort: stop once the event cap is hit or record no longer matches.
+                return
+            if attempt >= _TRACE_APPEND_MAX_ATTEMPTS:
+                raise
+            if error_code not in {
+                "ProvisionedThroughputExceededException",
+                "ThrottlingException",
+                "RequestLimitExceeded",
+                "InternalServerError",
+                "ServiceUnavailable",
+                "LimitExceededException",
+                "TransactionConflictException",
+            }:
+                raise
+            delay = _TRACE_APPEND_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+            time.sleep(delay + random.uniform(0, 0.03))
+        except Exception:
+            if attempt >= _TRACE_APPEND_MAX_ATTEMPTS:
+                raise
+            delay = _TRACE_APPEND_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+            time.sleep(delay + random.uniform(0, 0.03))
+
+    logger.warning(
+        "AsyncLLMTraceAppendExhaustedRetries | job_id=%s | event_type=%s",
+        job_id,
+        str(safe_event.get("type", "event")),
     )
 
 

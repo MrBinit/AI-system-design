@@ -1,0 +1,25 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="UniGraph icon">
+  <defs>
+    <linearGradient id="shieldGrad" x1="52" y1="40" x2="204" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1D84E2"/>
+      <stop offset="0.45" stop-color="#0C4DA2"/>
+      <stop offset="1" stop-color="#E41E3F"/>
+    </linearGradient>
+    <linearGradient id="arrowGrad" x1="124" y1="118" x2="234" y2="22" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FF9E1B"/>
+      <stop offset="1" stop-color="#E41E3F"/>
+    </linearGradient>
+  </defs>
+
+  <path d="M46 56L126 28L210 56V148C210 184 179 213 128 228C77 213 46 184 46 148V56Z" fill="url(#shieldGrad)"/>
+  <path d="M74 170H98V194H74V170Z" fill="#E41E3F" opacity="0.85"/>
+  <path d="M108 150H132V194H108V150Z" fill="#E41E3F" opacity="0.85"/>
+  <path d="M142 134H166V194H142V134Z" fill="#E41E3F" opacity="0.85"/>
+
+  <path d="M118 120L186 116L170 148L212 156L236 60L156 92L134 78L118 120Z" fill="url(#arrowGrad)"/>
+
+  <path d="M66 98L127 75L190 99L127 124L66 98Z" fill="white"/>
+  <path d="M85 106V132C85 132 109 150 127 150C145 150 169 132 169 132V106" stroke="#0C4DA2" stroke-width="4"/>
+  <circle cx="94" cy="130" r="4" fill="#0C4DA2"/>
+  <path d="M94 130V142" stroke="#0C4DA2" stroke-width="3"/>
+</svg>

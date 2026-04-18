@@ -22,12 +22,44 @@ function cardClass(role: ChatMessage["role"]): string {
   if (role === "assistant") {
     return "border border-blue-100 bg-white shadow-soft dark:border-slate-700 dark:bg-slate-900";
   }
-  return "border border-blue-100 bg-gradient-to-br from-blue-50/80 to-white shadow-sm dark:border-slate-700 dark:bg-slate-800/80";
+  return "border border-blue-100 bg-gradient-to-br from-blue-50/80 via-white to-rose-50/50 shadow-sm dark:border-slate-700 dark:bg-slate-800/80";
 }
 
 function extractUrlsFromText(input: string): string[] {
   const matches = input.match(/https?:\/\/[^\s)"']+/gi) ?? [];
   return Array.from(new Set(matches.map((item) => item.trim())));
+}
+
+function displayWebsite(value: string): string {
+  try {
+    const hostname = new URL(value).hostname.trim().toLowerCase();
+    return hostname.replace(/^www\./, "");
+  } catch {
+    return value.trim().toLowerCase();
+  }
+}
+
+function compactUrlLabel(url: string): string {
+  return url.replace(/^https?:\/\//i, "").replace(/\/$/, "");
+}
+
+function splitAnswerSections(content: string): { primary: string; sourcesBlock: string } {
+  const text = String(content ?? "");
+  const marker = text.match(/\n\s*Sources?:\s*/i);
+  if (!marker || typeof marker.index !== "number") {
+    return { primary: text.trim(), sourcesBlock: "" };
+  }
+  const primary = text.slice(0, marker.index).trim();
+  const sourcesBlock = text.slice(marker.index).trim();
+  return { primary, sourcesBlock };
+}
+
+function compactPercent(value?: number): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  const pct = Math.max(0, Math.min(100, Math.round(value * 100)));
+  return `${pct}%`;
 }
 
 export function MessageCard({
@@ -45,6 +77,7 @@ export function MessageCard({
     message.role === "assistant" && message.content.trim().toLowerCase().startsWith("error:");
   const modeLabel = message.executionMode ? message.executionMode.toUpperCase() : "";
   const citations = message.sourceUrls?.length ? message.sourceUrls : extractUrlsFromText(message.content);
+  const { primary: primaryAnswer, sourcesBlock } = splitAnswerSections(message.content);
 
   useEffect(() => {
     return () => {
@@ -76,7 +109,7 @@ export function MessageCard({
   return (
     <article className="animate-[fade-up_240ms_ease-out] space-y-1.5">
       <div className="flex items-start gap-3">
-        <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 text-[11px] font-bold text-white">
+        <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-brand-blue to-brand-red text-[11px] font-bold text-white">
           {avatarForRole(message.role)}
         </div>
 
@@ -91,11 +124,11 @@ export function MessageCard({
             {message.role === "assistant" ? (
               <div className="flex items-center gap-1.5">
                 {modeLabel ? (
-                  <span className="rounded-full bg-indigo-100 px-2 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-950/50 dark:text-indigo-200">
+                  <span className="rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-medium text-rose-700 dark:bg-rose-950/50 dark:text-rose-200">
                     {modeLabel}
                   </span>
                 ) : null}
-                <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-blue-700 dark:bg-slate-700 dark:text-slate-200">
+                <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-brand-blue dark:bg-slate-700 dark:text-slate-200">
                   AI response
                 </span>
               </div>
@@ -107,17 +140,32 @@ export function MessageCard({
               <button
                 type="button"
                 onClick={() => onOpenActivity(message.id)}
-                className="inline-flex items-center gap-1 text-[15px] font-medium text-slate-700 hover:text-blue-700 dark:text-slate-200 dark:hover:text-blue-300"
+                className="inline-flex items-center gap-1 text-[15px] font-medium text-slate-700 hover:text-brand-blue dark:text-slate-200 dark:hover:text-blue-300"
               >
                 <ActivityIcon className="h-4 w-4" />
                 {message.workedForLabel ? `Thought for ${message.workedForLabel}` : "Thought details"}{" "}
                 <span aria-hidden="true">›</span>
               </button>
+              {compactPercent(message.trustConfidence) ? (
+                <span className="rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:border-emerald-900/70 dark:bg-emerald-950/40 dark:text-emerald-200">
+                  {compactPercent(message.trustConfidence)} confidence
+                </span>
+              ) : null}
+              {message.trustFreshness ? (
+                <span className="rounded-full border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium capitalize text-brand-blue dark:border-blue-900/70 dark:bg-blue-950/40 dark:text-blue-200">
+                  {message.trustFreshness}
+                </span>
+              ) : null}
+              {message.trustContradiction ? (
+                <span className="rounded-full border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:border-amber-900/70 dark:bg-amber-950/40 dark:text-amber-200">
+                  conflict
+                </span>
+              ) : null}
               {citations.length ? (
                 <button
                   type="button"
                   onClick={() => setShowCitations((prev) => !prev)}
-                  className="text-[13px] text-blue-700 hover:underline dark:text-blue-300"
+                  className="text-[13px] text-brand-blue hover:underline dark:text-blue-300"
                 >
                   {showCitations ? "Hide" : "Show"} citations ({citations.length})
                 </button>
@@ -183,7 +231,7 @@ export function MessageCard({
                   ),
                 }}
               >
-                {message.content}
+                {primaryAnswer || message.content}
               </ReactMarkdown>
             </div>
           ) : (
@@ -193,14 +241,37 @@ export function MessageCard({
           )}
 
           {message.role === "assistant" && showCitations && citations.length ? (
-            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-slate-500 dark:text-slate-400">
-              {citations.slice(0, 5).map((url) => (
-                <a key={url} href={url} target="_blank" rel="noreferrer" className="max-w-full truncate text-blue-700 hover:underline dark:text-blue-300">
-                  {url}
-                </a>
-              ))}
-              {citations.length > 5 ? <span>+{citations.length - 5} more</span> : null}
-            </div>
+            <section className="mt-2 rounded-xl border border-blue-100 bg-white/70 p-2.5 dark:border-slate-700 dark:bg-slate-900/60">
+              <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300">
+                Supporting Evidence
+              </p>
+              <div className="space-y-1.5">
+                {citations.slice(0, 6).map((url, index) => (
+                  <a
+                    key={url}
+                    href={url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block rounded-lg border border-blue-100 bg-white px-2.5 py-2 hover:bg-blue-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300">
+                        [{index + 1}] {displayWebsite(url)}
+                      </span>
+                    </div>
+                    <span className="mt-0.5 block truncate text-[11px] text-brand-blue dark:text-blue-300">
+                      {compactUrlLabel(url)}
+                    </span>
+                  </a>
+                ))}
+                {citations.length > 6 ? (
+                  <p className="text-[10px] text-slate-500 dark:text-slate-400">+{citations.length - 6} more</p>
+                ) : null}
+                {sourcesBlock ? (
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">{sourcesBlock.slice(0, 180)}</p>
+                ) : null}
+              </div>
+            </section>
           ) : null}
 
           {message.role === "assistant" && message.sourcePrompt ? (
@@ -208,7 +279,7 @@ export function MessageCard({
               <button
                 type="button"
                 onClick={() => onRegenerate(message.sourcePrompt || "")}
-                className="inline-flex items-center gap-1 rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-700 transition hover:bg-blue-100 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+                className="inline-flex items-center gap-1 rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-medium text-brand-blue transition hover:bg-blue-100 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
               >
                 <SparklesIcon className="h-3.5 w-3.5" />
                 Regenerate
@@ -217,7 +288,7 @@ export function MessageCard({
               <button
                 type="button"
                 onClick={() => onRegenerateInDeep(message.sourcePrompt || "")}
-                className="rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1.5 text-xs text-indigo-700 transition hover:bg-indigo-100 dark:border-indigo-800 dark:bg-indigo-950/40 dark:text-indigo-200"
+                className="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-xs text-rose-700 transition hover:bg-rose-100 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-200"
               >
                 Regenerate in Deep
               </button>
@@ -239,8 +310,8 @@ export function MessageCard({
                 onClick={() => onReaction(message.id, message.reaction === "like" ? null : "like")}
                 className={`rounded-lg border px-2.5 py-1.5 text-xs transition ${
                   message.reaction === "like"
-                    ? "border-blue-500 bg-blue-600 text-white"
-                    : "border-slate-200 bg-white text-slate-600 hover:border-blue-200 hover:text-blue-600 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-200"
+                    ? "border-brand-blue bg-brand-blue text-white"
+                    : "border-slate-200 bg-white text-slate-600 hover:border-blue-200 hover:text-brand-blue dark:border-slate-600 dark:bg-slate-900 dark:text-slate-200"
                 }`}
               >
                 <LikeIcon className="h-3.5 w-3.5" />

@@ -18,7 +18,7 @@ class ChatRequest(BaseModel):
         pattern=r"^[A-Za-z0-9_.:@\-]+$",
     )
     prompt: str = Field(min_length=1, max_length=8000)
-    mode: Literal["auto", "fast", "deep"] = "auto"
+    mode: Literal["auto", "fast", "standard", "deep"] = "auto"
 
 
 class AsyncChatEnqueueResponse(BaseModel):

@@ -45,8 +45,9 @@ def _stub_citation_grounding_policy(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _disable_always_web_hybrid_by_default(monkeypatch):
-    monkeypatch.setattr(llm_service.settings.serpapi, "always_web_retrieval_enabled", False)
-    monkeypatch.setattr(llm_service.settings.serpapi, "retrieval_min_unique_domains", 1)
+    monkeypatch.setattr(llm_service.settings.web_search, "always_web_retrieval_enabled", False)
+    monkeypatch.setattr(llm_service.settings.web_search, "retrieval_min_unique_domains", 1)
+    monkeypatch.setattr(llm_service.settings.web_search, "deep_min_unique_domains", 1)
 
 
 @pytest.fixture(autouse=True)
@@ -301,7 +302,7 @@ async def test_generate_response_agentic_retries_for_source_diversity(monkeypatc
     monkeypatch.setattr(
         llm_service, "_enforce_citation_grounding", _REAL_ENFORCE_CITATION_GROUNDING
     )
-    monkeypatch.setattr(llm_service.settings.serpapi, "retrieval_min_unique_domains", 2)
+    monkeypatch.setattr(llm_service.settings.web_search, "retrieval_min_unique_domains", 2)
     monkeypatch.setattr(
         llm_service,
         "_evidence_urls",
@@ -518,10 +519,10 @@ async def test_generate_response_skips_retrieval_when_disabled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_generate_response_uses_web_fallback_when_vector_empty(monkeypatch):
-    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
-    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "max_context_results", 2)
+    monkeypatch.setenv("WEB_SEARCH_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.web_search, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "max_context_results", 2)
 
     fake_redis = FakeRedis()
     _attach_fake_redis(monkeypatch, fake_redis)
@@ -568,10 +569,10 @@ async def test_generate_response_uses_web_fallback_when_vector_empty(monkeypatch
 
 @pytest.mark.asyncio
 async def test_generate_response_skips_web_fallback_when_vector_confident(monkeypatch):
-    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
-    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_similarity_threshold", 0.35)
+    monkeypatch.setenv("WEB_SEARCH_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.web_search, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_similarity_threshold", 0.35)
 
     fake_redis = FakeRedis()
     _attach_fake_redis(monkeypatch, fake_redis)
@@ -622,10 +623,10 @@ async def test_generate_response_skips_web_fallback_when_vector_confident(monkey
 
 @pytest.mark.asyncio
 async def test_generate_response_always_web_hybrid_runs_web_when_vector_confident(monkeypatch):
-    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
-    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "always_web_retrieval_enabled", True)
+    monkeypatch.setenv("WEB_SEARCH_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.web_search, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "always_web_retrieval_enabled", True)
 
     fake_redis = FakeRedis()
     _attach_fake_redis(monkeypatch, fake_redis)
@@ -677,7 +678,7 @@ async def test_generate_response_always_web_hybrid_runs_web_when_vector_confiden
 
     result = await llm_service.generate_response("user-1", "oxford ai admission")
     assert result == "primary-response"
-    assert web_calls["count"] == 1
+    assert web_calls["count"] >= 1
 
 
 @pytest.mark.asyncio
@@ -885,10 +886,10 @@ async def test_prepare_messages_for_model_fanout_cancels_vector_prefetch_on_quer
 
 @pytest.mark.asyncio
 async def test_generate_response_uses_web_fallback_when_vector_low_confidence(monkeypatch):
-    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
-    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_similarity_threshold", 0.35)
+    monkeypatch.setenv("WEB_SEARCH_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.web_search, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_similarity_threshold", 0.35)
 
     fake_redis = FakeRedis()
     _attach_fake_redis(monkeypatch, fake_redis)
@@ -944,10 +945,10 @@ async def test_generate_response_uses_web_fallback_when_vector_low_confidence(mo
 
 @pytest.mark.asyncio
 async def test_generate_response_reranks_combined_vector_and_web_results(monkeypatch):
-    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
-    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_similarity_threshold", 0.35)
+    monkeypatch.setenv("WEB_SEARCH_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.web_search, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_similarity_threshold", 0.35)
 
     fake_redis = FakeRedis()
     _attach_fake_redis(monkeypatch, fake_redis)
@@ -1013,11 +1014,11 @@ async def test_generate_response_reranks_combined_vector_and_web_results(monkeyp
 
 @pytest.mark.asyncio
 async def test_generate_response_rerank_restores_domain_diversity(monkeypatch):
-    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
-    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "retrieval_min_unique_domains", 2)
-    monkeypatch.setattr(llm_service.settings.serpapi, "max_context_results", 4)
+    monkeypatch.setenv("WEB_SEARCH_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.web_search, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "retrieval_min_unique_domains", 2)
+    monkeypatch.setattr(llm_service.settings.web_search, "max_context_results", 4)
 
     fake_redis = FakeRedis()
     _attach_fake_redis(monkeypatch, fake_redis)
@@ -1031,7 +1032,7 @@ async def test_generate_response_rerank_restores_domain_diversity(monkeypatch):
         )
         assert "Evidence from domain X." in joined
         assert "Evidence from domain Y." in joined
-        return FakeResponse("primary-response")
+        return FakeResponse("Comparison: X has systems focus, while Y has research focus.")
 
     async def fake_update_memory(*_args, **_kwargs):
         return None
@@ -1070,14 +1071,72 @@ async def test_generate_response_rerank_restores_domain_diversity(monkeypatch):
     monkeypatch.setattr(llm_service, "arerank_retrieval_results", fake_rerank)
 
     result = await llm_service.generate_response("user-1", "compare x and y")
-    assert result == "primary-response"
+    assert "Comparison:" in result
+
+
+@pytest.mark.asyncio
+async def test_generate_response_rerank_restores_comparison_entity_coverage(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.web_search, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "retrieval_min_unique_domains", 1)
+    monkeypatch.setattr(llm_service.settings.web_search, "max_context_results", 4)
+
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    async def fake_primary(messages):
+        joined = "\n".join(
+            str(message.get("content", "")) for message in messages if isinstance(message, dict)
+        )
+        assert "TUM data evidence." in joined
+        assert "LMU data evidence." in joined
+        return FakeResponse("Comparison: TUM and LMU both have relevant programs.")
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {"retrieval_strategy": "ann", "results": []}
+
+    async def fake_web_fallback(*_args, **_kwargs):
+        return {
+            "results": [
+                {
+                    "content": "TUM data evidence.",
+                    "metadata": {"url": "https://www.tum.de/programs/data"},
+                },
+                {
+                    "content": "LMU data evidence.",
+                    "metadata": {"url": "https://www.lmu.de/programs/data"},
+                },
+            ]
+        }
+
+    async def fake_rerank(_query, candidates):
+        assert len(candidates) == 2
+        # Simulate reranker collapsing to only one side of the comparison.
+        return {"results": [candidates[1]], "applied": True, "timings_ms": {"total": 5}}
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+    monkeypatch.setattr(llm_service, "aretrieve_web_chunks", fake_web_fallback)
+    monkeypatch.setattr(llm_service, "arerank_retrieval_results", fake_rerank)
+
+    result = await llm_service.generate_response("user-1", "Compare TUM vs LMU data science programs")
+    assert "Comparison:" in result
 
 
 @pytest.mark.asyncio
 async def test_generate_response_returns_sorry_when_web_fallback_has_no_results(monkeypatch):
-    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
-    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
+    monkeypatch.setenv("WEB_SEARCH_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.web_search, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_enabled", True)
 
     fake_redis = FakeRedis()
     _attach_fake_redis(monkeypatch, fake_redis)
@@ -1109,10 +1168,10 @@ async def test_generate_response_returns_sorry_when_web_fallback_has_no_results(
 
 @pytest.mark.asyncio
 async def test_generate_response_uses_vector_when_web_fallback_empty(monkeypatch):
-    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
-    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_similarity_threshold", 0.35)
+    monkeypatch.setenv("WEB_SEARCH_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.web_search, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_similarity_threshold", 0.35)
 
     fake_redis = FakeRedis()
     _attach_fake_redis(monkeypatch, fake_redis)
@@ -1158,10 +1217,10 @@ async def test_generate_response_uses_vector_when_web_fallback_empty(monkeypatch
 
 @pytest.mark.asyncio
 async def test_generate_response_tries_web_when_vector_has_no_urls(monkeypatch):
-    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
-    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_similarity_threshold", 0.05)
+    monkeypatch.setenv("WEB_SEARCH_API_KEY", "test-key")
+    monkeypatch.setattr(llm_service.settings.web_search, "enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_enabled", True)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_similarity_threshold", 0.05)
     monkeypatch.setattr(llm_service, "_evidence_urls", lambda _results: [])
 
     fake_redis = FakeRedis()
@@ -1202,14 +1261,14 @@ async def test_generate_response_tries_web_when_vector_has_no_urls(monkeypatch):
 
     result = await llm_service.generate_response("user-1", "saarland ai")
     assert result == "Sorry, no relevant information is found."
-    assert web_calls["count"] == 1
+    assert web_calls["count"] >= 1
 
 
 @pytest.mark.asyncio
 async def test_generate_response_returns_sorry_when_strict_citation_has_no_evidence(monkeypatch):
     monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: True)
-    monkeypatch.setattr(llm_service.settings.serpapi, "enabled", False)
-    monkeypatch.setattr(llm_service.settings.serpapi, "fallback_enabled", False)
+    monkeypatch.setattr(llm_service.settings.web_search, "enabled", False)
+    monkeypatch.setattr(llm_service.settings.web_search, "fallback_enabled", False)
 
     fake_redis = FakeRedis()
     _attach_fake_redis(monkeypatch, fake_redis)
@@ -1604,6 +1663,69 @@ def test_resolve_initial_execution_mode_routes_auto_queries():
     )
 
 
+def test_normalized_request_mode_maps_standard_to_fast():
+    assert llm_service._normalized_request_mode("standard") == "fast"
+    assert llm_service._resolve_initial_execution_mode("standard", "hello") == "fast"
+
+
+def test_apply_answer_policy_skips_template_for_fast_mode(monkeypatch):
+    monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: True)
+    state = {
+        "execution_mode": "fast",
+        "citation_required": True,
+        "evidence_urls": ["https://example.edu/source"],
+        "output_guard_reason": "",
+    }
+    answer = "University details are available (https://example.edu/source)."
+    result = llm_service._apply_answer_policy(answer, state)
+    assert result == answer
+
+
+def test_apply_answer_policy_skips_template_for_deep_mode_when_not_partial(monkeypatch):
+    monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: True)
+    state = {
+        "execution_mode": "deep",
+        "citation_required": True,
+        "evidence_urls": ["https://example.edu/source"],
+        "output_guard_reason": "",
+    }
+    answer = "University details are available (https://example.edu/source)."
+    result = llm_service._apply_answer_policy(answer, state)
+    assert result == answer
+
+
+def test_apply_answer_policy_keeps_answer_unchanged_for_partial_fallback(monkeypatch):
+    monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: True)
+    state = {
+        "execution_mode": "deep",
+        "citation_required": True,
+        "evidence_urls": ["https://example.edu/source"],
+        "output_guard_reason": "agent_verification_partial",
+    }
+    answer = "University details are available (https://example.edu/source)."
+
+    result = llm_service._apply_answer_policy(answer, state)
+    assert result == answer
+
+
+def test_append_uncertainty_and_missing_info_skip_for_fast_mode(monkeypatch):
+    monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: True)
+    state = {
+        "execution_mode": "fast",
+        "citation_required": True,
+        "evidence_urls": ["https://example.edu/source"],
+        "agent_last_issues": ["missing: exact application deadline"],
+        "trust_uncertainty_reasons": ["Independent source corroboration is limited."],
+        "output_guard_reason": "agent_verification_partial",
+    }
+    answer = "Program details are available (https://example.edu/source)."
+
+    with_uncertainty = llm_service._append_uncertainty_section(answer, state)
+    with_missing = llm_service._append_missing_info_section(with_uncertainty, state)
+
+    assert with_missing == answer
+
+
 def test_build_retrieval_query_uses_only_latest_user_turn_for_new_topic():
     messages = [
         {"role": "user", "content": "Compare TU Munich vs RWTH Aachen MSc AI"},
@@ -1627,6 +1749,22 @@ def test_build_retrieval_query_keeps_previous_user_turn_for_followup():
 
     assert "What is TU Munich MSc AI deadline?" in query
     assert "What about RWTH Aachen?" in query
+
+
+def test_build_retrieval_query_keeps_previous_user_turn_for_context_dependent_deadline_prompt():
+    messages = [
+        {"role": "user", "content": "tell me about university of darmstadt Msc AI"},
+        {"role": "assistant", "content": "Here is TU Darmstadt info."},
+        {
+            "role": "user",
+            "content": "tell the deadline of the university and the application requirements.",
+        },
+    ]
+
+    query = llm_service._build_retrieval_query(messages)
+
+    assert "tell me about university of darmstadt Msc AI" in query
+    assert "tell the deadline of the university and the application requirements." in query
 
 
 @pytest.mark.asyncio
@@ -1775,3 +1913,227 @@ def test_enforce_citation_grounding_requires_evidence_when_policy_enabled(monkey
     result = _REAL_ENFORCE_CITATION_GROUNDING("Some answer text.", state)
     assert result == "Sorry, no relevant information is found."
     assert state["output_guard_reason"] == "weak_evidence_missing"
+
+
+def test_enforce_citation_grounding_allows_uncited_comparison_fallback(monkeypatch):
+    monkeypatch.setattr(llm_service, "_is_citation_grounding_required", lambda: True)
+    state = {
+        "citation_required": False,
+        "allow_uncited_comparison_fallback": True,
+        "query_intent": "comparison",
+        "output_guard_reason": "",
+    }
+    answer = "Comparison: TUM vs LMU."
+    assert _REAL_ENFORCE_CITATION_GROUNDING(answer, state) == answer
+
+
+def test_required_answer_fields_and_missing_detection_for_comparison():
+    prompt = (
+        "Compare TUM vs LMU for English-taught data science master's programs, "
+        "including admission requirements and application deadlines."
+    )
+    required = llm_service._required_answer_fields(prompt, intent="comparison")
+    assert "comparison_between_requested_entities" in required
+    assert "application_deadline" in required
+    assert "eligibility_requirements" in required
+
+    state = {
+        "required_answer_fields": required,
+        "comparison_entities": ["TUM", "LMU"],
+    }
+    missing = llm_service._missing_required_answer_fields(
+        "TUM has strong data programs with good labs.",
+        state,
+    )
+    assert "comparison_between_requested_entities" in missing
+    assert "application_deadline" in missing
+
+
+def test_missing_comparison_entities_detects_uncovered_entity():
+    results = [
+        {
+            "content": "Data Engineering and Analytics at TUM.",
+            "metadata": {"url": "https://www.tum.de/en/studies/degree-programs/detail/program"},
+        }
+    ]
+    missing = llm_service._missing_comparison_entities(results, ["TUM", "LMU"])
+    assert missing == ["LMU"]
+
+
+def test_build_structured_comparison_from_evidence_contains_required_fields():
+    state = {
+        "comparison_entities": ["TUM", "LMU"],
+        "retrieved_results": [
+            {
+                "content": "TUM Data Engineering and Analytics is an English-taught master's program.",
+                "metadata": {"url": "https://www.tum.de/en/studies/degree-programs/detail/program"},
+            },
+            {
+                "content": "LMU statistics program provides data science focus areas.",
+                "metadata": {"url": "https://www.lmu.de/en/studies/programs/data-science"},
+            },
+        ],
+        "evidence_urls": [
+            "https://www.tum.de/en/studies/degree-programs/detail/program",
+            "https://www.lmu.de/en/studies/programs/data-science",
+        ],
+    }
+    answer = llm_service._build_structured_comparison_from_evidence(state)
+    assert "Comparison: TUM vs LMU" in answer
+    assert "TUM:" in answer and "LMU:" in answer
+    assert "Eligibility requirements:" in answer
+    assert "Application deadline:" in answer
+    assert "https://www.tum.de/en/studies/degree-programs/detail/program" in answer
+    assert "https://www.lmu.de/en/studies/programs/data-science" in answer
+
+
+def test_apply_grounded_retrieval_context_relaxes_for_comparison_without_urls(monkeypatch):
+    monkeypatch.setattr(llm_service, "_evidence_urls", lambda _results: [])
+    state = {
+        "query_intent": "comparison",
+        "comparison_entities": ["TUM", "LMU"],
+    }
+    messages = [{"role": "user", "content": "compare tum vs lmu"}]
+    merged_results = [
+        {
+            "content": "TUM data evidence.",
+            "metadata": {},
+        },
+        {
+            "content": "LMU data evidence.",
+            "metadata": {},
+        },
+    ]
+    updated_messages, detail = llm_service._apply_grounded_retrieval_context(
+        messages=messages,
+        merged_results=merged_results,
+        used_web_results=False,
+        state=state,
+    )
+    assert detail is None
+    assert state["allow_uncited_comparison_fallback"] is True
+    assert state["citation_required"] is False
+    assert isinstance(updated_messages, list)
+
+
+def test_web_expansion_queries_for_comparison_include_missing_entity_target():
+    state = {
+        "query_intent": "comparison",
+        "comparison_entities": ["TUM", "LMU"],
+    }
+    current_results = [
+        {
+            "content": "TUM Data Engineering and Analytics details.",
+            "metadata": {"url": "https://www.tum.de/en/studies/degree-programs/detail/program"},
+        }
+    ]
+    queries = llm_service._web_expansion_queries(
+        base_query=(
+            "Compare TUM vs LMU for English-taught data science master's programs, "
+            "including admission requirements and application deadlines."
+        ),
+        state=state,
+        low_similarity=True,
+        insufficient_domains=True,
+        current_results=current_results,
+    )
+    assert any("site:lmu.de" in query.lower() for query in queries)
+
+
+def test_agentic_result_issues_marks_query_not_addressed_for_low_required_coverage():
+    state = {
+        "citation_required": False,
+        "evidence_urls": [],
+        "required_answer_fields": [
+            "comparison_between_requested_entities",
+            "application_deadline",
+            "required_documents",
+        ],
+        "comparison_entities": ["TUM", "LMU"],
+        "retrieval_single_domain_low_quality": False,
+        "deadline_query": False,
+    }
+    issues = llm_service._agentic_result_issues(
+        "I cannot provide a comprehensive comparison with the current evidence.",
+        state,
+    )
+    assert "missing_required_answer_fields" in issues
+    assert "query_not_addressed" in issues
+    assert state["required_field_coverage"] == 0.0
+
+
+def test_cache_skip_reason_handles_abstain_like_variants():
+    reason = llm_service._cache_skip_reason(
+        "Could not verify the requested details from available evidence. Not enough information.",
+        {},
+    )
+    assert reason == "abstain_like_variant"
+
+
+@pytest.mark.asyncio
+async def test_augment_messages_with_retrieval_fanout_prefetches_web_for_deep_mode(monkeypatch):
+    monkeypatch.setattr(llm_service, "_web_retrieval_ready", lambda: (True, "ready"))
+    monkeypatch.setattr(llm_service, "_should_run_web_retrieval", lambda: False)
+    monkeypatch.setattr(llm_service, "_retrieval_fanout_enabled", lambda: True)
+
+    web_started = asyncio.Event()
+    release_web = asyncio.Event()
+
+    async def fake_web_with_timeout(_retrieval_query, *, top_k, search_mode):
+        assert top_k == llm_service.settings.postgres.default_top_k
+        assert search_mode == "deep"
+        web_started.set()
+        await release_web.wait()
+        return {
+            "results": [
+                {
+                    "content": "Web evidence.",
+                    "metadata": {"url": "https://web.example.edu/a"},
+                }
+            ],
+            "query_plan": {"planner": "llm", "llm_used": True, "subquestions": []},
+            "query_variants": ["query"],
+            "facts": [],
+            "retrieval_loop": {"enabled": True},
+        }
+
+    async def fake_vector(_retrieval_query, _state):
+        await asyncio.wait_for(web_started.wait(), timeout=0.3)
+        release_web.set()
+        return (
+            [
+                {
+                    "content": "Vector evidence.",
+                    "metadata": {"url": "https://vector.example.edu/a"},
+                }
+            ],
+            0.1,
+        )
+
+    async def fake_rerank(_query, merged_results, _state):
+        return merged_results
+
+    def fake_apply_grounded_retrieval_context(*, messages, merged_results, used_web_results, state):
+        _ = state
+        assert used_web_results is True
+        assert len(merged_results) >= 2
+        return messages, None
+
+    monkeypatch.setattr(llm_service, "_run_one_web_query_with_timeout", fake_web_with_timeout)
+    monkeypatch.setattr(llm_service, "_retrieve_vector_candidates", fake_vector)
+    monkeypatch.setattr(llm_service, "_rerank_if_configured", fake_rerank)
+    monkeypatch.setattr(
+        llm_service, "_apply_grounded_retrieval_context", fake_apply_grounded_retrieval_context
+    )
+
+    base_messages = [{"role": "user", "content": "hello"}]
+    state = {"safe_user_prompt": "hello"}
+    messages, detail = await llm_service._augment_messages_with_retrieval(
+        messages=base_messages,
+        retrieval_query="hello",
+        search_mode="deep",
+        state=state,
+    )
+
+    assert detail is None
+    assert messages == base_messages

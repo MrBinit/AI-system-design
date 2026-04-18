@@ -3,7 +3,7 @@ import type { ChatExecutionMode } from "../types";
 
 const MODE_OPTIONS: Array<{ value: ChatExecutionMode; label: string }> = [
   { value: "auto", label: "Auto" },
-  { value: "fast", label: "Fast" },
+  { value: "standard", label: "Standard" },
   { value: "deep", label: "Deep" },
 ];
 
@@ -33,8 +33,8 @@ export function ChatInput({
   onSubmit,
 }: ChatInputProps) {
   const modeHint =
-    mode === "fast"
-      ? "Fast: quickest answer with minimal extra passes."
+    mode === "fast" || mode === "standard"
+      ? "Standard: quickest answer with minimal extra passes."
       : mode === "deep"
         ? "Deep: slower, higher coverage and verification."
         : "Auto: balanced speed and depth based on question complexity.";
@@ -51,7 +51,7 @@ export function ChatInput({
               onClick={async () => {
                 await onSuggestionClick(chip);
               }}
-              className="rounded-full border border-blue-200 bg-white px-3 py-1 text-xs text-slate-600 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+              className="rounded-full border border-blue-200 bg-white px-3 py-1 text-xs text-slate-600 hover:border-blue-300 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
             >
               {chip}
             </button>
@@ -78,7 +78,9 @@ export function ChatInput({
                   className={[
                     "rounded-lg border px-2.5 py-1 text-xs font-medium transition",
                     selected
-                      ? "border-blue-500 bg-blue-50 text-blue-700 dark:border-blue-400 dark:bg-blue-950/40 dark:text-blue-200"
+                      ? option.value === "deep"
+                        ? "border-brand-red bg-rose-50 text-brand-red dark:border-rose-400 dark:bg-rose-950/30 dark:text-rose-200"
+                        : "border-brand-blue bg-blue-50 text-brand-blue dark:border-blue-400 dark:bg-blue-950/40 dark:text-blue-200"
                       : "border-slate-200 text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800",
                     disabled ? "cursor-not-allowed opacity-60" : "",
                   ]
@@ -111,14 +113,14 @@ export function ChatInput({
         <button
           type="submit"
           disabled={disabled || !value.trim()}
-          className="inline-flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-lg shadow-blue-500/30 transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-45"
+          className="inline-flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-r from-brand-blue to-brand-red text-white shadow-lg shadow-blue-500/30 transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-45"
           aria-label="Send"
         >
           <SendIcon className="h-4.5 w-4.5" />
         </button>
       </form>
       <div className="mt-2 flex items-center justify-between px-1 text-xs text-slate-500 dark:text-slate-400">
-        <p>Press Enter to send. Shift + Enter for a new line. Slash: /fast /deep /auto /cite /summarize /web</p>
+        <p>Press Enter to send. Shift + Enter for a new line. Slash: /standard /fast /deep /auto /cite /summarize /web</p>
         <div className="flex items-center gap-3">
           <button
             type="button"

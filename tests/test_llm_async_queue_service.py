@@ -115,3 +115,42 @@ def test_enqueue_chat_job_persists_normalized_mode(monkeypatch):
     assert response["status"] == "queued"
     assert captured_record["mode"] == "deep"
     assert '"mode": "deep"' in captured_send["MessageBody"]
+
+
+def test_enqueue_chat_job_maps_standard_mode_to_fast(monkeypatch):
+    captured_record = {}
+    captured_send = {}
+
+    monkeypatch.setattr(llm_async_queue_service.settings.queue, "llm_async_enabled", True)
+    monkeypatch.setattr(
+        llm_async_queue_service.settings.queue,
+        "llm_queue_url",
+        "https://sqs.us-east-1.amazonaws.com/123/queue",
+    )
+    monkeypatch.setattr(llm_async_queue_service.settings.queue, "llm_result_table", "tbl")
+    monkeypatch.setattr(llm_async_queue_service.settings.queue, "llm_result_ttl_days", 0)
+    monkeypatch.setattr(llm_async_queue_service, "_now_iso", lambda: "2026-03-30T00:00:00+00:00")
+    monkeypatch.setattr(
+        llm_async_queue_service,
+        "_put_initial_job",
+        lambda record: captured_record.update(record),
+    )
+
+    class _FakeSqs:
+        def send_message(self, **kwargs):
+            captured_send.update(kwargs)
+            return {"MessageId": "mid-1"}
+
+    monkeypatch.setattr(llm_async_queue_service, "_sqs_client", lambda: _FakeSqs())
+    monkeypatch.setattr(llm_async_queue_service, "_update_job", lambda *_args, **_kwargs: None)
+
+    response = llm_async_queue_service.enqueue_chat_job(
+        user_id="user-1",
+        prompt="hello",
+        session_id="session-1",
+        mode="standard",
+    )
+
+    assert response["status"] == "queued"
+    assert captured_record["mode"] == "fast"
+    assert '"mode": "fast"' in captured_send["MessageBody"]

@@ -14,7 +14,7 @@ from app.schemas.postgres_config_schema import PostgresConfig
 from app.schemas.queue_config_schema import QueueConfig
 from app.schemas.redis_config_schema import RedisConfig, RedisRoleConfig
 from app.schemas.security_config_schema import SecurityConfig
-from app.schemas.serpapi_config_schema import SerpApiConfig
+from app.schemas.tavily_config_schema import TavilyConfig
 
 
 class Settings(BaseModel):
@@ -29,7 +29,7 @@ class Settings(BaseModel):
     memory: MemoryConfig
     guardrails: GuardrailsConfig
     security: SecurityConfig
-    serpapi: SerpApiConfig
+    web_search: TavilyConfig
     io: IOConfig
     middleware: MiddlewareConfig
     queue: QueueConfig
@@ -51,7 +51,7 @@ __all__ = [
     "RedisConfig",
     "RedisRoleConfig",
     "SecurityConfig",
-    "SerpApiConfig",
+    "TavilyConfig",
     "Settings",
     "UserTokenBudgetConfig",
 ]

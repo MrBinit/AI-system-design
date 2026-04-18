@@ -77,6 +77,20 @@ def _load_yaml_file(file_path: Path) -> dict:
     return data
 
 
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursively merge overlay dict into base dict."""
+    for key, value in overlay.items():
+        if (
+            key in base
+            and isinstance(base[key], dict)
+            and isinstance(value, dict)
+        ):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
 def _load_aws_secrets_manager_env():
     """Load environment variables from one AWS Secrets Manager JSON secret."""
     secret_id = os.getenv("AWS_SECRETS_MANAGER_SECRET_ID", "").strip()
@@ -146,96 +160,146 @@ def _apply_env_overrides(data: dict) -> dict:
     _set(["security", "jwt_audience"], "SECURITY_JWT_AUDIENCE")
     _set(["security", "jwt_exp_minutes"], "SECURITY_JWT_EXP_MINUTES", int)
 
-    _set(["serpapi", "enabled"], "SERPAPI_ENABLED", bool)
-    _set(["serpapi", "google_search_url"], "SERPAPI_GOOGLE_SEARCH_URL")
-    _set(["serpapi", "engine"], "SERPAPI_ENGINE")
-    _set(["serpapi", "api_key_env_name"], "SERPAPI_API_KEY_ENV_NAME")
-    _set(["serpapi", "default_gl"], "SERPAPI_DEFAULT_GL")
-    _set(["serpapi", "default_hl"], "SERPAPI_DEFAULT_HL")
-    _set(["serpapi", "default_num"], "SERPAPI_DEFAULT_NUM", int)
-    _set(["serpapi", "timeout_seconds"], "SERPAPI_TIMEOUT_SECONDS", float)
-    _set(["serpapi", "max_concurrency"], "SERPAPI_MAX_CONCURRENCY", int)
-    _set(["serpapi", "queue_workers"], "SERPAPI_QUEUE_WORKERS", int)
-    _set(["serpapi", "queue_max_size"], "SERPAPI_QUEUE_MAX_SIZE", int)
+    _set(["web_search", "enabled"], "WEB_SEARCH_ENABLED", bool)
+    _set(["web_search", "google_search_url"], "WEB_SEARCH_GOOGLE_SEARCH_URL")
+    _set(["web_search", "engine"], "WEB_SEARCH_ENGINE")
+    _set(["web_search", "search_depth"], "WEB_SEARCH_SEARCH_DEPTH")
+    _set(["web_search", "api_key_env_name"], "WEB_SEARCH_API_KEY_ENV_NAME")
+    _set(["web_search", "api_key_env_name"], "TAVILY_API_KEY_ENV_NAME")
+    _set(["web_search", "default_gl"], "WEB_SEARCH_DEFAULT_GL")
+    _set(["web_search", "default_hl"], "WEB_SEARCH_DEFAULT_HL")
+    _set(["web_search", "default_num"], "WEB_SEARCH_DEFAULT_NUM", int)
+    _set(["web_search", "timeout_seconds"], "WEB_SEARCH_TIMEOUT_SECONDS", float)
+    _set(["web_search", "max_concurrency"], "WEB_SEARCH_MAX_CONCURRENCY", int)
+    _set(["web_search", "queue_workers"], "WEB_SEARCH_QUEUE_WORKERS", int)
+    _set(["web_search", "queue_max_size"], "WEB_SEARCH_QUEUE_MAX_SIZE", int)
     _set(
-        ["serpapi", "always_web_retrieval_enabled"],
-        "SERPAPI_ALWAYS_WEB_RETRIEVAL_ENABLED",
+        ["web_search", "always_web_retrieval_enabled"],
+        "WEB_SEARCH_ALWAYS_WEB_RETRIEVAL_ENABLED",
         bool,
     )
     _set(
-        ["serpapi", "retrieval_fanout_enabled"],
-        "SERPAPI_RETRIEVAL_FANOUT_ENABLED",
+        ["web_search", "retrieval_fanout_enabled"],
+        "WEB_SEARCH_RETRIEVAL_FANOUT_ENABLED",
         bool,
     )
-    _set(["serpapi", "fallback_enabled"], "SERPAPI_FALLBACK_ENABLED", bool)
+    _set(["web_search", "fallback_enabled"], "WEB_SEARCH_FALLBACK_ENABLED", bool)
     _set(
-        ["serpapi", "fallback_similarity_threshold"],
-        "SERPAPI_FALLBACK_SIMILARITY_THRESHOLD",
+        ["web_search", "fallback_similarity_threshold"],
+        "WEB_SEARCH_FALLBACK_SIMILARITY_THRESHOLD",
         float,
     )
-    _set(["serpapi", "query_planner_enabled"], "SERPAPI_QUERY_PLANNER_ENABLED", bool)
-    _set(["serpapi", "query_planner_use_llm"], "SERPAPI_QUERY_PLANNER_USE_LLM", bool)
-    _set(["serpapi", "query_planner_model_id"], "SERPAPI_QUERY_PLANNER_MODEL_ID")
-    _set(["serpapi", "query_planner_max_queries"], "SERPAPI_QUERY_PLANNER_MAX_QUERIES", int)
     _set(
-        ["serpapi", "query_planner_max_subquestions"],
-        "SERPAPI_QUERY_PLANNER_MAX_SUBQUESTIONS",
-        int,
-    )
-    _set(["serpapi", "retrieval_loop_enabled"], "SERPAPI_RETRIEVAL_LOOP_ENABLED", bool)
-    _set(["serpapi", "retrieval_loop_use_llm"], "SERPAPI_RETRIEVAL_LOOP_USE_LLM", bool)
-    _set(["serpapi", "retrieval_loop_model_id"], "SERPAPI_RETRIEVAL_LOOP_MODEL_ID")
-    _set(["serpapi", "retrieval_loop_max_steps"], "SERPAPI_RETRIEVAL_LOOP_MAX_STEPS", int)
-    _set(
-        ["serpapi", "retrieval_loop_max_gap_queries"],
-        "SERPAPI_RETRIEVAL_LOOP_MAX_GAP_QUERIES",
-        int,
-    )
-    _set(
-        ["serpapi", "retrieval_min_unique_domains"],
-        "SERPAPI_RETRIEVAL_MIN_UNIQUE_DOMAINS",
-        int,
-    )
-    _set(
-        ["serpapi", "retrieval_gap_min_token_coverage"],
-        "SERPAPI_RETRIEVAL_GAP_MIN_TOKEN_COVERAGE",
+        ["web_search", "expansion_similarity_threshold"],
+        "WEB_SEARCH_EXPANSION_SIMILARITY_THRESHOLD",
         float,
     )
-    _set(["serpapi", "multi_query_enabled"], "SERPAPI_MULTI_QUERY_ENABLED", bool)
-    _set(["serpapi", "max_query_variants"], "SERPAPI_MAX_QUERY_VARIANTS", int)
+    _set(["web_search", "query_planner_enabled"], "WEB_SEARCH_QUERY_PLANNER_ENABLED", bool)
+    _set(["web_search", "query_planner_use_llm"], "WEB_SEARCH_QUERY_PLANNER_USE_LLM", bool)
+    _set(["web_search", "query_planner_model_id"], "WEB_SEARCH_QUERY_PLANNER_MODEL_ID")
     _set(
-        ["serpapi", "allowed_domain_suffixes"],
-        "SERPAPI_ALLOWED_DOMAIN_SUFFIXES",
+        ["web_search", "query_planner_acquire_timeout_seconds"],
+        "WEB_SEARCH_QUERY_PLANNER_ACQUIRE_TIMEOUT_SECONDS",
+        float,
+    )
+    _set(["web_search", "query_planner_cache_enabled"], "WEB_SEARCH_QUERY_PLANNER_CACHE_ENABLED", bool)
+    _set(
+        ["web_search", "query_planner_cache_ttl_seconds"],
+        "WEB_SEARCH_QUERY_PLANNER_CACHE_TTL_SECONDS",
+        int,
+    )
+    _set(["web_search", "query_planner_max_queries"], "WEB_SEARCH_QUERY_PLANNER_MAX_QUERIES", int)
+    _set(
+        ["web_search", "query_planner_max_subquestions"],
+        "WEB_SEARCH_QUERY_PLANNER_MAX_SUBQUESTIONS",
+        int,
+    )
+    _set(["web_search", "retrieval_loop_enabled"], "WEB_SEARCH_RETRIEVAL_LOOP_ENABLED", bool)
+    _set(["web_search", "retrieval_loop_use_llm"], "WEB_SEARCH_RETRIEVAL_LOOP_USE_LLM", bool)
+    _set(["web_search", "retrieval_loop_model_id"], "WEB_SEARCH_RETRIEVAL_LOOP_MODEL_ID")
+    _set(
+        ["web_search", "retrieval_loop_acquire_timeout_seconds"],
+        "WEB_SEARCH_RETRIEVAL_LOOP_ACQUIRE_TIMEOUT_SECONDS",
+        float,
+    )
+    _set(["web_search", "retrieval_loop_cache_enabled"], "WEB_SEARCH_RETRIEVAL_LOOP_CACHE_ENABLED", bool)
+    _set(
+        ["web_search", "retrieval_loop_cache_ttl_seconds"],
+        "WEB_SEARCH_RETRIEVAL_LOOP_CACHE_TTL_SECONDS",
+        int,
+    )
+    _set(["web_search", "retrieval_loop_max_steps"], "WEB_SEARCH_RETRIEVAL_LOOP_MAX_STEPS", int)
+    _set(
+        ["web_search", "retrieval_loop_max_gap_queries"],
+        "WEB_SEARCH_RETRIEVAL_LOOP_MAX_GAP_QUERIES",
+        int,
+    )
+    _set(
+        ["web_search", "retrieval_min_unique_domains"],
+        "WEB_SEARCH_RETRIEVAL_MIN_UNIQUE_DOMAINS",
+        int,
+    )
+    _set(
+        ["web_search", "deep_min_unique_domains"],
+        "WEB_SEARCH_DEEP_MIN_UNIQUE_DOMAINS",
+        int,
+    )
+    _set(
+        ["web_search", "retrieval_gap_min_token_coverage"],
+        "WEB_SEARCH_RETRIEVAL_GAP_MIN_TOKEN_COVERAGE",
+        float,
+    )
+    _set(["web_search", "multi_query_enabled"], "WEB_SEARCH_MULTI_QUERY_ENABLED", bool)
+    _set(["web_search", "max_query_variants"], "WEB_SEARCH_MAX_QUERY_VARIANTS", int)
+    _set(
+        ["web_search", "allowed_domain_suffixes"],
+        "WEB_SEARCH_ALLOWED_DOMAIN_SUFFIXES",
         lambda raw: [entry.strip() for entry in raw.split(",") if entry.strip()],
     )
-    _set(["serpapi", "max_context_results"], "SERPAPI_MAX_CONTEXT_RESULTS", int)
-    _set(["serpapi", "fetch_page_content"], "SERPAPI_FETCH_PAGE_CONTENT", bool)
-    _set(["serpapi", "max_pages_to_fetch"], "SERPAPI_MAX_PAGES_TO_FETCH", int)
     _set(
-        ["serpapi", "page_fetch_timeout_seconds"],
-        "SERPAPI_PAGE_FETCH_TIMEOUT_SECONDS",
+        ["web_search", "official_source_filter_enabled"],
+        "WEB_SEARCH_OFFICIAL_SOURCE_FILTER_ENABLED",
+        bool,
+    )
+    _set(
+        ["web_search", "official_source_allowlist"],
+        "WEB_SEARCH_OFFICIAL_SOURCE_ALLOWLIST",
+        lambda raw: [entry.strip().lower() for entry in raw.split(",") if entry.strip()],
+    )
+    _set(["web_search", "max_context_results"], "WEB_SEARCH_MAX_CONTEXT_RESULTS", int)
+    _set(["web_search", "fetch_page_content"], "WEB_SEARCH_FETCH_PAGE_CONTENT", bool)
+    _set(["web_search", "max_pages_to_fetch"], "WEB_SEARCH_MAX_PAGES_TO_FETCH", int)
+    _set(
+        ["web_search", "page_fetch_timeout_seconds"],
+        "WEB_SEARCH_PAGE_FETCH_TIMEOUT_SECONDS",
         float,
     )
-    _set(["serpapi", "max_page_chars"], "SERPAPI_MAX_PAGE_CHARS", int)
-    _set(["serpapi", "strip_boilerplate"], "SERPAPI_STRIP_BOILERPLATE", bool)
-    _set(["serpapi", "min_clean_line_chars"], "SERPAPI_MIN_CLEAN_LINE_CHARS", int)
-    _set(["serpapi", "page_chunk_chars"], "SERPAPI_PAGE_CHUNK_CHARS", int)
+    _set(["web_search", "max_page_chars"], "WEB_SEARCH_MAX_PAGE_CHARS", int)
+    _set(["web_search", "strip_boilerplate"], "WEB_SEARCH_STRIP_BOILERPLATE", bool)
+    _set(["web_search", "min_clean_line_chars"], "WEB_SEARCH_MIN_CLEAN_LINE_CHARS", int)
+    _set(["web_search", "page_chunk_chars"], "WEB_SEARCH_PAGE_CHUNK_CHARS", int)
     _set(
-        ["serpapi", "page_chunk_overlap_chars"],
-        "SERPAPI_PAGE_CHUNK_OVERLAP_CHARS",
+        ["web_search", "page_chunk_overlap_chars"],
+        "WEB_SEARCH_PAGE_CHUNK_OVERLAP_CHARS",
         int,
     )
-    _set(["serpapi", "max_chunks_per_page"], "SERPAPI_MAX_CHUNKS_PER_PAGE", int)
-    _set(["serpapi", "min_chunk_chars"], "SERPAPI_MIN_CHUNK_CHARS", int)
+    _set(["web_search", "max_chunks_per_page"], "WEB_SEARCH_MAX_CHUNKS_PER_PAGE", int)
+    _set(["web_search", "min_chunk_chars"], "WEB_SEARCH_MIN_CHUNK_CHARS", int)
     _set(
-        ["serpapi", "chunk_dedupe_similarity"],
-        "SERPAPI_CHUNK_DEDUPE_SIMILARITY",
+        ["web_search", "chunk_dedupe_similarity"],
+        "WEB_SEARCH_CHUNK_DEDUPE_SIMILARITY",
         float,
     )
-    _set(["serpapi", "trust_relevance_weight"], "SERPAPI_TRUST_RELEVANCE_WEIGHT", float)
-    _set(["serpapi", "trust_authority_weight"], "SERPAPI_TRUST_AUTHORITY_WEIGHT", float)
-    _set(["serpapi", "trust_recency_weight"], "SERPAPI_TRUST_RECENCY_WEIGHT", float)
-    _set(["serpapi", "trust_agreement_weight"], "SERPAPI_TRUST_AGREEMENT_WEIGHT", float)
+    _set(["web_search", "trust_relevance_weight"], "WEB_SEARCH_TRUST_RELEVANCE_WEIGHT", float)
+    _set(["web_search", "trust_authority_weight"], "WEB_SEARCH_TRUST_AUTHORITY_WEIGHT", float)
+    _set(["web_search", "trust_recency_weight"], "WEB_SEARCH_TRUST_RECENCY_WEIGHT", float)
+    _set(["web_search", "trust_agreement_weight"], "WEB_SEARCH_TRUST_AGREEMENT_WEIGHT", float)
+    _set(["web_search", "retry_max_attempts"], "WEB_SEARCH_RETRY_MAX_ATTEMPTS", int)
+    _set(
+        ["web_search", "retry_base_backoff_seconds"],
+        "WEB_SEARCH_RETRY_BASE_BACKOFF_SECONDS",
+        float,
+    )
 
     # Backward-compatible aliases: old AZURE_OPENAI_* vars still map into bedrock config.
     _set(["bedrock", "primary_model_id"], "AZURE_OPENAI_PRIMARY_DEPLOYMENT")
@@ -246,6 +310,36 @@ def _apply_env_overrides(data: dict) -> dict:
     _set(["bedrock", "fallback_model_id"], "BEDROCK_FALLBACK_MODEL_ID")
     _set(["bedrock", "timeout"], "BEDROCK_TIMEOUT", int)
     _set(["bedrock", "max_concurrency"], "BEDROCK_MAX_CONCURRENCY", int)
+    _set(["bedrock", "web_grounding_enabled"], "BEDROCK_WEB_GROUNDING_ENABLED", bool)
+    _set(
+        ["bedrock", "web_grounding_include_sources"],
+        "BEDROCK_WEB_GROUNDING_INCLUDE_SOURCES",
+        bool,
+    )
+    _set(
+        ["bedrock", "throttle_retry_max_attempts"],
+        "BEDROCK_THROTTLE_RETRY_MAX_ATTEMPTS",
+        int,
+    )
+    _set(
+        ["bedrock", "throttle_retry_base_backoff_seconds"],
+        "BEDROCK_THROTTLE_RETRY_BASE_BACKOFF_SECONDS",
+        float,
+    )
+    _set(
+        ["bedrock", "throttle_retry_max_backoff_seconds"],
+        "BEDROCK_THROTTLE_RETRY_MAX_BACKOFF_SECONDS",
+        float,
+    )
+    _set(
+        ["bedrock", "throttle_retry_jitter_seconds"],
+        "BEDROCK_THROTTLE_RETRY_JITTER_SECONDS",
+        float,
+    )
+    _set(["bedrock", "answer_rate_limit_rps"], "BEDROCK_ANSWER_RATE_LIMIT_RPS", float)
+    _set(["bedrock", "answer_rate_limit_burst"], "BEDROCK_ANSWER_RATE_LIMIT_BURST", int)
+    _set(["bedrock", "planner_rate_limit_rps"], "BEDROCK_PLANNER_RATE_LIMIT_RPS", float)
+    _set(["bedrock", "planner_rate_limit_burst"], "BEDROCK_PLANNER_RATE_LIMIT_BURST", int)
     _set(["bedrock", "reranker_enabled"], "BEDROCK_RERANKER_ENABLED", bool)
     _set(["bedrock", "reranker_model_id"], "BEDROCK_RERANKER_MODEL_ID")
     _set(["bedrock", "reranker_api_version"], "BEDROCK_RERANKER_API_VERSION", int)
@@ -259,6 +353,9 @@ def _apply_env_overrides(data: dict) -> dict:
         int,
     )
 
+    _set(["redis", "local_tunnel_enabled"], "REDIS_LOCAL_TUNNEL_ENABLED", bool)
+    _set(["redis", "tunnel_local_port"], "REDIS_TUNNEL_LOCAL_PORT", int)
+    _set(["redis", "tunnel_instance_id"], "REDIS_TUNNEL_INSTANCE_ID")
     _set(["redis", "app", "host"], "REDIS_APP_HOST")
     _set(["redis", "app", "port"], "REDIS_APP_PORT", int)
     _set(["redis", "app", "db"], "REDIS_APP_DB", int)
@@ -452,6 +549,8 @@ def _apply_env_overrides(data: dict) -> dict:
         float,
     )
     _set(["io", "llm_max_concurrency"], "IO_LLM_MAX_CONCURRENCY", int)
+    _set(["io", "llm_answer_max_concurrency"], "IO_LLM_ANSWER_MAX_CONCURRENCY", int)
+    _set(["io", "llm_planner_max_concurrency"], "IO_LLM_PLANNER_MAX_CONCURRENCY", int)
     _set(["io", "embedding_max_concurrency"], "IO_EMBEDDING_MAX_CONCURRENCY", int)
     _set(["io", "retrieval_max_concurrency"], "IO_RETRIEVAL_MAX_CONCURRENCY", int)
     _set(["io", "reranker_max_concurrency"], "IO_RERANKER_MAX_CONCURRENCY", int)
@@ -470,7 +569,16 @@ def get_settings() -> Settings:
 
     data = {}
     for config_file in config_files:
-        data.update(_load_yaml_file(config_file))
+        _deep_merge(data, _load_yaml_file(config_file))
+
+    override_dir_raw = os.getenv("APP_CONFIG_OVERRIDE_DIR", "").strip()
+    if override_dir_raw:
+        override_dir = Path(override_dir_raw).expanduser().resolve()
+        if not override_dir.exists():
+            raise FileNotFoundError(f"APP_CONFIG_OVERRIDE_DIR does not exist: {override_dir}")
+        override_files = sorted(override_dir.glob("*_config.yaml"))
+        for override_file in override_files:
+            _deep_merge(data, _load_yaml_file(override_file))
 
     _load_aws_secrets_manager_env()
     data = _apply_env_overrides(data)

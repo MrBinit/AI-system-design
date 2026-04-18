@@ -236,28 +236,32 @@ Expected output: `True`
   - inbound `8000` to ALB or trusted CIDR only
   - Redis/Postgres access only from app nodes
 
-## 9) Optional Local Redis Profile (Non-Production)
+## 9) Redis Requirement
 
-Start local Redis + app stack:
+Production Redis must use AWS ElastiCache:
 
-```bash
-docker compose --profile local-redis up -d redis api worker
-```
+- `REDIS_APP_HOST` and `REDIS_WORKER_HOST` must be ElastiCache endpoints (`*.cache.amazonaws.com`)
+- `REDIS_APP_TLS=true` and `REDIS_WORKER_TLS=true`
+- `REDIS_APP_SSL_CERT_REQS=required` and `REDIS_WORKER_SSL_CERT_REQS=required`
 
-Local profile safety:
+Local laptop development uses a local Docker Redis by default via YAML override:
 
-- Redis port binds only to localhost: `127.0.0.1:6379:6379`
-- do not use `local-redis` profile on production EC2
+- local override dir: `app/config/local`
+- local stack startup: `./scripts/local-up.sh`
+- local compose service: `redis` (`redis:7.4-alpine`)
 
-Suggested local overrides:
+### Optional: Local Laptop → ElastiCache (SSM Tunnel)
 
-```bash
-REDIS_APP_HOST=redis
-REDIS_WORKER_HOST=redis
-REDIS_APP_TLS=false
-REDIS_WORKER_TLS=false
-APP_DOCS_ENABLED=true
-```
+Use this only when you need prod-like integration from laptop:
+
+1. Start tunnel in terminal A:
+   - `./scripts/redis-tunnel-up.sh`
+2. Start stack in terminal B:
+   - `REDIS_LOCAL_TUNNEL_ENABLED=true ./scripts/local-up.sh`
+
+Notes:
+- In tunnel mode, Redis TLS and cert verification remain enabled.
+- Docker containers connect via `host.docker.internal:<REDIS_TUNNEL_LOCAL_PORT>`.
 
 ## 10) Rollback
 

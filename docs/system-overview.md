@@ -13,7 +13,7 @@ Queue-aware runtime order (API + worker path):
 -> `Short-Term Memory Build (summary + recent turns + new query)`
 -> `Long-Term Retrieval (Bedrock embedding + pgvector top_k=2)`
 -> `Confidence Gate (vector similarity)`
--> `Website Fallback (SerpAPI Google + async page fetch, only when needed)`
+-> `Website Fallback (Tavily web search + async page fetch, only when needed)`
 -> `LLM Message Assembly (chat prompt + retrieved context + short-term context)`
 -> `Context Guardrails`
 -> `LLM Call (AWS Bedrock primary, fallback on failure)`
@@ -51,7 +51,7 @@ Interactive streaming path (queue-backed):
   - `app:cache:chat:{user_id}:sha256:{sanitized_prompt_hash}`
   - embedding cache
 - Current model path: retrieval embedding + generation both run on AWS Bedrock.
-- Website fallback search path: SerpAPI Google query variants + domain filtering + cleaned page chunks.
+- Website fallback search path: Tavily query variants + domain filtering + cleaned page chunks.
 
 ## 3) DynamoDB Metrics Storage (AWS)
 Request and aggregate metrics are persisted to DynamoDB in addition to JSON files.
@@ -176,12 +176,12 @@ Prompts and model:
   - Duplications: 0.0%
   - Security Hotspots: 0 (review rating A)
 
-## 10) Website Search API (SerpAPI)
+## 10) Website Search API (Tavily)
 Reference: `docs/website-search.md`
 
 Implemented behavior:
 - Vector-first retrieval with confidence gate; web fallback runs only when vector evidence is missing/weak.
-- SerpAPI multi-query retrieval with async batch execution.
+- Tavily multi-query retrieval with async batch execution.
 - Optional domain allowlist filtering (`.de`, `.eu`, etc.).
 - Async top-page fetch, boilerplate stripping, clean chunking, and near-duplicate chunk removal.
 - Retrieval fan-out/fan-in path:
@@ -200,6 +200,6 @@ Implemented behavior:
   - user feedback.
 
 Key config toggles:
-- `serpapi.retrieval_fanout_enabled` (env: `SERPAPI_RETRIEVAL_FANOUT_ENABLED`)
-- `serpapi.always_web_retrieval_enabled`
-- `serpapi.fallback_enabled`
+- `web_search.retrieval_fanout_enabled` (env: `WEB_SEARCH_RETRIEVAL_FANOUT_ENABLED`)
+- `web_search.always_web_retrieval_enabled`
+- `web_search.fallback_enabled`

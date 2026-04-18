@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import { BrandIcon, BrandLogo } from "./Brand";
 import {
   CloseIcon,
   MoonIcon,
@@ -80,7 +81,7 @@ function ConversationButton({
         onClick={onClick}
         className={`w-full rounded-xl px-3 py-2 pr-10 text-left text-sm transition ${
           active
-            ? "bg-blue-600 text-white shadow"
+            ? "bg-gradient-to-r from-brand-blue to-brand-red text-white shadow"
             : "bg-white/70 text-slate-700 hover:bg-blue-50 dark:bg-slate-800/60 dark:text-slate-200 dark:hover:bg-slate-700"
         }`}
       >
@@ -103,7 +104,7 @@ function ConversationButton({
         className={`absolute right-2 top-2 rounded-md p-1.5 transition ${
           active
             ? "text-blue-100 hover:bg-white/20"
-            : "text-slate-500 hover:bg-blue-100 hover:text-blue-700 dark:text-slate-300 dark:hover:bg-slate-700"
+            : "text-slate-500 hover:bg-blue-100 hover:text-brand-blue dark:text-slate-300 dark:hover:bg-slate-700"
         } ${menuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100"}`}
         aria-label={`Conversation options for ${item.title}`}
       >
@@ -213,10 +214,13 @@ export function Sidebar({
       >
         <div>
           <div className="mb-5 flex items-center justify-between">
-            <h2 className="text-lg font-bold tracking-wide text-slate-900 dark:text-slate-100">UNIGRAPH</h2>
+            <div className="flex items-center gap-2">
+              <BrandIcon className="h-7 w-7 rounded-md" />
+              <BrandLogo compact />
+            </div>
             <button
               type="button"
-              className="rounded-lg p-1.5 text-slate-500 hover:bg-blue-50 hover:text-blue-700 dark:text-slate-300 dark:hover:bg-slate-800 md:hidden"
+              className="rounded-lg p-1.5 text-slate-500 hover:bg-blue-50 hover:text-brand-blue dark:text-slate-300 dark:hover:bg-slate-800 md:hidden"
               onClick={onCloseMobile}
               aria-label="Close sidebar"
             >
@@ -228,14 +232,14 @@ export function Sidebar({
             <button
               type="button"
               onClick={onNewChat}
-              className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-blue-600 px-3 py-2 text-sm font-medium text-white shadow-md shadow-blue-500/30"
+              className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-brand-blue to-brand-red px-3 py-2 text-sm font-medium text-white shadow-md shadow-blue-500/30"
             >
               <PlusIcon className="h-4 w-4" />
               New Chat
             </button>
             <button
               type="button"
-              className="rounded-xl border border-blue-200 bg-white p-2 text-slate-600 hover:text-blue-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+              className="rounded-xl border border-blue-200 bg-white p-2 text-slate-600 hover:text-brand-blue dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
               aria-label="Search"
             >
               <SearchIcon className="h-4 w-4" />
@@ -378,7 +382,7 @@ export function Sidebar({
           </button>
 
           <div className="mt-2 flex items-center gap-3 rounded-2xl bg-white p-3 shadow dark:bg-slate-900">
-            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 text-sm font-semibold text-white">
+            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-gradient-to-br from-brand-blue to-brand-red text-sm font-semibold text-white">
               {initials(auth.username)}
             </div>
             <div className="min-w-0">
