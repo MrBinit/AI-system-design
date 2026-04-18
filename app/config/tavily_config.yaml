@@ -8,8 +8,8 @@ web_search:
   default_hl: "en"
   default_num: 3
   timeout_seconds: 6.0
-  max_concurrency: 2
-  queue_workers: 2
+  max_concurrency: 4
+  queue_workers: 4
   queue_max_size: 200
   always_web_retrieval_enabled: false
   retrieval_fanout_enabled: true
@@ -18,16 +18,16 @@ web_search:
   expansion_similarity_threshold: 0.20
   query_planner_enabled: true
   query_planner_use_llm: true
-  query_planner_model_id: "us.anthropic.claude-3-5-haiku-20241022-v1:0"
-  query_planner_acquire_timeout_seconds: 0.75
+  query_planner_model_id: "us.anthropic.claude-opus-4-6-v1"
+  query_planner_acquire_timeout_seconds: 2.5
   query_planner_cache_enabled: true
   query_planner_cache_ttl_seconds: 300
   query_planner_max_queries: 5
-  query_planner_max_subquestions: 4
+  query_planner_max_subquestions: 5
   retrieval_loop_enabled: true
   retrieval_loop_use_llm: true
-  retrieval_loop_model_id: "us.anthropic.claude-3-5-haiku-20241022-v1:0"
-  retrieval_loop_acquire_timeout_seconds: 0.75
+  retrieval_loop_model_id: "us.anthropic.claude-opus-4-6-v1"
+  retrieval_loop_acquire_timeout_seconds: 2.5
   retrieval_loop_cache_enabled: true
   retrieval_loop_cache_ttl_seconds: 180
   retrieval_loop_max_steps: 2
@@ -45,11 +45,11 @@ web_search:
   official_source_allowlist:
     - "daad.de"
   max_context_results: 4
-  deep_max_context_results: 8
-  deep_default_num: 6
+  deep_max_context_results: 10
+  deep_default_num: 8
   fetch_page_content: true
   max_pages_to_fetch: 2
-  deep_max_pages_to_fetch: 4
+  deep_max_pages_to_fetch: 6
   page_fetch_timeout_seconds: 6.0
   max_page_chars: 2800
   strip_boilerplate: true
@@ -57,12 +57,16 @@ web_search:
   page_chunk_chars: 850
   page_chunk_overlap_chars: 120
   max_chunks_per_page: 2
-  deep_max_chunks_per_page: 3
+  deep_max_chunks_per_page: 4
   min_chunk_chars: 140
   chunk_dedupe_similarity: 0.9
   trust_relevance_weight: 0.6
   trust_authority_weight: 0.2
   trust_recency_weight: 0.1
   trust_agreement_weight: 0.1
+  deep_cache_min_confidence: 0.7
+  deep_cache_min_required_field_coverage: 0.85
+  deep_cache_min_source_count: 2
+  cache_max_not_verified_mentions: 3
   retry_max_attempts: 1
   retry_base_backoff_seconds: 0.2

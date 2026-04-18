@@ -937,9 +937,37 @@ def _normalize_subquestion_list(values, *, limit: int) -> list[str]:
     return _normalize_query_list(values, limit=limit)
 
 
-def _planner_model_id() -> str:
+def _planner_model_candidates() -> list[str]:
     configured = str(getattr(settings.web_search, "query_planner_model_id", "")).strip()
-    return configured or str(settings.bedrock.primary_model_id).strip()
+    primary = str(settings.bedrock.primary_model_id).strip()
+    fallback = str(settings.bedrock.fallback_model_id).strip()
+    candidates = [configured, primary, fallback]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        value = str(candidate).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
+def _retrieval_loop_model_candidates() -> list[str]:
+    configured = str(getattr(settings.web_search, "retrieval_loop_model_id", "")).strip()
+    if configured:
+        candidates = [configured] + _planner_model_candidates()
+    else:
+        candidates = _planner_model_candidates()
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        value = str(candidate).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
 
 
 def _max_planner_queries() -> int:
@@ -948,6 +976,36 @@ def _max_planner_queries() -> int:
 
 def _max_planner_subquestions() -> int:
     return max(0, int(getattr(settings.web_search, "query_planner_max_subquestions", 4)))
+
+
+def _planner_query_limit_for_query(query: str) -> int:
+    base = _max_planner_queries()
+    if not _is_deep_search_mode():
+        return base
+    required_fields_count = len(_required_fields_from_query(query))
+    focus_count = len(_coverage_subquestions_from_query(query))
+    boost = min(5, max(required_fields_count, focus_count))
+    return min(12, max(base, base + boost))
+
+
+async def _call_planner_model_text(
+    *,
+    model_id: str,
+    messages: list[dict],
+    acquire_timeout_seconds: float,
+) -> str:
+    from app.infra.bedrock_chat_client import client
+
+    response = await client.chat.completions.create(
+        model=model_id,
+        messages=messages,
+        limiter_name="llm_planner",
+        limiter_acquire_timeout_seconds=acquire_timeout_seconds,
+        rate_limit_profile="planner",
+    )
+    if not response or not getattr(response, "choices", None):
+        return ""
+    return str(response.choices[0].message.content or "").strip()
 
 
 def _required_fields_from_query(query: str) -> list[dict]:
@@ -1067,7 +1125,7 @@ def _coverage_subquestions_from_query(query: str) -> list[str]:
 
 
 def _build_query_planner_messages(query: str, allowed_suffixes: list[str]) -> list[dict]:
-    max_queries = _max_planner_queries()
+    max_queries = _planner_query_limit_for_query(query)
     max_subquestions = _max_planner_subquestions()
     suffix_clause = ", ".join(allowed_suffixes[:3]) if allowed_suffixes else "none"
     required_fields = _required_fields_from_query(query)
@@ -1132,9 +1190,29 @@ def _heuristic_subquestions(query: str) -> list[str]:
 
 
 def _build_heuristic_query_plan(query: str, allowed_suffixes: list[str]) -> dict:
+    multi_query_enabled = bool(getattr(settings.web_search, "multi_query_enabled", False))
+    coverage_subquestions = _coverage_subquestions_from_query(query)
+    heuristic_subquestions = _heuristic_subquestions(query)
+    if multi_query_enabled:
+        merged_subquestions = _normalize_subquestion_list(
+            coverage_subquestions + heuristic_subquestions,
+            limit=max(_max_planner_subquestions(), len(coverage_subquestions)),
+        )
+    else:
+        merged_subquestions = []
+    query_limit = _planner_query_limit_for_query(query)
+    base_queries = _build_query_variants(query, allowed_suffixes)
+    if multi_query_enabled:
+        query_candidates = base_queries + _build_gap_queries(query, merged_subquestions)
+    else:
+        query_candidates = base_queries
+    merged_queries = _normalize_query_list(
+        query_candidates,
+        limit=query_limit,
+    )
     return {
-        "queries": _build_query_variants(query, allowed_suffixes),
-        "subquestions": _heuristic_subquestions(query),
+        "queries": merged_queries or base_queries,
+        "subquestions": merged_subquestions,
         "planner": "heuristic",
         "llm_used": False,
     }
@@ -1146,22 +1224,24 @@ def _normalize_query_plan_payload(
     allowed_suffixes: list[str],
     payload: dict,
 ) -> dict:
-    max_queries = _max_planner_queries()
+    max_queries = _planner_query_limit_for_query(query)
     max_subquestions = _max_planner_subquestions()
     base_queries = [query] + _build_query_variants(query, allowed_suffixes)
+    focus_subquestions = _coverage_subquestions_from_query(query)
     llm_queries = _normalize_query_list(payload.get("queries"), limit=max_queries)
-    focus_queries = _build_gap_queries(query, _coverage_subquestions_from_query(query))
+    focus_queries = _build_gap_queries(query, focus_subquestions)
     merged_queries = _normalize_query_list(
-        base_queries + llm_queries + focus_queries,
+        base_queries + focus_queries + llm_queries,
         limit=max_queries,
     )
+    dynamic_subquestion_limit = min(12, max(max_subquestions, len(focus_subquestions)))
     merged_subquestions = _normalize_subquestion_list(
-        _coverage_subquestions_from_query(query)
+        focus_subquestions
         + _normalize_subquestion_list(
             payload.get("subquestions"),
-            limit=max_subquestions,
+            limit=dynamic_subquestion_limit,
         ),
-        limit=max_subquestions,
+        limit=dynamic_subquestion_limit,
     )
     return {
         "queries": merged_queries or _build_query_variants(query, allowed_suffixes),
@@ -1171,88 +1251,136 @@ def _normalize_query_plan_payload(
     }
 
 
+def _query_planner_repair_messages(query: str, raw_planner_output: str) -> list[dict]:
+    max_queries = _planner_query_limit_for_query(query)
+    max_subquestions = _max_planner_subquestions()
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Convert planner output into strict JSON only. "
+                "Allowed keys: queries, subquestions. "
+                "Each value must be an array of short strings."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Repair this planner output:\n{raw_planner_output}\n\n"
+                f"Return at most {max_queries} queries and at most {max_subquestions} subquestions."
+            ),
+        },
+    ]
+
+
 async def _aplan_queries_with_llm(query: str, allowed_suffixes: list[str]) -> dict | None:
     if not bool(getattr(settings.web_search, "query_planner_use_llm", False)):
         return None
 
-    model_id = _planner_model_id()
-    if not model_id:
+    model_candidates = _planner_model_candidates()
+    if not model_candidates:
         return None
 
-    cache_key = _planner_cache_key(model_id=model_id, query=query, allowed_suffixes=allowed_suffixes)
-    if bool(getattr(settings.web_search, "query_planner_cache_enabled", True)):
-        cached = await _read_cache_json(cache_key)
-        if cached:
-            cached_plan = _normalize_query_plan_payload(
-                query=query,
-                allowed_suffixes=allowed_suffixes,
-                payload=cached,
+    acquire_timeout = float(getattr(settings.web_search, "query_planner_acquire_timeout_seconds", 0.0))
+    use_cache = bool(getattr(settings.web_search, "query_planner_cache_enabled", True))
+    ttl_seconds = int(getattr(settings.web_search, "query_planner_cache_ttl_seconds", 900))
+    for model_id in model_candidates:
+        cache_key = _planner_cache_key(
+            model_id=model_id,
+            query=query,
+            allowed_suffixes=allowed_suffixes,
+        )
+        if use_cache:
+            cached = await _read_cache_json(cache_key)
+            if cached:
+                cached_plan = _normalize_query_plan_payload(
+                    query=query,
+                    allowed_suffixes=allowed_suffixes,
+                    payload=cached,
+                )
+                cached_plan["planner"] = "llm_cache"
+                cached_plan["llm_used"] = True
+                emit_trace_event(
+                    "query_plan_cache_hit",
+                    {
+                        "query": query[:220],
+                        "model_id": model_id,
+                    },
+                )
+                return cached_plan
+
+        try:
+            messages = _build_query_planner_messages(query, allowed_suffixes)
+            content = await _call_planner_model_text(
+                model_id=model_id,
+                messages=messages,
+                acquire_timeout_seconds=acquire_timeout,
             )
-            cached_plan["planner"] = "llm_cache"
-            cached_plan["llm_used"] = True
+        except DependencyBackpressureError as exc:
+            logger.warning(
+                "Web-search query planner backpressure for model=%s; trying fallback planner model. %s",
+                model_id,
+                exc,
+            )
             emit_trace_event(
-                "query_plan_cache_hit",
+                "query_plan_backpressure",
+                {
+                    "query": query[:220],
+                    "model_id": model_id,
+                    "retry_after_seconds": round(float(exc.retry_after_seconds), 3),
+                },
+            )
+            continue
+        except Exception as exc:
+            logger.warning(
+                "Web-search query planner failed for model=%s; trying fallback planner model. %s",
+                model_id,
+                exc,
+            )
+            continue
+
+        payload = _extract_json_object(content)
+        if not payload and content:
+            try:
+                repair_messages = _query_planner_repair_messages(query, content)
+                repaired = await _call_planner_model_text(
+                    model_id=model_id,
+                    messages=repair_messages,
+                    acquire_timeout_seconds=acquire_timeout,
+                )
+                payload = _extract_json_object(repaired)
+            except DependencyBackpressureError:
+                payload = None
+            except Exception:
+                payload = None
+        if not payload:
+            continue
+
+        plan = _normalize_query_plan_payload(
+            query=query,
+            allowed_suffixes=allowed_suffixes,
+            payload=payload,
+        )
+        if use_cache:
+            await _write_cache_json(
+                cache_key,
+                {
+                    "queries": plan.get("queries", []),
+                    "subquestions": plan.get("subquestions", []),
+                },
+                ttl_seconds=ttl_seconds,
+            )
+        if model_id != model_candidates[0]:
+            emit_trace_event(
+                "query_plan_model_fallback_used",
                 {
                     "query": query[:220],
                     "model_id": model_id,
                 },
             )
-            return cached_plan
+        return plan
 
-    try:
-        messages = _build_query_planner_messages(query, allowed_suffixes)
-        from app.infra.bedrock_chat_client import client
-
-        response = await client.chat.completions.create(
-            model=model_id,
-            messages=messages,
-            limiter_name="llm_planner",
-            limiter_acquire_timeout_seconds=float(
-                getattr(settings.web_search, "query_planner_acquire_timeout_seconds", 0.0)
-            ),
-            rate_limit_profile="planner",
-        )
-    except DependencyBackpressureError as exc:
-        logger.warning(
-            "Web-search query planner backpressure; falling back to heuristic variants. %s",
-            exc,
-        )
-        emit_trace_event(
-            "query_plan_backpressure",
-            {
-                "query": query[:220],
-                "retry_after_seconds": round(float(exc.retry_after_seconds), 3),
-            },
-        )
-        return None
-    except Exception as exc:
-        logger.warning(
-            "Web-search query planner failed; falling back to heuristic variants. %s",
-            exc,
-        )
-        return None
-
-    if not response or not getattr(response, "choices", None):
-        return None
-    content = str(response.choices[0].message.content or "").strip()
-    payload = _extract_json_object(content)
-    if not payload:
-        return None
-    plan = _normalize_query_plan_payload(
-        query=query,
-        allowed_suffixes=allowed_suffixes,
-        payload=payload,
-    )
-    if bool(getattr(settings.web_search, "query_planner_cache_enabled", True)):
-        await _write_cache_json(
-            cache_key,
-            {
-                "queries": plan.get("queries", []),
-                "subquestions": plan.get("subquestions", []),
-            },
-            ttl_seconds=int(getattr(settings.web_search, "query_planner_cache_ttl_seconds", 900)),
-        )
-    return plan
+    return None
 
 
 def _planner_enabled() -> bool:
@@ -1266,11 +1394,6 @@ async def _resolve_query_plan(query: str, allowed_suffixes: list[str]) -> dict:
     if llm_plan:
         return llm_plan
     return _build_heuristic_query_plan(query, allowed_suffixes)
-
-
-def _retrieval_loop_model_id() -> str:
-    configured = str(getattr(settings.web_search, "retrieval_loop_model_id", "")).strip()
-    return configured or _planner_model_id()
 
 
 def _loop_llm_enabled() -> bool:
@@ -1338,6 +1461,35 @@ def _normalize_gap_plan_payload(payload: dict, *, query: str, fallback_missing: 
     }
 
 
+def _gap_planner_repair_messages(
+    query: str,
+    *,
+    fallback_missing: list[str],
+    raw_planner_output: str,
+) -> list[dict]:
+    max_gap_queries = max(1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2)))
+    fallback_text = "\n".join(f"- {item}" for item in fallback_missing[:8]) or "- (none)"
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Convert coverage-gap analysis output into strict JSON only. "
+                "Allowed keys: missing_subquestions, queries. "
+                "Each value must be an array of short strings."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"User query: {query}\n"
+                f"Fallback missing coverage items:\n{fallback_text}\n\n"
+                f"Repair this planner output:\n{raw_planner_output}\n\n"
+                f"Return at most {max_gap_queries} queries."
+            ),
+        },
+    ]
+
+
 async def _aidentify_gap_plan_with_llm(
     query: str,
     *,
@@ -1347,93 +1499,117 @@ async def _aidentify_gap_plan_with_llm(
 ) -> dict | None:
     if not _loop_llm_enabled() or not subquestions:
         return None
-    model_id = _retrieval_loop_model_id()
-    if not model_id:
+    model_candidates = _retrieval_loop_model_candidates()
+    if not model_candidates:
         return None
 
-    cache_key = _gap_planner_cache_key(
-        model_id=model_id,
-        query=query,
-        subquestions=subquestions,
-        facts=facts,
-        fallback_missing=fallback_missing,
-    )
-    if bool(getattr(settings.web_search, "retrieval_loop_cache_enabled", True)):
-        cached = await _read_cache_json(cache_key)
-        if cached:
-            plan = _normalize_gap_plan_payload(
-                cached,
-                query=query,
-                fallback_missing=fallback_missing,
+    acquire_timeout = float(getattr(settings.web_search, "retrieval_loop_acquire_timeout_seconds", 0.0))
+    use_cache = bool(getattr(settings.web_search, "retrieval_loop_cache_enabled", True))
+    ttl_seconds = int(getattr(settings.web_search, "retrieval_loop_cache_ttl_seconds", 300))
+    for model_id in model_candidates:
+        cache_key = _gap_planner_cache_key(
+            model_id=model_id,
+            query=query,
+            subquestions=subquestions,
+            facts=facts,
+            fallback_missing=fallback_missing,
+        )
+        if use_cache:
+            cached = await _read_cache_json(cache_key)
+            if cached:
+                plan = _normalize_gap_plan_payload(
+                    cached,
+                    query=query,
+                    fallback_missing=fallback_missing,
+                )
+                emit_trace_event(
+                    "retrieval_gap_plan_cache_hit",
+                    {
+                        "query": query[:220],
+                        "model_id": model_id,
+                    },
+                )
+                return plan
+
+        try:
+            messages = _build_gap_analyzer_messages(
+                query,
+                subquestions=subquestions,
+                facts=facts,
+            )
+            content = await _call_planner_model_text(
+                model_id=model_id,
+                messages=messages,
+                acquire_timeout_seconds=acquire_timeout,
+            )
+        except DependencyBackpressureError as exc:
+            logger.warning(
+                "Web-search retrieval-loop backpressure for model=%s; trying fallback loop model. %s",
+                model_id,
+                exc,
             )
             emit_trace_event(
-                "retrieval_gap_plan_cache_hit",
+                "retrieval_gap_plan_backpressure",
+                {
+                    "query": query[:220],
+                    "model_id": model_id,
+                    "retry_after_seconds": round(float(exc.retry_after_seconds), 3),
+                },
+            )
+            continue
+        except Exception as exc:
+            logger.warning(
+                "Web-search retrieval-loop gap analysis failed for model=%s; trying fallback loop model. %s",
+                model_id,
+                exc,
+            )
+            continue
+
+        payload = _extract_json_object(content)
+        if not payload and content:
+            try:
+                repaired = await _call_planner_model_text(
+                    model_id=model_id,
+                    messages=_gap_planner_repair_messages(
+                        query,
+                        fallback_missing=fallback_missing,
+                        raw_planner_output=content,
+                    ),
+                    acquire_timeout_seconds=acquire_timeout,
+                )
+                payload = _extract_json_object(repaired)
+            except DependencyBackpressureError:
+                payload = None
+            except Exception:
+                payload = None
+        if not payload:
+            continue
+
+        plan = _normalize_gap_plan_payload(
+            payload,
+            query=query,
+            fallback_missing=fallback_missing,
+        )
+        if use_cache:
+            await _write_cache_json(
+                cache_key,
+                {
+                    "missing_subquestions": plan.get("missing_subquestions", []),
+                    "queries": plan.get("queries", []),
+                },
+                ttl_seconds=ttl_seconds,
+            )
+        if model_id != model_candidates[0]:
+            emit_trace_event(
+                "retrieval_gap_model_fallback_used",
                 {
                     "query": query[:220],
                     "model_id": model_id,
                 },
             )
-            return plan
+        return plan
 
-    try:
-        messages = _build_gap_analyzer_messages(
-            query,
-            subquestions=subquestions,
-            facts=facts,
-        )
-        from app.infra.bedrock_chat_client import client
-
-        response = await client.chat.completions.create(
-            model=model_id,
-            messages=messages,
-            limiter_name="llm_planner",
-            limiter_acquire_timeout_seconds=float(
-                getattr(settings.web_search, "retrieval_loop_acquire_timeout_seconds", 0.0)
-            ),
-            rate_limit_profile="planner",
-        )
-    except DependencyBackpressureError as exc:
-        logger.warning(
-            "Web-search retrieval-loop backpressure; falling back to heuristic gap detection. %s",
-            exc,
-        )
-        emit_trace_event(
-            "retrieval_gap_plan_backpressure",
-            {
-                "query": query[:220],
-                "retry_after_seconds": round(float(exc.retry_after_seconds), 3),
-            },
-        )
-        return None
-    except Exception as exc:
-        logger.warning(
-            "Web-search retrieval-loop gap analysis failed; "
-            "falling back to heuristic gap detection. %s",
-            exc,
-        )
-        return None
-
-    if not response or not getattr(response, "choices", None):
-        return None
-    content = str(response.choices[0].message.content or "").strip()
-    payload = _extract_json_object(content)
-    if not payload:
-        return None
-    plan = _normalize_gap_plan_payload(
-        payload,
-        query=query,
-        fallback_missing=fallback_missing,
-    )
-    if bool(getattr(settings.web_search, "retrieval_loop_cache_enabled", True)):
-        await _write_cache_json(
-            cache_key,
-            {
-                "missing_subquestions": plan.get("missing_subquestions", []),
-                "queries": plan.get("queries", []),
-            },
-            ttl_seconds=int(getattr(settings.web_search, "retrieval_loop_cache_ttl_seconds", 300)),
-        )
-    return plan
+    return None
 
 
 def _subquestion_token_coverage(subquestion: str, evidence_text: str) -> float:
@@ -2403,23 +2579,60 @@ def _build_required_field_queries(
     if allowed_suffixes:
         suffix_scope = " (" + " OR ".join(f"site:{suffix}" for suffix in allowed_suffixes[:2]) + ")"
 
+    targeted_focus_by_field: dict[str, list[str]] = {
+        "admission_requirements": [
+            "admission requirements eligibility criteria required documents",
+            "prerequisite credits bachelor degree requirements",
+        ],
+        "language_requirements": [
+            "english language requirements IELTS TOEFL CEFR minimum score",
+            "accepted language certificates and minimum scores",
+        ],
+        "application_deadline": [
+            "application deadline exact dates apply by closing date intake timeline",
+            "application period start date end date winter semester summer semester",
+        ],
+        "duration_ects": [
+            "program duration semesters years total ECTS credits",
+            "standard period of study semesters and credit points",
+        ],
+        "curriculum_modules": [
+            "curriculum structure core modules module handbook regulations",
+            "study and examination regulations program modules",
+        ],
+        "tuition_fees": [
+            "tuition fees semester contribution exact amount EUR",
+            "study costs and semester fees for international students",
+        ],
+    }
+
     for field in missing_required_fields:
+        field_id = str(field.get("id", "")).strip()
         focus = " ".join(str(field.get("query_focus", "")).split()).strip()
-        if not focus:
-            continue
-        candidates.append(f"{query} {focus} official source")
-        if suffix_scope:
-            candidates.append(f"{query} {focus}{suffix_scope}")
-        for domain in official_domains:
-            grouped = _domain_group_key(domain)
-            if grouped in seen_domains:
+        focus_items = [focus] if focus else []
+        focus_items.extend(targeted_focus_by_field.get(field_id, []))
+        for focus_item in focus_items:
+            normalized_focus = " ".join(str(focus_item).split()).strip()
+            if not normalized_focus:
                 continue
-            candidates.append(f"{query} {focus} site:{domain}")
+            candidates.append(f"{query} {normalized_focus} official source")
+            candidates.append(f"{query} {normalized_focus} official pdf")
+            if suffix_scope:
+                candidates.append(f"{query} {normalized_focus}{suffix_scope}")
+            for domain in official_domains:
+                grouped = _domain_group_key(domain)
+                if grouped in seen_domains:
+                    continue
+                candidates.append(f"{query} {normalized_focus} site:{domain}")
 
     max_gap_queries = max(1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2)))
+    candidate_limit = min(
+        24,
+        max_gap_queries * max(3, min(6, len(missing_required_fields) + 2)),
+    )
     return _normalize_query_list(
         candidates,
-        limit=max_gap_queries * 3,
+        limit=candidate_limit,
     )
 
 
@@ -2433,7 +2646,7 @@ def _build_follow_up_queries(
     unique_domains: list[str],
 ) -> list[str]:
     max_gap_queries = max(1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2)))
-    candidate_limit = max_gap_queries * 4
+    candidate_limit = min(28, max_gap_queries * 6)
     required_field_queries = _build_required_field_queries(
         query,
         missing_required_fields=missing_required_fields,
@@ -2550,7 +2763,9 @@ async def _aretrieve_web_chunks_impl(
             "queries": query_plan.get("queries", []),
         },
     )
-    planned_query_limit = _max_planner_queries() if deep_mode else min(2, _max_planner_queries())
+    planned_query_limit = (
+        _planner_query_limit_for_query(query) if deep_mode else min(2, _max_planner_queries())
+    )
     planned_queries = _normalize_query_list(
         query_plan.get("queries", []),
         limit=planned_query_limit,

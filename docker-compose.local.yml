@@ -102,8 +102,6 @@ services:
     image: ai-system-gradio:latest
     init: true
     restart: unless-stopped
-    env_file:
-      - ${ENV_FILE:-.env.local}
     environment:
       <<: [*local_aws_env, *local_config_env, *local_redis_env]
       POSTGRES_ENABLED: "true"

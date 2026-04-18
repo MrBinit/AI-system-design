@@ -3,21 +3,15 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
-export ENV_FILE="${ENV_FILE:-.env.local}"
+export ENV_FILE="${ENV_FILE:-}"
 export AWS_SECRETS_MANAGER_SECRET_ID="${AWS_SECRETS_MANAGER_SECRET_ID:-unigraph/prod/app}"
 export AWS_SECRETS_MANAGER_REGION="${AWS_SECRETS_MANAGER_REGION:-us-east-1}"
 if [[ -d "${HOME}/.local/bin" ]]; then
   export PATH="${HOME}/.local/bin:${PATH}"
 fi
 
-if [[ ! -f "${ROOT_DIR}/${ENV_FILE}" ]]; then
-  if [[ -f "${ROOT_DIR}/.env" ]]; then
-    echo "[redis-tunnel] ${ENV_FILE} not found; falling back to .env"
-    ENV_FILE=".env"
-  else
-    echo "[redis-tunnel] Missing env file: ${ENV_FILE}"
-    exit 1
-  fi
+if [[ -z "${ENV_FILE}" || ! -f "${ROOT_DIR}/${ENV_FILE}" ]]; then
+  echo "[redis-tunnel] No env file configured; using process env + AWS secrets only."
 fi
 
 if [[ "${AWS_SECRETS_AUTO_EXPORT:-1}" == "1" ]]; then

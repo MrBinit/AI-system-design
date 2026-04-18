@@ -4,16 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 export GRADIO_PORT="${GRADIO_PORT:-7860}"
-export ENV_FILE="${ENV_FILE:-.env.local}"
+export ENV_FILE="${ENV_FILE:-}"
 
-if [[ ! -f "${ROOT_DIR}/${ENV_FILE}" ]]; then
-  if [[ -f "${ROOT_DIR}/.env" ]]; then
-    echo "[local-metrics] ${ENV_FILE} not found; falling back to .env"
-    ENV_FILE=".env"
-  else
-    echo "[local-metrics] Missing env file: ${ENV_FILE}"
-    exit 1
-  fi
+declare -a COMPOSE_CMD=(docker compose)
+if [[ -n "${ENV_FILE}" && -f "${ROOT_DIR}/${ENV_FILE}" ]]; then
+  COMPOSE_CMD+=(--env-file "${ENV_FILE}")
 fi
 
 COMPOSE_ARGS=(
@@ -32,7 +27,7 @@ section() {
 }
 
 section "Metrics Files (Container)"
-docker compose --env-file "${ENV_FILE}" "${COMPOSE_ARGS[@]}" exec -T gradio sh -lc "ls -lah /app/data/metrics || true"
+"${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" exec -T gradio sh -lc "ls -lah /app/data/metrics || true"
 
 section "Metrics Files (Host)"
 ls -lah "${HOST_METRICS_DIR}" || true

@@ -106,6 +106,10 @@ _DATE_LIKE_RE = re.compile(
     r"\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4}\b",
     flags=re.IGNORECASE,
 )
+_DEADLINE_SENTENCE_HINT_RE = re.compile(
+    r"\b(deadline|application period|apply by|closing date|last date|bewerbungsfrist|intake)\b",
+    flags=re.IGNORECASE,
+)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _CLAIM_LINE_MIN_CHARS = 42
 _CLAIM_CITATION_MIN_COVERAGE = 0.55
@@ -163,7 +167,8 @@ _COMPARISON_ENTITY_DOMAIN_HINTS: tuple[tuple[str, str], ...] = (
     ("rwth", "rwth-aachen.de"),
     ("rwth aachen", "rwth-aachen.de"),
 )
-_CHAT_CACHE_VERSION = "v2"
+_CHAT_CACHE_VERSION = "v3"
+_CACHE_LOW_QUALITY_NOT_VERIFIED_RE = re.compile(r"\bnot verified from evidence\b", flags=re.IGNORECASE)
 
 
 def _clamp01(value: float | None, *, fallback: float = 0.0) -> float:
@@ -1626,6 +1631,50 @@ def _evidence_date_values(results: list[dict], *, limit: int = 6) -> list[str]:
     return values
 
 
+def _date_sets_conflict(date_sets: list[set[str]]) -> bool:
+    normalized_sets = [set(item) for item in date_sets if isinstance(item, set) and item]
+    if len(normalized_sets) < 2:
+        return False
+    for index, first in enumerate(normalized_sets):
+        for second in normalized_sets[index + 1 :]:
+            if first == second:
+                continue
+            if first.issubset(second) or second.issubset(first):
+                continue
+            return True
+    return False
+
+
+def _deadline_date_sets_from_evidence(results: list[dict], *, limit: int = 6) -> list[set[str]]:
+    date_sets: list[set[str]] = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        content = " ".join(str(result.get("content", "")).split())
+        if not content:
+            continue
+        sentences = [item.strip() for item in _SENTENCE_SPLIT_RE.split(content) if item.strip()]
+        for sentence in sentences[:8]:
+            lowered = sentence.lower()
+            if not _DEADLINE_SENTENCE_HINT_RE.search(lowered):
+                continue
+            dates = {
+                " ".join(str(match).split()).lower()
+                for match in _DATE_LIKE_RE.findall(sentence)
+                if str(match).strip()
+            }
+            if not dates:
+                continue
+            date_sets.append(dates)
+            if len(date_sets) >= limit:
+                return date_sets
+    return date_sets
+
+
+def _has_deadline_date_conflict(results: list[dict]) -> bool:
+    return _date_sets_conflict(_deadline_date_sets_from_evidence(results, limit=8))
+
+
 def _derive_evidence_trust_signals(results: list[dict], state: dict) -> None:
     if not isinstance(results, list) or not results:
         state["trust_confidence"] = None
@@ -1687,10 +1736,11 @@ def _derive_evidence_trust_signals(results: list[dict], state: dict) -> None:
             freshness_label = "stale"
             freshness_score = 0.35
 
-    contradiction_flag = bool(avg_agreement <= 0.32 and domain_count >= 3)
+    contradiction_flag = bool(avg_agreement <= 0.28 and domain_count >= 3)
     if bool(state.get("deadline_query", False)):
-        date_values = _evidence_date_values(results, limit=4)
-        contradiction_flag = contradiction_flag or len(date_values) >= 2
+        contradiction_flag = contradiction_flag or (
+            avg_agreement <= 0.45 and domain_count >= 2 and _has_deadline_date_conflict(results)
+        )
 
     confidence = (
         (avg_quality * 0.45)
@@ -1843,11 +1893,17 @@ def _retrieval_fanout_enabled() -> bool:
     return bool(getattr(settings.web_search, "retrieval_fanout_enabled", True))
 
 
-def _web_retrieval_timeout_seconds() -> float:
+def _web_retrieval_timeout_seconds(search_mode: str | None = None) -> float:
     configured = _safe_float(getattr(settings.web_search, "timeout_seconds", 12.0))
     if configured is None:
         configured = 12.0
-    return max(4.0, min(45.0, configured * 1.75))
+    normalized_mode = _normalized_request_mode(search_mode)
+    if normalized_mode == _AUTO_MODE:
+        normalized_mode = _DEEP_MODE
+    multiplier = 6.0 if normalized_mode == _DEEP_MODE else 3.0
+    floor_seconds = 30.0 if normalized_mode == _DEEP_MODE else 12.0
+    ceiling_seconds = 120.0 if normalized_mode == _DEEP_MODE else 60.0
+    return max(floor_seconds, min(ceiling_seconds, configured * multiplier))
 
 
 async def _run_one_web_query_with_timeout(
@@ -1863,10 +1919,15 @@ async def _run_one_web_query_with_timeout(
                 top_k=top_k,
                 search_mode=search_mode,
             ),
-            timeout=_web_retrieval_timeout_seconds(),
+            timeout=_web_retrieval_timeout_seconds(search_mode),
         )
     except asyncio.TimeoutError:
-        logger.warning("Web retrieval timed out; query=%s", query)
+        logger.warning(
+            "Web retrieval timed out; mode=%s timeout_s=%.2f query=%s",
+            str(search_mode),
+            _web_retrieval_timeout_seconds(search_mode),
+            query,
+        )
         return None
     except Exception as exc:
         logger.warning("Web retrieval query failed; query=%s error=%s", query, exc)
@@ -2094,7 +2155,7 @@ async def _retrieve_web_candidates_if_needed(
             try:
                 web_result = await asyncio.wait_for(
                     web_prefetch_task,
-                    timeout=_web_retrieval_timeout_seconds(),
+                    timeout=_web_retrieval_timeout_seconds(search_mode),
                 )
             except asyncio.TimeoutError:
                 if not web_prefetch_task.done():
@@ -2205,7 +2266,8 @@ async def _retrieve_web_candidates_if_needed(
                     _run_one_web_query_with_timeout(
                         expansion_query,
                         top_k=settings.postgres.default_top_k,
-                        search_mode=search_mode,
+                        # Expansion fan-out should be lightweight even during deep mode.
+                        search_mode=_FAST_MODE if deep_mode else search_mode,
                     )
                 )
                 for expansion_query in expansion_queries
@@ -3000,13 +3062,16 @@ def _map_claims_to_evidence_snippets(answer: str, state: dict) -> dict:
                 break
         if selected:
             grounded_count += 1
-            selected_dates = {
-                " ".join(str(date).split()).lower()
-                for item in selected
-                for date in item.get("dates", [])
-                if str(date).strip()
-            }
-            if len(selected_dates) >= 2:
+            date_sets: list[set[str]] = []
+            for item in selected:
+                item_dates = {
+                    " ".join(str(date).split()).lower()
+                    for date in item.get("dates", [])
+                    if str(date).strip()
+                }
+                if item_dates:
+                    date_sets.append(item_dates)
+            if _date_sets_conflict(date_sets):
                 conflict_count += 1
         mappings.append({"claim": claim, "snippets": selected})
 
@@ -3025,7 +3090,11 @@ def _has_contradiction_signal(answer: str, state: dict, evidence_map: dict | Non
     if bool(state.get("trust_contradiction_flag", False)):
         return True
     if isinstance(evidence_map, dict):
-        if int(evidence_map.get("conflict_count", 0) or 0) > 0:
+        conflict_count = int(evidence_map.get("conflict_count", 0) or 0)
+        trust_agreement = _safe_float(state.get("trust_agreement_score"))
+        if conflict_count >= 2:
+            return True
+        if conflict_count >= 1 and trust_agreement is not None and trust_agreement <= 0.4:
             return True
     if bool(state.get("deadline_query", False)):
         answer_dates = {
@@ -3038,7 +3107,7 @@ def _has_contradiction_signal(answer: str, state: dict, evidence_map: dict | Non
             for match in _evidence_date_values(state.get("retrieved_results", []), limit=10)
             if str(match).strip()
         }
-        if answer_dates and evidence_dates and answer_dates.difference(evidence_dates):
+        if answer_dates and evidence_dates and answer_dates.isdisjoint(evidence_dates):
             return True
     return False
 
@@ -4200,6 +4269,42 @@ async def _refine_stream_draft(
         return draft
 
 
+def _cache_not_verified_mentions(text: str) -> int:
+    return len(_CACHE_LOW_QUALITY_NOT_VERIFIED_RE.findall(str(text or "")))
+
+
+def _cache_reject_reason_for_cached_text(cached_text: str) -> str:
+    text = str(cached_text or "").strip()
+    if not text:
+        return "empty_cached_text"
+    lowered = text.lower()
+    if lowered.startswith(_NO_RELEVANT_INFORMATION_DETAIL.lower()):
+        return "cached_no_relevant_information"
+    if _NO_RELEVANT_INFORMATION_DETAIL.lower() in lowered:
+        return "cached_no_relevant_information_variant"
+    if text == refusal_response():
+        return "cached_guardrail_refusal"
+    if _is_generic_placeholder_response(text, {}):
+        return "cached_generic_placeholder"
+    abstain_like_markers = (
+        "no relevant information",
+        "insufficient evidence",
+        "could not verify",
+        "cannot verify",
+        "unable to provide",
+        "not enough information",
+    )
+    if any(marker in lowered for marker in abstain_like_markers):
+        return "cached_abstain_like"
+    max_not_verified_mentions = max(
+        1,
+        int(getattr(settings.web_search, "cache_max_not_verified_mentions", 3)),
+    )
+    if _cache_not_verified_mentions(text) > max_not_verified_mentions:
+        return "cached_excessive_not_verified_fields"
+    return ""
+
+
 def _cache_skip_reason(result: str, state: dict) -> str:
     text = str(result or "").strip()
     if not text:
@@ -4227,6 +4332,45 @@ def _cache_skip_reason(result: str, state: dict) -> str:
     context_guard_reason = str(state.get("context_guard_reason", "") or "").strip()
     if context_guard_reason:
         return f"context_guard:{context_guard_reason}"
+    if _is_generic_placeholder_response(text, state):
+        return "generic_placeholder"
+    max_not_verified_mentions = max(
+        1,
+        int(getattr(settings.web_search, "cache_max_not_verified_mentions", 3)),
+    )
+    if _cache_not_verified_mentions(text) > max_not_verified_mentions:
+        return "excessive_not_verified_fields"
+
+    execution_mode = _normalized_request_mode(str(state.get("execution_mode", _DEEP_MODE)))
+    if execution_mode == _DEEP_MODE:
+        if bool(state.get("trust_contradiction_flag", False)):
+            return "deep_conflict_detected"
+
+        web_fallback_attempted = bool(state.get("web_fallback_attempted", False))
+        web_verified = state.get("web_retrieval_verified")
+        if web_fallback_attempted and web_verified is False:
+            return "deep_web_not_verified"
+
+        confidence = _safe_float(state.get("trust_confidence"))
+        min_confidence = float(getattr(settings.web_search, "deep_cache_min_confidence", 0.7))
+        if web_fallback_attempted and confidence is not None and confidence < min_confidence:
+            return "deep_confidence_low"
+
+        required_coverage = _safe_float(state.get("web_required_field_coverage"))
+        min_required_coverage = float(
+            getattr(settings.web_search, "deep_cache_min_required_field_coverage", 0.85)
+        )
+        if (
+            web_fallback_attempted
+            and required_coverage is not None
+            and required_coverage < min_required_coverage
+        ):
+            return "deep_required_field_coverage_low"
+
+        min_sources = max(1, int(getattr(settings.web_search, "deep_cache_min_source_count", 2)))
+        source_count = int(state.get("retrieval_source_count", 0) or 0)
+        if web_fallback_attempted and source_count < min_sources:
+            return "deep_source_count_low"
     return ""
 
 
@@ -4856,14 +5000,28 @@ async def _prepare_request(
     cached, state["cache_read_ms"] = await _read_cached_response(str(context["cache_key"]))
     if cached:
         cached_text = str(cached)
-        await _record_context_outcome(context, answer=cached_text, outcome="cache_hit")
-        emit_trace_event(
-            "cache_hit",
-            {
-                "answer_preview": cached_text[:260],
-            },
-        )
-        return context, None, cached_text
+        reject_reason = _cache_reject_reason_for_cached_text(cached_text)
+        if reject_reason:
+            emit_trace_event(
+                "cache_hit_rejected",
+                {
+                    "reason": reject_reason,
+                    "answer_preview": cached_text[:260],
+                },
+            )
+            try:
+                await _redis_call(async_redis_client.delete, str(context["cache_key"]))
+            except RedisError as exc:
+                logger.warning("Redis cache delete failed. %s", exc)
+        else:
+            await _record_context_outcome(context, answer=cached_text, outcome="cache_hit")
+            emit_trace_event(
+                "cache_hit",
+                {
+                    "answer_preview": cached_text[:260],
+                },
+            )
+            return context, None, cached_text
 
     messages, refusal = await _prepare_messages_for_model(
         user_id=user_id,

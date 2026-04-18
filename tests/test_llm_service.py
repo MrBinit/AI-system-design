@@ -66,6 +66,11 @@ class FakeRedis:
     def setex(self, key, ttl, value):
         self.store[key] = value
 
+    def delete(self, key):
+        existed = key in self.store
+        self.store.pop(key, None)
+        return 1 if existed else 0
+
 
 def _attach_fake_redis(monkeypatch, fake_redis: FakeRedis) -> None:
     monkeypatch.setattr(llm_service, "redis_client", fake_redis)
@@ -101,6 +106,35 @@ async def test_generate_response_returns_cache_hit(monkeypatch):
 
     result = await llm_service.generate_response("user-1", "find ai professor")
     assert result == "from-cache"
+
+
+@pytest.mark.asyncio
+async def test_generate_response_rejects_low_quality_cache_entry(monkeypatch):
+    fake_redis = FakeRedis()
+    cache_key = llm_service._chat_cache_key("user-1", "find ai professor")
+    fake_redis.store[cache_key] = "Sorry, no relevant information is found."
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_build_context(_user_id, user_prompt):
+        return [{"role": "user", "content": user_prompt}]
+
+    async def fake_primary(_messages):
+        return FakeResponse("fresh-answer")
+
+    async def fake_update_memory(*_args, **_kwargs):
+        return None
+
+    async def fake_retrieve_document_chunks(*_args, **_kwargs):
+        return {"results": []}
+
+    monkeypatch.setattr(llm_service, "build_context", fake_build_context)
+    monkeypatch.setattr(llm_service, "_call_primary", fake_primary)
+    monkeypatch.setattr(llm_service, "update_memory", fake_update_memory)
+    monkeypatch.setattr(llm_service, "aretrieve_document_chunks", fake_retrieve_document_chunks)
+
+    result = await llm_service.generate_response("user-1", "find ai professor")
+    assert result == "fresh-answer"
+    assert fake_redis.store.get(cache_key) == "fresh-answer"
 
 
 @pytest.mark.asyncio
@@ -2068,6 +2102,21 @@ def test_cache_skip_reason_handles_abstain_like_variants():
         {},
     )
     assert reason == "abstain_like_variant"
+
+
+def test_cache_skip_reason_rejects_low_confidence_deep_answer():
+    reason = llm_service._cache_skip_reason(
+        "Answer text with citations.",
+        {
+            "execution_mode": "deep",
+            "trust_confidence": 0.51,
+            "web_fallback_attempted": True,
+            "web_retrieval_verified": True,
+            "retrieval_source_count": 3,
+            "web_required_field_coverage": 1.0,
+        },
+    )
+    assert reason == "deep_confidence_low"
 
 
 @pytest.mark.asyncio

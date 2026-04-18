@@ -4,16 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 export GRADIO_PORT="${GRADIO_PORT:-7860}"
-export ENV_FILE="${ENV_FILE:-.env.local}"
+export ENV_FILE="${ENV_FILE:-}"
 
-if [[ ! -f "${ROOT_DIR}/${ENV_FILE}" ]]; then
-  if [[ -f "${ROOT_DIR}/.env" ]]; then
-    echo "[local-down] ${ENV_FILE} not found; falling back to .env"
-    ENV_FILE=".env"
-  else
-    echo "[local-down] Missing env file: ${ENV_FILE}"
-    exit 1
-  fi
+declare -a COMPOSE_CMD=(docker compose)
+if [[ -n "${ENV_FILE}" && -f "${ROOT_DIR}/${ENV_FILE}" ]]; then
+  COMPOSE_CMD+=(--env-file "${ENV_FILE}")
 fi
 
 COMPOSE_ARGS=(
@@ -25,5 +20,5 @@ COMPOSE_ARGS=(
 )
 
 echo "[local-down] Stopping local stack..."
-docker compose --env-file "${ENV_FILE}" "${COMPOSE_ARGS[@]}" down --remove-orphans
+"${COMPOSE_CMD[@]}" "${COMPOSE_ARGS[@]}" down --remove-orphans
 echo "[local-down] Done."

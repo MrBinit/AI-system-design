@@ -179,15 +179,24 @@ async def asearch_google(
 ) -> dict:
     """Run one Tavily web search request asynchronously."""
     _require_web_search_enabled()
+    timeout_seconds = max(2.0, float(settings.web_search.timeout_seconds))
     async with dependency_limiter("web_search"):
-        return await asyncio.to_thread(
-            _search_google_sync,
-            query,
-            gl=gl,
-            hl=hl,
-            num=num,
-            search_depth=search_depth,
-        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    _search_google_sync,
+                    query,
+                    gl=gl,
+                    hl=hl,
+                    num=num,
+                    search_depth=search_depth,
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Tavily request timed out after {timeout_seconds:.1f}s."
+            ) from exc
 
 
 def _normalized_queries(queries: list[str]) -> list[str]:

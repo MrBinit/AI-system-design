@@ -107,8 +107,12 @@ def _load_aws_secrets_manager_env():
 def _apply_env_overrides(data: dict) -> dict:
     """Apply environment overrides on top of YAML configuration for deployments."""
     config = data
+    yaml_only_prefixes = ("WEB_SEARCH_", "BEDROCK_", "AZURE_OPENAI_")
 
     def _set(path: list[str], env_name: str, cast=str):
+        if any(str(env_name).startswith(prefix) for prefix in yaml_only_prefixes):
+            # Keep model/search behavior controlled by YAML config, not env flags.
+            return
         raw = os.getenv(env_name)
         if raw is None or raw == "":
             return
