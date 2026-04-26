@@ -172,12 +172,10 @@ def _update_job(job_id: str, updates: dict) -> None:
 
 
 def _normalized_mode(value: str | None) -> str:
-    candidate = str(value or "").strip().lower()
-    if candidate == "standard":
-        return "fast"
-    if candidate in {"fast", "deep", "auto"}:
-        return candidate
-    return "auto"
+    # Runtime is intentionally single-mode: deep.
+    # Retrieval cost is controlled inside web retrieval via standard-first then deep escalation.
+    _ = value
+    return "deep"
 
 
 def enqueue_chat_job(

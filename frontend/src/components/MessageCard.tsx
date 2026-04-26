@@ -8,7 +8,6 @@ import type { ChatMessage, ReactionType } from "../types";
 interface MessageCardProps {
   message: ChatMessage;
   onRegenerate: (sourcePrompt: string) => void;
-  onRegenerateInDeep: (sourcePrompt: string) => void;
   onRetryWebOnly: (sourcePrompt: string) => void;
   onReaction: (messageId: string, reaction: ReactionType) => void;
 }
@@ -149,7 +148,6 @@ function partitionThoughtSteps(steps: string[]): { planner: string[]; progress: 
 export function MessageCard({
   message,
   onRegenerate,
-  onRegenerateInDeep,
   onRetryWebOnly,
   onReaction,
 }: MessageCardProps) {
@@ -160,7 +158,6 @@ export function MessageCard({
   const copyResetTimerRef = useRef<number | null>(null);
   const isErrorMessage =
     message.role === "assistant" && message.content.trim().toLowerCase().startsWith("error:");
-  const modeLabel = message.executionMode ? message.executionMode.toUpperCase() : "";
   const { primary: primaryAnswer, sourcesBlock } = splitAnswerSections(message.content);
   const citations = useMemo(() => {
     return uniqueUrls([
@@ -241,11 +238,6 @@ export function MessageCard({
             </div>
             {message.role === "assistant" ? (
               <div className="flex items-center gap-1.5">
-                {modeLabel ? (
-                  <span className="rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-medium text-rose-700 dark:bg-rose-950/50 dark:text-rose-200">
-                    {modeLabel}
-                  </span>
-                ) : null}
                 <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-brand-blue dark:bg-slate-700 dark:text-slate-200">
                   AI response
                 </span>
@@ -489,14 +481,6 @@ export function MessageCard({
               >
                 <SparklesIcon className="h-3.5 w-3.5" />
                 Regenerate
-              </button>
-
-              <button
-                type="button"
-                onClick={() => onRegenerateInDeep(message.sourcePrompt || "")}
-                className="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-xs text-rose-700 transition hover:bg-rose-100 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-200"
-              >
-                Regenerate in Deep
               </button>
 
               <button

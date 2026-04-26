@@ -60,11 +60,14 @@ def _normalize_tavily_payload(raw: dict[str, Any], *, query: str) -> dict:
     for row in results:
         if not isinstance(row, dict):
             continue
+        snippet = str(row.get("content", "")).strip() or str(row.get("raw_content", "")).strip()
+        if len(snippet) > 2000:
+            snippet = snippet[:2000]
         organic_results.append(
             {
                 "title": str(row.get("title", "")).strip(),
                 "link": str(row.get("url", "")).strip(),
-                "snippet": str(row.get("content", "")).strip(),
+                "snippet": snippet,
                 "date": str(row.get("published_date", "")).strip(),
             }
         )
@@ -82,6 +85,12 @@ def _search_tavily_sync(
     *,
     num: int,
     search_depth: str = "advanced",
+    topic: str | None = None,
+    time_range: str | None = None,
+    include_raw_content: bool | str | None = None,
+    include_answer: bool | str | None = None,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
 ) -> dict:
     try:
         from tavily import TavilyClient
@@ -92,10 +101,30 @@ def _search_tavily_sync(
 
     _, key = _api_key()
     client = TavilyClient(key)
+    request: dict[str, Any] = {
+        "query": query,
+        "search_depth": search_depth,
+        "max_results": max(1, int(num)),
+    }
+    if isinstance(topic, str) and topic.strip():
+        request["topic"] = topic.strip()
+    if isinstance(time_range, str) and time_range.strip():
+        request["time_range"] = time_range.strip()
+    if include_raw_content is not None:
+        request["include_raw_content"] = include_raw_content
+    if include_answer is not None:
+        request["include_answer"] = include_answer
+    if isinstance(include_domains, list):
+        domains = [str(item).strip() for item in include_domains if str(item).strip()]
+        if domains:
+            request["include_domains"] = domains
+    if isinstance(exclude_domains, list):
+        domains = [str(item).strip() for item in exclude_domains if str(item).strip()]
+        if domains:
+            request["exclude_domains"] = domains
+
     response = client.search(
-        query=query,
-        search_depth=search_depth,
-        max_results=max(1, int(num)),
+        **request,
     )
     if not isinstance(response, dict):
         raise RuntimeError("Tavily response must be a JSON object.")
@@ -108,6 +137,12 @@ def _request_json(
     timeout_seconds: float,
     num: int,
     search_depth: str = "advanced",
+    topic: str | None = None,
+    time_range: str | None = None,
+    include_raw_content: bool | str | None = None,
+    include_answer: bool | str | None = None,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
 ) -> dict:
     attempts = _retry_attempts()
     last_error: Exception | None = None
@@ -118,6 +153,12 @@ def _request_json(
                 query=query,
                 num=num,
                 search_depth=search_depth,
+                topic=topic,
+                time_range=time_range,
+                include_raw_content=include_raw_content,
+                include_answer=include_answer,
+                include_domains=include_domains,
+                exclude_domains=exclude_domains,
             )
             return payload
         except Exception as exc:
@@ -139,6 +180,12 @@ def _search_google_sync(
     hl: str | None = None,
     num: int | None = None,
     search_depth: str | None = None,
+    topic: str | None = None,
+    time_range: str | None = None,
+    include_raw_content: bool | str | None = None,
+    include_answer: bool | str | None = None,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
 ) -> dict:
     trimmed_query = str(query).strip()
     if not trimmed_query:
@@ -152,6 +199,12 @@ def _search_google_sync(
         timeout_seconds=float(settings.web_search.timeout_seconds),
         num=max_results,
         search_depth=selected_depth,
+        topic=topic,
+        time_range=time_range,
+        include_raw_content=include_raw_content,
+        include_answer=include_answer,
+        include_domains=include_domains,
+        exclude_domains=exclude_domains,
     )
     return _normalize_tavily_payload(raw_payload, query=trimmed_query)
 
@@ -163,10 +216,28 @@ def search_google(
     hl: str | None = None,
     num: int | None = None,
     search_depth: str | None = None,
+    topic: str | None = None,
+    time_range: str | None = None,
+    include_raw_content: bool | str | None = None,
+    include_answer: bool | str | None = None,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
 ) -> dict:
     """Run one Tavily web search request."""
     _require_web_search_enabled()
-    return _search_google_sync(query, gl=gl, hl=hl, num=num, search_depth=search_depth)
+    return _search_google_sync(
+        query,
+        gl=gl,
+        hl=hl,
+        num=num,
+        search_depth=search_depth,
+        topic=topic,
+        time_range=time_range,
+        include_raw_content=include_raw_content,
+        include_answer=include_answer,
+        include_domains=include_domains,
+        exclude_domains=exclude_domains,
+    )
 
 
 async def asearch_google(
@@ -176,10 +247,33 @@ async def asearch_google(
     hl: str | None = None,
     num: int | None = None,
     search_depth: str | None = None,
+    topic: str | None = None,
+    time_range: str | None = None,
+    include_raw_content: bool | str | None = None,
+    include_answer: bool | str | None = None,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
 ) -> dict:
     """Run one Tavily web search request asynchronously."""
     _require_web_search_enabled()
     timeout_seconds = max(2.0, float(settings.web_search.timeout_seconds))
+    depth = str(search_depth or getattr(settings.web_search, "search_depth", "advanced")).strip().lower()
+    compact_query = " ".join(str(query or "").split()).strip()
+    has_domain_filters = bool(
+        (isinstance(include_domains, list) and any(str(item).strip() for item in include_domains))
+        or (isinstance(exclude_domains, list) and any(str(item).strip() for item in exclude_domains))
+    )
+    if depth == "basic":
+        if has_domain_filters:
+            timeout_seconds = max(timeout_seconds, 9.0)
+        if len(compact_query) >= 120:
+            timeout_seconds = max(timeout_seconds, 8.0)
+    if depth == "advanced":
+        timeout_seconds = max(timeout_seconds, min(18.0, timeout_seconds * 2.0))
+    if include_raw_content:
+        timeout_seconds = max(timeout_seconds, min(24.0, timeout_seconds * 2.6))
+    if len(compact_query) > 200:
+        timeout_seconds = max(timeout_seconds, min(30.0, timeout_seconds * 1.25))
     async with dependency_limiter("web_search"):
         try:
             return await asyncio.wait_for(
@@ -190,6 +284,12 @@ async def asearch_google(
                     hl=hl,
                     num=num,
                     search_depth=search_depth,
+                    topic=topic,
+                    time_range=time_range,
+                    include_raw_content=include_raw_content,
+                    include_answer=include_answer,
+                    include_domains=include_domains,
+                    exclude_domains=exclude_domains,
                 ),
                 timeout=timeout_seconds,
             )
@@ -210,6 +310,12 @@ async def asearch_google_batch(
     hl: str | None = None,
     num: int | None = None,
     search_depth: str | None = None,
+    topic: str | None = None,
+    time_range: str | None = None,
+    include_raw_content: bool | str | None = None,
+    include_answer: bool | str | None = None,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
 ) -> list[dict]:
     """Run many Tavily web-search requests with an internal async work queue."""
     _require_web_search_enabled()
@@ -236,6 +342,12 @@ async def asearch_google_batch(
                         hl=hl,
                         num=num,
                         search_depth=search_depth,
+                        topic=topic,
+                        time_range=time_range,
+                        include_raw_content=include_raw_content,
+                        include_answer=include_answer,
+                        include_domains=include_domains,
+                        exclude_domains=exclude_domains,
                     )
                     results[index] = {"query": query_value, "result": payload, "error": ""}
                 except Exception as exc:
@@ -253,3 +365,63 @@ async def asearch_google_batch(
     await queue.join()
     await asyncio.gather(*workers)
     return results
+
+
+def _extract_tavily_sync(
+    urls: list[str],
+    *,
+    extract_depth: str = "advanced",
+    query: str | None = None,
+) -> dict:
+    try:
+        from tavily import TavilyClient
+    except Exception as exc:  # pragma: no cover - import failure path
+        raise RuntimeError(
+            "tavily-python is required. Install with: pip install tavily-python"
+        ) from exc
+
+    _, key = _api_key()
+    client = TavilyClient(key)
+    request: dict[str, Any] = {
+        "urls": urls[:20],
+        "extract_depth": extract_depth if extract_depth in {"basic", "advanced"} else "advanced",
+    }
+    if isinstance(query, str) and query.strip():
+        request["query"] = query.strip()
+    response = client.extract(**request)
+    if not isinstance(response, dict):
+        raise RuntimeError("Tavily extract response must be a JSON object.")
+    return response
+
+
+async def aextract_urls(
+    urls: list[str],
+    *,
+    extract_depth: str = "advanced",
+    query: str | None = None,
+) -> dict:
+    """Extract cleaned content for explicit URLs using Tavily Extract."""
+    _require_web_search_enabled()
+    normalized = [str(item).strip() for item in urls if str(item).strip()]
+    if not normalized:
+        return {"results": [], "failed_results": []}
+    timeout_seconds = max(12.0, float(settings.web_search.timeout_seconds) * 3.0)
+    if str(extract_depth).strip().lower() == "advanced":
+        timeout_seconds = max(timeout_seconds, 22.0)
+    if len(normalized) > 6:
+        timeout_seconds = min(40.0, timeout_seconds * 1.3)
+    async with dependency_limiter("web_search"):
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    _extract_tavily_sync,
+                    normalized,
+                    extract_depth=extract_depth,
+                    query=query,
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Tavily extract timed out after {timeout_seconds:.1f}s."
+            ) from exc

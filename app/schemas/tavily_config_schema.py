@@ -24,22 +24,30 @@ class TavilyConfig(BaseModel):
     fallback_enabled: bool = True
     fallback_similarity_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
     expansion_similarity_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
-    query_planner_enabled: bool = True
-    query_planner_use_llm: bool = True
+    query_planner_enabled: bool = False
+    query_planner_use_llm: bool = False
     query_planner_model_id: str = ""
     query_planner_acquire_timeout_seconds: float = Field(default=0.75, ge=0.0, le=30.0)
     query_planner_cache_enabled: bool = True
     query_planner_cache_ttl_seconds: int = Field(default=900, ge=0, le=86400)
     query_planner_max_queries: int = Field(default=5, ge=1, le=12)
     query_planner_max_subquestions: int = Field(default=4, ge=0, le=12)
-    retrieval_loop_enabled: bool = True
-    retrieval_loop_use_llm: bool = True
+    retrieval_loop_enabled: bool = False
+    retrieval_loop_use_llm: bool = False
     retrieval_loop_model_id: str = ""
     retrieval_loop_acquire_timeout_seconds: float = Field(default=0.75, ge=0.0, le=30.0)
     retrieval_loop_cache_enabled: bool = True
     retrieval_loop_cache_ttl_seconds: int = Field(default=300, ge=0, le=86400)
     retrieval_loop_max_steps: int = Field(default=2, ge=1, le=5)
+    retrieval_loop_max_stagnant_steps: int = Field(default=1, ge=0, le=3)
     retrieval_loop_max_gap_queries: int = Field(default=3, ge=1, le=8)
+    deterministic_controller_enabled: bool = True
+    deep_standard_first_enabled: bool = True
+    deep_escalate_only_if_unresolved: bool = True
+    standard_search_max_queries: int = Field(default=2, ge=1, le=8)
+    deep_search_max_queries: int = Field(default=3, ge=1, le=12)
+    deep_extract_max_urls: int = Field(default=4, ge=0, le=20)
+    retrieval_no_progress_cutoff: int = Field(default=1, ge=0, le=3)
     deep_required_field_rescue_enabled: bool = True
     deep_required_field_rescue_max_queries: int = Field(default=6, ge=1, le=12)
     agentic_required_field_rescue_max_rounds: int = Field(default=2, ge=0, le=3)
@@ -85,3 +93,11 @@ class TavilyConfig(BaseModel):
     cache_max_not_verified_mentions: int = Field(default=3, ge=1, le=20)
     retry_max_attempts: int = Field(default=3, ge=1, le=6)
     retry_base_backoff_seconds: float = Field(default=0.8, ge=0.1, le=5.0)
+    german_university_mode_enabled: bool = True
+    german_university_authority_boost: float = Field(default=0.15, ge=0.0, le=0.5)
+    german_education_domain_priority: bool = True
+    german_specific_extraction_enabled: bool = True
+    evidence_specificity_validation_enabled: bool = True
+    evidence_specificity_min_score: float = Field(default=0.3, ge=0.0, le=1.0)
+    answer_validation_enabled: bool = True
+    answer_validation_min_quality_score: float = Field(default=0.6, ge=0.0, le=1.0)

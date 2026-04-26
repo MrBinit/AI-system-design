@@ -57,7 +57,7 @@ async def _process_message(message: dict) -> None:
     user_id = str(payload.get("user_id", "")).strip()
     session_id = str(payload.get("session_id", user_id)).strip() or user_id
     prompt = str(payload.get("prompt", "")).strip()
-    mode = str(payload.get("mode", "auto")).strip().lower() or "auto"
+    mode = str(payload.get("mode", "deep")).strip().lower() or "deep"
 
     if not job_id or not user_id or not prompt:
         if job_id:

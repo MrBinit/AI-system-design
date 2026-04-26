@@ -1,6 +1,6 @@
 export type ChatRole = "user" | "assistant";
 export type ReactionType = "like" | "dislike" | null;
-export type ChatExecutionMode = "auto" | "fast" | "standard" | "deep";
+export type ChatExecutionMode = "deep";
 
 export interface AuthSession {
   token: string;

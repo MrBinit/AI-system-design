@@ -761,6 +761,522 @@ async def test_asearch_payloads_uses_mode_specific_result_count(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_asearch_payloads_applies_official_deep_policy(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "default_num", 3)
+    monkeypatch.setattr(service.settings.web_search, "deep_default_num", 6)
+    captured_kwargs: list[dict] = []
+
+    async def _fake_batch(queries: list[str], **kwargs):
+        _ = queries
+        captured_kwargs.append(dict(kwargs))
+        return [
+            {
+                "query": "q1",
+                "result": {"organic_results": []},
+                "error": "",
+            }
+        ]
+
+    monkeypatch.setattr(service, "asearch_google_batch", _fake_batch)
+
+    mode_token = service._RETRIEVAL_MODE_CTX.set("deep")
+    query_token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics IELTS GPA ECTS deadline portal"
+    )
+    strict_token = service._RETRIEVAL_STRICT_OFFICIAL_CTX.set(True)
+    target_domains_token = service._RETRIEVAL_TARGET_DOMAINS_CTX.set(
+        ("uni-mannheim.de", "portal2.uni-mannheim.de", "daad.de")
+    )
+    required_ids_token = service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.set(
+        ("language_score_thresholds", "gpa_threshold", "application_deadline", "application_portal")
+    )
+    try:
+        await service._asearch_payloads(
+            ["university of mannheim msc business informatics site:uni-mannheim.de"],
+            top_k=3,
+        )
+    finally:
+        service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.reset(required_ids_token)
+        service._RETRIEVAL_TARGET_DOMAINS_CTX.reset(target_domains_token)
+        service._RETRIEVAL_STRICT_OFFICIAL_CTX.reset(strict_token)
+        service._RETRIEVAL_QUERY_CTX.reset(query_token)
+        service._RETRIEVAL_MODE_CTX.reset(mode_token)
+
+    assert captured_kwargs
+    kwargs = captured_kwargs[0]
+    assert kwargs["search_depth"] == "advanced"
+    assert kwargs["include_raw_content"] == "markdown"
+    assert kwargs["include_answer"] is False
+    include_domains = kwargs.get("include_domains") or []
+    assert "uni-mannheim.de" in include_domains
+    assert "daad.de" in include_domains
+
+
+@pytest.mark.asyncio
+async def test_atry_tavily_extract_rows_returns_cleaned_content(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "max_page_chars", 1200)
+    captured: dict[str, object] = {}
+
+    async def _fake_extract(urls: list[str], *, extract_depth: str, query: str | None = None):
+        captured["urls"] = list(urls)
+        captured["extract_depth"] = extract_depth
+        captured["query"] = query
+        return {
+            "results": [
+                {
+                    "url": "https://uni-example.de/apply",
+                    "raw_content": "  Apply online through the official portal.  ",
+                    "published_date": "2026-04-01",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(service, "aextract_urls", _fake_extract)
+
+    mode_token = service._RETRIEVAL_MODE_CTX.set("deep")
+    try:
+        extracted = await service._atry_tavily_extract_rows(
+            [
+                {
+                    "title": "Apply Online",
+                    "url": "https://uni-example.de/apply",
+                    "snippet": "Apply online",
+                }
+            ],
+            query="where to apply",
+            allowed_suffixes=[],
+            strict_official=False,
+            target_domain_groups=None,
+            enforce_target_domain_scope=False,
+            max_urls=4,
+        )
+    finally:
+        service._RETRIEVAL_MODE_CTX.reset(mode_token)
+
+    assert captured["urls"] == ["https://uni-example.de/apply"]
+    assert captured["extract_depth"] == "advanced"
+    assert captured["query"] == "where to apply"
+    assert "https://uni-example.de/apply" in extracted
+    assert extracted["https://uni-example.de/apply"]["content"] == "Apply online through the official portal."
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_prefers_tavily_extract_content_when_fetch_is_empty(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "multi_query_enabled", False)
+    monkeypatch.setattr(service.settings.web_search, "query_planner_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_enabled", False)
+    monkeypatch.setattr(service.settings.web_search, "allowed_domain_suffixes", [])
+
+    async def _fake_plan(_query: str, _allowed_suffixes: list[str]):
+        return {
+            "queries": ["uni example apply portal"],
+            "subquestions": [],
+            "planner": "heuristic",
+            "llm_used": False,
+        }
+
+    async def _fake_payloads(_queries: list[str], *, top_k: int):
+        _ = top_k
+        return [
+            {
+                "organic_results": [
+                    {
+                        "title": "Apply Online",
+                        "link": "https://uni-example.de/apply",
+                        "snippet": "Portal information",
+                    }
+                ]
+            }
+        ]
+
+    async def _fake_fetch_pages(_rows: list[dict], **_kwargs):
+        return {
+            "https://uni-example.de/apply": {
+                "content": "",
+                "published_date": "2026-03-01",
+            }
+        }
+
+    async def _fake_extract_rows(*_args, **_kwargs):
+        return {
+            "https://uni-example.de/apply": {
+                "content": "Apply via https://uni-example.de/apply portal.",
+                "published_date": "2026-03-02",
+                "internal_links": [],
+            }
+        }
+
+    monkeypatch.setattr(service, "_resolve_query_plan", _fake_plan)
+    monkeypatch.setattr(service, "_asearch_payloads", _fake_payloads)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+    monkeypatch.setattr(service, "_atry_tavily_extract_rows", _fake_extract_rows)
+
+    result = await service.aretrieve_web_chunks(
+        "where to apply for uni example msc",
+        top_k=2,
+        search_mode="deep",
+    )
+
+    assert result["results"]
+    assert any(
+        "https://uni-example.de/apply portal" in str(item.get("content", ""))
+        for item in result["results"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_deep_uses_standard_first_without_escalation_when_complete(
+    monkeypatch,
+):
+    calls: list[str] = []
+
+    async def _fake_impl(_query: str, *, top_k: int, search_mode: str = "deep"):
+        _ = top_k
+        calls.append(search_mode)
+        if search_mode == "standard":
+            return {
+                "results": [
+                    {
+                        "content": (
+                            "MSc Business Informatics is taught in English. "
+                            "Language requirement: IELTS 6.0 or TOEFL iBT 72. "
+                            "Apply via portal https://portal2.uni-mannheim.de/."
+                        ),
+                        "metadata": {"url": "https://uni-mannheim.de/en/admission"},
+                    }
+                ]
+            }
+        raise AssertionError("deep mode should not run when standard pass is complete")
+
+    monkeypatch.setattr(service, "_aretrieve_web_chunks_impl", _fake_impl)
+
+    result = await service.aretrieve_web_chunks(
+        (
+            "Tell me about University of Mannheim MSc Business Informatics language requirements "
+            "and where to apply."
+        ),
+        top_k=3,
+        search_mode="deep",
+    )
+
+    assert calls == ["standard"]
+    assert result["results"]
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_deep_escalates_after_standard_when_required_fields_missing(
+    monkeypatch,
+):
+    calls: list[str] = []
+
+    async def _fake_impl(_query: str, *, top_k: int, search_mode: str = "deep"):
+        _ = top_k
+        calls.append(search_mode)
+        if search_mode == "standard":
+            return {
+                "results": [
+                    {
+                        "content": "Proof of English proficiency is required.",
+                        "metadata": {"url": "https://uni-mannheim.de/en/admission"},
+                    }
+                ]
+            }
+        return {
+            "results": [
+                {
+                    "content": (
+                        "MSc Business Informatics language requirement: IELTS 6.0 or TOEFL iBT 72. "
+                        "Apply via https://portal2.uni-mannheim.de/."
+                    ),
+                    "metadata": {"url": "https://uni-mannheim.de/en/admission"},
+                }
+            ],
+            "search_mode": "deep",
+        }
+
+    monkeypatch.setattr(service, "_aretrieve_web_chunks_impl", _fake_impl)
+
+    result = await service.aretrieve_web_chunks(
+        (
+            "Tell me about University of Mannheim MSc Business Informatics language requirements "
+            "and where to apply."
+        ),
+        top_k=3,
+        search_mode="deep",
+    )
+
+    assert calls == ["standard", "deep"]
+    assert result.get("search_mode") == "deep"
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_deep_skips_standard_first_for_high_cost_admissions_scope(
+    monkeypatch,
+):
+    calls: list[str] = []
+
+    async def _fake_impl(_query: str, *, top_k: int, search_mode: str = "deep"):
+        _ = top_k
+        calls.append(search_mode)
+        return {
+            "results": [
+                {
+                    "content": (
+                        "Language requirement: IELTS 6.5. "
+                        "Minimum grade requirement is 2.5 and at least 30 ECTS. "
+                        "Application deadline for international students: 15 July 2026. "
+                        "Apply via https://portal2.uni-mannheim.de/."
+                    ),
+                    "metadata": {"url": "https://uni-mannheim.de/en/admission"},
+                }
+            ],
+            "search_mode": search_mode,
+        }
+
+    monkeypatch.setattr(service, "_aretrieve_web_chunks_impl", _fake_impl)
+
+    result = await service.aretrieve_web_chunks(
+        (
+            "Tell me about University of Mannheim MSc Business Informatics: "
+            "IELTS/German requirement, GPA and ECTS requirements, "
+            "application deadline for international students, and where to apply."
+        ),
+        top_k=3,
+        search_mode="deep",
+    )
+
+    assert calls == ["deep"]
+    assert result.get("search_mode") == "deep"
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_stops_loop_when_coverage_is_not_improving(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "multi_query_enabled", False)
+    monkeypatch.setattr(service.settings.web_search, "query_planner_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_max_steps", 4)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_max_gap_queries", 1)
+    monkeypatch.setattr(service, "_retrieval_loop_max_stagnant_steps", lambda: 1)
+    monkeypatch.setattr(service.settings.web_search, "deep_required_field_rescue_enabled", False)
+    monkeypatch.setattr(service.settings.web_search, "allowed_domain_suffixes", [])
+
+    async def _fake_plan(_query: str, _allowed_suffixes: list[str]):
+        return {
+            "queries": ["uni sample msc ai language requirements"],
+            "subquestions": [],
+            "planner": "heuristic",
+            "llm_used": False,
+        }
+
+    async def _fake_payloads(_queries: list[str], *, top_k: int):
+        _ = top_k
+        return [
+            {
+                    "organic_results": [
+                        {
+                            "title": "Language Overview",
+                            "link": "https://uni-sample.de/language",
+                            "snippet": "English proficiency required.",
+                        }
+                    ]
+                }
+            ]
+
+    async def _fake_fetch_pages(rows: list[dict], **_kwargs):
+        return {
+            str(rows[0].get("url", "")): {
+                "content": "Applicants must provide proof of English proficiency.",
+                "published_date": "2026-03-10",
+            }
+        }
+
+    monkeypatch.setattr(service, "_resolve_query_plan", _fake_plan)
+    monkeypatch.setattr(service, "_asearch_payloads", _fake_payloads)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+
+    result = await service._aretrieve_web_chunks_impl(
+        (
+            "Tell me University of Sample MSc AI language requirements and where to apply."
+        ),
+        top_k=3,
+        search_mode="deep",
+    )
+
+    assert result["retrieval_loop"]["iterations"] in {1, 2}
+    stop_reason = str((result.get("metrics", {}) or {}).get("stop_reason", "")).strip()
+    if stop_reason:
+        assert stop_reason in {"no_progress", "budget_cap", "coverage_reached"}
+
+
+def test_program_scope_bias_penalizes_program_drift():
+    token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics requirements"
+    )
+    try:
+        matching_bias = service._program_scope_bias(
+            title="MSc Business Informatics",
+            url="https://uni-mannheim.de/en/academics/msc-business-informatics/",
+            snippet="Master's program overview.",
+            content="MSc Business Informatics is taught in English.",
+        )
+        drift_bias = service._program_scope_bias(
+            title="BSc Business Informatics",
+            url="https://uni-mannheim.de/en/academics/bsc-business-informatics/",
+            snippet="Bachelor program details.",
+            content="Bachelor level modules and undergraduate track.",
+        )
+    finally:
+        service._RETRIEVAL_QUERY_CTX.reset(token)
+
+    assert matching_bias > drift_bias
+
+
+def test_passes_degree_level_lock_rejects_bachelor_only_for_master_query():
+    token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics requirements"
+    )
+    try:
+        assert (
+            service._passes_degree_level_lock(
+                title="BSc Business Informatics",
+                url="https://uni-mannheim.de/en/academics/bsc-business-informatics/",
+                snippet="Bachelor program",
+                content="Undergraduate modules",
+            )
+            is False
+        )
+        assert (
+            service._passes_degree_level_lock(
+                title="MSc Business Informatics",
+                url="https://uni-mannheim.de/en/academics/masters-program-in-business-informatics/",
+                snippet="Master program",
+                content="Graduate level",
+            )
+            is True
+        )
+    finally:
+        service._RETRIEVAL_QUERY_CTX.reset(token)
+
+
+def test_filter_rows_by_program_scope_rejects_off_target_program_pages():
+    token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics requirements"
+    )
+    try:
+        rows = [
+            {
+                "title": "Mannheim Master in Operations and Supply Chain Management",
+                "url": "https://www.uni-mannheim.de/en/academics/masters-program-operations-supply-chain/",
+                "snippet": "Master program details",
+            },
+            {
+                "title": "Master's Program in Business Informatics",
+                "url": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics",
+                "snippet": "MSc Business Informatics program facts",
+            },
+        ]
+        filtered = service._filter_rows_by_program_scope(rows, allow_fallback_on_empty=False)
+    finally:
+        service._RETRIEVAL_QUERY_CTX.reset(token)
+
+    assert len(filtered) == 1
+    assert "business-informatics" in filtered[0]["url"]
+
+
+def test_required_field_evidence_table_builds_found_and_missing_rows():
+    required_fields = service._required_fields_from_query(
+        "University of Mannheim MSc Business Informatics language requirements and application portal"
+    )
+    candidates = [
+        {
+            "content": "English requirement: IELTS 6.0 or TOEFL iBT 72.",
+            "metadata": {
+                "url": "https://uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics",
+                "trust_score": 0.83,
+            },
+        },
+        {
+            "content": "Apply online via portal: https://portal2.uni-mannheim.de/",
+            "metadata": {
+                "url": "https://portal2.uni-mannheim.de/",
+                "trust_score": 0.8,
+            },
+        },
+    ]
+    rows = service._required_field_evidence_table(required_fields, candidates)
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["language_requirements"]["status"] == "found"
+    assert "ielts" in by_id["language_requirements"]["value"].lower()
+    assert by_id["application_portal"]["status"] == "found"
+    assert "portal2.uni-mannheim.de" in by_id["application_portal"]["value"].lower()
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_prioritizes_field_routing_before_generic_planner_query(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "multi_query_enabled", False)
+    monkeypatch.setattr(service.settings.web_search, "query_planner_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_max_steps", 1)
+    monkeypatch.setattr(service.settings.web_search, "deep_required_field_rescue_enabled", False)
+    monkeypatch.setattr(service.settings.web_search, "allowed_domain_suffixes", [])
+
+    async def _fake_plan(_query: str, _allowed_suffixes: list[str]):
+        return {
+            "queries": ["generic planner query that should not run first"],
+            "subquestions": [],
+            "planner": "heuristic",
+            "llm_used": False,
+        }
+
+    seen_batches: list[list[str]] = []
+
+    async def _fake_payloads(queries: list[str], *, top_k: int):
+        _ = top_k
+        seen_batches.append(list(queries))
+        return [
+            {
+                "organic_results": [
+                    {
+                        "title": "Master's Program in Business Informatics",
+                        "link": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics",
+                        "snippet": "Program information and admission details.",
+                    }
+                ]
+            }
+        ]
+
+    async def _fake_fetch_pages(rows: list[dict], **_kwargs):
+        return {
+            str(rows[0].get("url", "")): {
+                "content": "Application deadline: 15 May 2026. Apply via https://portal2.uni-mannheim.de/",
+                "published_date": "2026-03-01",
+            }
+        }
+
+    monkeypatch.setattr(service, "_resolve_query_plan", _fake_plan)
+    monkeypatch.setattr(service, "_asearch_payloads", _fake_payloads)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+
+    await service.aretrieve_web_chunks(
+        (
+            "Tell me about University of Mannheim MSc Business Informatics: IELTS/German, GPA/ECTS, "
+            "deadline and portal using official sources only."
+        ),
+        top_k=3,
+        search_mode="deep",
+    )
+
+    assert seen_batches
+    first_batch = " ".join(seen_batches[0]).lower()
+    assert "generic planner query" not in first_batch
+    assert (
+        "official selection statute" in first_batch
+        or "official application deadlines" in first_batch
+        or "official apply online portal" in first_batch
+    )
+
+
+@pytest.mark.asyncio
 async def test_query_planner_uses_cache_before_llm_call(monkeypatch):
     monkeypatch.setattr(service.settings.web_search, "query_planner_use_llm", True)
     monkeypatch.setattr(service.settings.web_search, "query_planner_cache_enabled", True)
@@ -821,6 +1337,36 @@ def test_build_query_variants_includes_suffix_scoped_variant(monkeypatch):
     )
 
     assert any("site:.de" in item and "site:.eu" in item for item in variants)
+
+
+def test_build_query_variants_prioritizes_official_source_routes(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "multi_query_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "max_query_variants", 5)
+    monkeypatch.setattr(service.settings.web_search, "official_source_allowlist", ["daad.de"])
+
+    variants = service._build_query_variants(
+        "University of Mannheim MSc Business Informatics admission deadline language requirements",
+        [".de", ".eu"],
+    )
+    lowered = [item.lower() for item in variants]
+
+    assert any("site:uni-mannheim.de" in item for item in lowered)
+    assert any("admission requirements" in item for item in lowered)
+
+
+def test_build_official_source_route_queries_includes_daad_and_uni_assist(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "official_source_allowlist", ["daad.de"])
+
+    queries = service._build_official_source_route_queries(
+        "University of Stuttgart autonomous systems master admission",
+        [{"id": "application_portal"}, {"id": "admission_requirements"}],
+        max_queries=12,
+    )
+    lowered = [item.lower() for item in queries]
+
+    assert any("site:uni-stuttgart.de" in item for item in lowered)
+    assert any("site:daad.de" in item for item in lowered)
+    assert any("site:uni-assist.de" in item for item in lowered)
 
 
 def test_build_query_variants_adds_entity_focused_queries(monkeypatch):
@@ -934,6 +1480,42 @@ def test_filter_rows_by_allowed_domains_keeps_official_and_daad_only(monkeypatch
     assert "https://research-forum.eu/ai" not in urls
 
 
+def test_source_filter_decisions_report_rejection_reasons(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "official_source_filter_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "official_source_allowlist", ["daad.de"])
+
+    rows = [
+        {
+            "title": "DAAD Program Entry",
+            "url": "https://www2.daad.de/deutschland/studienangebote/international-programmes/en/detail/5634/",
+            "snippet": "DAAD international program details.",
+        },
+        {
+            "title": "Forum discussion",
+            "url": "https://example.com/ai",
+            "snippet": "Community notes about admissions.",
+        },
+        {
+            "title": "Research portal",
+            "url": "https://research-forum.eu/ai",
+            "snippet": "Community notes about admissions.",
+        },
+    ]
+
+    decisions = service._source_filter_decisions(
+        rows,
+        allowed_suffixes=[".de", ".eu"],
+        strict_official=False,
+    )
+    summary = service._source_filter_summary(decisions)
+
+    assert summary["kept_count"] == 1
+    assert summary["rejected_count"] == 2
+    assert summary["reason_counts"]["kept"] == 1
+    assert summary["reason_counts"]["domain_suffix_not_allowed"] == 1
+    assert summary["reason_counts"]["non_official_host"] == 1
+
+
 def test_official_domains_for_query_infers_university_domains():
     domains = service._official_domains_for_query(
         "tell me university of tubingen msc machine learning requirements"
@@ -949,6 +1531,13 @@ def test_official_domains_for_query_infers_university_domains():
     )
     assert "tum.de" in tum_domains
     assert "uni-munich.de" not in tum_domains
+
+    mannheim_domains = service._official_domains_for_query(
+        "tell me about university of mannheim msc business informatics requirements"
+    )
+    assert "uni-mannheim.de" in mannheim_domains
+    assert "portal2.uni-mannheim.de" in mannheim_domains
+    assert "tu-mannheim.de" not in mannheim_domains
 
 
 def test_strict_official_policy_rejects_non_official_admissions_sources(monkeypatch):
@@ -1269,6 +1858,17 @@ def test_required_fields_from_query_language_requirement_only_does_not_force_gpa
     assert "ects_breakdown" not in ids
 
 
+def test_required_fields_from_query_language_plus_gpa_and_ects_includes_threshold_fields():
+    fields = service._required_fields_from_query(
+        "language requirements plus GPA and ECTS requirements for msc business informatics"
+    )
+    ids = [str(item.get("id", "")).strip() for item in fields]
+    assert "language_requirements" in ids
+    assert "language_score_thresholds" in ids
+    assert "gpa_threshold" in ids
+    assert "ects_breakdown" in ids
+
+
 def test_required_fields_from_query_broad_program_profile_adds_depth_bundle():
     fields = service._required_fields_from_query(
         "tell me about technical university of munich msc data engineering"
@@ -1305,6 +1905,83 @@ def test_effective_retrieval_loop_max_steps_boosts_for_program_queries(monkeypat
     assert boosted >= 4
 
 
+def test_build_required_field_queries_includes_statute_and_language_routes_for_official_domain():
+    query = "University of Mannheim MSc Business Informatics admission requirements"
+    fields = [
+        {
+            "id": "gpa_threshold",
+            "query_focus": "minimum GPA grade threshold admission score requirement",
+        },
+        {
+            "id": "ects_breakdown",
+            "query_focus": "required ECTS prerequisite credits mathematics computer science",
+        },
+        {
+            "id": "language_score_thresholds",
+            "query_focus": "IELTS TOEFL CEFR minimum score thresholds exact values",
+        },
+    ]
+
+    queries = service._build_required_field_queries(
+        query,
+        missing_required_fields=fields,
+        allowed_suffixes=[],
+        unique_domains=["uni-mannheim.de"],
+    )
+
+    lowered = [item.lower() for item in queries]
+    assert any("selection statute" in item and "site:uni-mannheim.de" in item for item in lowered)
+    assert any("ielts toefl minimum score official" in item and "site:uni-mannheim.de" in item for item in lowered)
+    assert any("official pdf" in item for item in lowered)
+
+
+def test_build_required_field_queries_keeps_deadline_portal_and_grade_routes_together():
+    query = (
+        "Tell me University of Mannheim MSc Business Informatics language requirements, "
+        "GPA and ECTS requirements, application deadline, and where to apply."
+    )
+    fields = service._required_fields_from_query(query)
+
+    queries = service._build_required_field_queries(
+        query,
+        missing_required_fields=fields,
+        allowed_suffixes=[],
+        unique_domains=["uni-mannheim.de"],
+    )
+
+    lowered = [item.lower() for item in queries]
+    assert any("application deadlines international students" in item for item in lowered)
+    assert any("minimum grade" in item or "mindestnote" in item for item in lowered)
+    assert any("apply online application portal" in item for item in lowered)
+
+
+def test_build_required_field_queries_trim_to_tavily_safe_length():
+    query = (
+        "Tell me about University of Mannheim MSc Business Informatics language requirements "
+        "for international students, GPA and ECTS requirements, application deadline and portal "
+        "plus all official details in one response with verification and additional notes."
+    )
+    fields = service._required_fields_from_query(query)
+    queries = service._build_required_field_queries(
+        query,
+        missing_required_fields=fields,
+        allowed_suffixes=[".de", ".eu"],
+        unique_domains=["uni-mannheim.de", "daad.de"],
+    )
+    assert queries
+    assert max(len(item) for item in queries) <= 380
+    assert len(queries) == len({item.lower() for item in queries})
+
+
+def test_normalize_query_list_trims_and_dedupes_after_trim():
+    long_a = "mannheim " + ("business informatics " * 60)
+    long_b = (long_a + " official").strip()
+    normalized = service._normalize_query_list([long_a, long_b, long_a], limit=5)
+    assert normalized
+    assert all(len(item) <= 380 for item in normalized)
+    assert len(normalized) == len({item.lower() for item in normalized})
+
+
 def test_required_field_coverage_for_application_portal_requires_url():
     required_fields = service._required_fields_from_query(
         "application portal for msc machine learning"
@@ -1327,7 +2004,87 @@ def test_required_field_coverage_for_application_portal_requires_url():
     assert "application_portal" not in strong["missing_ids"]
 
 
-def test_required_field_coverage_for_language_requires_score():
+def test_required_field_coverage_for_application_portal_accepts_direct_portal2_url():
+    required_fields = service._required_fields_from_query(
+        "where to apply for msc business informatics and application portal"
+    )
+    with_portal2_url = [
+        {
+            "content": "Apply here: https://portal2.uni-mannheim.de/",
+            "metadata": {"url": "https://portal2.uni-mannheim.de/"},
+        }
+    ]
+    status = service._required_field_coverage(required_fields, with_portal2_url)
+    assert "application_portal" not in status["missing_ids"]
+
+
+def test_extract_portal_value_rejects_generic_apply_index_source_url():
+    value = service._extract_portal_value(
+        "Applications are managed centrally. Please refer to the application information page.",
+        "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/selection-statutes/",
+    )
+    assert value == ""
+
+
+def test_extract_portal_value_accepts_portal_source_url():
+    value = service._extract_portal_value(
+        "Use the official application portal for submission.",
+        "https://portal2.uni-mannheim.de/",
+    )
+    assert "portal2.uni-mannheim.de" in value.lower()
+
+
+def test_collect_search_rows_high_precision_drops_noise_without_fallback():
+    payloads = [
+        {
+            "organic_results": [
+                {
+                    "title": "Course Catalog Spring 2026",
+                    "link": "https://www.uni-mannheim.de/en/academics/coming-to-mannheim/engageeu-study-offers/course-catalog-spring-2026/",
+                    "snippet": "Course offerings for exchange students.",
+                }
+            ]
+        }
+    ]
+    mode_token = service._RETRIEVAL_MODE_CTX.set("deep")
+    query_token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics application deadline and portal"
+    )
+    required_token = service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.set(
+        ("application_deadline", "application_portal", "language_score_thresholds")
+    )
+    try:
+        rows = service._collect_search_rows(
+            payloads,
+            query_variants=["mannheim msc business informatics admissions"],
+            top_k=3,
+            allowed_suffixes=[],
+            strict_official=False,
+            target_domain_groups=[],
+            enforce_target_domain_scope=False,
+        )
+    finally:
+        service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.reset(required_token)
+        service._RETRIEVAL_QUERY_CTX.reset(query_token)
+        service._RETRIEVAL_MODE_CTX.reset(mode_token)
+    assert rows == []
+
+
+def test_retrieval_min_unique_domains_allows_single_domain_for_strict_official_scope(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "retrieval_min_unique_domains", 2)
+    monkeypatch.setattr(service.settings.web_search, "deep_min_unique_domains", 2)
+    mode_token = service._RETRIEVAL_MODE_CTX.set("deep")
+    strict_token = service._RETRIEVAL_STRICT_OFFICIAL_CTX.set(True)
+    target_token = service._RETRIEVAL_TARGET_DOMAINS_CTX.set(("uni-mannheim.de",))
+    try:
+        assert service._retrieval_min_unique_domains() == 1
+    finally:
+        service._RETRIEVAL_TARGET_DOMAINS_CTX.reset(target_token)
+        service._RETRIEVAL_STRICT_OFFICIAL_CTX.reset(strict_token)
+        service._RETRIEVAL_MODE_CTX.reset(mode_token)
+
+
+def test_required_field_coverage_for_language_separates_requirement_and_score_slots():
     required_fields = service._required_fields_from_query(
         "language requirements for international students"
     )
@@ -1347,7 +2104,8 @@ def test_required_field_coverage_for_language_requires_score():
     weak = service._required_field_coverage(required_fields, language_only)
     strong = service._required_field_coverage(required_fields, with_scores)
 
-    assert "language_requirements" in weak["missing_ids"]
+    assert "language_requirements" not in weak["missing_ids"]
+    assert "language_score_thresholds" in weak["missing_ids"]
     assert weak["coverage"] < 1.0
     assert "language_requirements" not in strong["missing_ids"]
     assert strong["coverage"] == 1.0
@@ -1380,6 +2138,77 @@ def test_required_field_coverage_for_gpa_and_ects_requires_numeric_thresholds():
     assert "ects_breakdown" in weak_status["missing_ids"]
     assert "gpa_threshold" not in strong_status["missing_ids"]
     assert "ects_breakdown" not in strong_status["missing_ids"]
+
+
+@pytest.mark.asyncio
+async def test_deep_university_query_uses_iterative_loop_path(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "deep_standard_first_enabled", False)
+    monkeypatch.setattr(service.settings.web_search, "deterministic_controller_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_max_steps", 2)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_max_gap_queries", 1)
+    monkeypatch.setattr(service.settings.web_search, "allowed_domain_suffixes", [])
+
+    async def _should_not_use_deterministic(*_args, **_kwargs):
+        raise AssertionError("Deep university queries should run through iterative retrieval loop.")
+
+    async def _fake_plan(_query: str, _allowed_suffixes: list[str]):
+        return {
+            "queries": ["university of mannheim msc business informatics application deadline portal"],
+            "subquestions": [],
+            "planner": "heuristic",
+            "llm_used": False,
+        }
+
+    async def _fake_payloads(_queries: list[str], *, top_k: int):
+        _ = top_k
+        return [
+            {
+                "organic_results": [
+                    {
+                        "title": "Selection Statutes",
+                        "link": "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/selection-statutes/",
+                        "snippet": "Program-specific statutes and admission details.",
+                    },
+                    {
+                        "title": "Application Portal",
+                        "link": "https://portal2.uni-mannheim.de/",
+                        "snippet": "Apply online.",
+                    },
+                ]
+            }
+        ]
+
+    async def _fake_fetch_pages(rows: list[dict], **_kwargs):
+        payload: dict[str, dict] = {}
+        for row in rows:
+            url = str(row.get("url", "")).strip()
+            if "portal2" in url:
+                payload[url] = {
+                    "content": "Apply online via https://portal2.uni-mannheim.de/.",
+                    "published_date": "2026-03-10",
+                }
+            else:
+                payload[url] = {
+                    "content": "Language of instruction: English. IELTS 6.5. Application deadline: 15 July 2026.",
+                    "published_date": "2026-03-10",
+                }
+        return payload
+
+    monkeypatch.setattr(service, "_aretrieve_web_chunks_impl_deterministic", _should_not_use_deterministic)
+    monkeypatch.setattr(service, "_resolve_query_plan", _fake_plan)
+    monkeypatch.setattr(service, "_asearch_payloads", _fake_payloads)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+
+    result = await service.aretrieve_web_chunks(
+        "Tell me about University of Mannheim MSc Business Informatics language and deadline and portal",
+        top_k=3,
+        search_mode="deep",
+    )
+
+    assert result["search_mode"] == "deep"
+    assert result["retrieval_loop"]["enabled"] is True
+    assert result["retrieval_loop"]["iterations"] >= 1
 
 
 @pytest.mark.asyncio
@@ -1619,3 +2448,342 @@ async def test_aretrieve_web_chunks_uses_internal_crawl_to_close_missing_languag
     steps = result["retrieval_loop"]["steps"]
     assert steps
     assert "crawl_internal_links" in set(steps[0].get("actions", []))
+
+
+@pytest.mark.asyncio
+async def test_aretrieve_web_chunks_routes_missing_fields_to_statute_deadline_and_portal_sources(
+    monkeypatch,
+):
+    monkeypatch.setattr(service.settings.web_search, "multi_query_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "query_planner_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_max_steps", 2)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_max_gap_queries", 1)
+    monkeypatch.setattr(service.settings.web_search, "allowed_domain_suffixes", [])
+
+    async def _fake_plan(_query: str, _allowed_suffixes: list[str]):
+        return {
+            "queries": ["university of mannheim msc business informatics"],
+            "subquestions": [],
+            "planner": "heuristic",
+            "llm_used": False,
+        }
+
+    async def _fake_payloads(queries: list[str], *, top_k: int):
+        _ = top_k
+        query_text = " ".join(queries).lower()
+        rows: list[dict] = []
+        if (
+            "selection statute" in query_text
+            or "auswahlsatzung" in query_text
+            or "minimum grade" in query_text
+        ):
+            rows.append(
+                {
+                    "title": "Selection Statute",
+                    "link": "https://uni-mannheim.de/business-informatics-selection-statute.pdf",
+                    "snippet": "Minimum grade and ECTS prerequisites.",
+                }
+            )
+        if "ielts" in query_text or "foreign language requirements" in query_text:
+            rows.append(
+                {
+                    "title": "Foreign Language Requirements",
+                    "link": "https://uni-mannheim.de/masters-programs-foreign-language-requirements/",
+                    "snippet": "IELTS and TOEFL minimum scores.",
+                }
+            )
+        if "deadline" in query_text or "application deadlines international" in query_text:
+            rows.append(
+                {
+                    "title": "Application Deadlines",
+                    "link": "https://uni-mannheim.de/application-deadlines/",
+                    "snippet": "Application deadlines for international students.",
+                }
+            )
+        if "apply online" in query_text or "where to apply" in query_text or "portal" in query_text:
+            rows.append(
+                {
+                    "title": "Apply Online",
+                    "link": "https://portal2.uni-mannheim.de/",
+                    "snippet": "Official application portal.",
+                }
+            )
+        if not rows:
+            rows.append(
+                {
+                    "title": "Program Overview",
+                    "link": "https://uni-mannheim.de/msc-business-informatics/",
+                    "snippet": "English-taught master's program.",
+                }
+            )
+        return [{"organic_results": rows}]
+
+    async def _fake_fetch_pages(rows: list[dict], **_kwargs):
+        payload: dict[str, dict] = {}
+        for row in rows:
+            url = str(row.get("url", "")).strip()
+            if "selection-statute" in url:
+                payload[url] = {
+                    "content": (
+                        "Admission requirements: minimum grade 2.5. "
+                        "ECTS prerequisites: at least 30 ECTS in informatics and 18 ECTS in mathematics/statistics."
+                    ),
+                    "published_date": "2026-03-01",
+                }
+            elif "foreign-language-requirements" in url:
+                payload[url] = {
+                    "content": "English requirement: IELTS 6.0 or TOEFL iBT 72 minimum.",
+                    "published_date": "2026-03-01",
+                }
+            elif "application-deadlines" in url:
+                payload[url] = {
+                    "content": "Application deadline for international students: 15 May 2026.",
+                    "published_date": "2026-03-01",
+                }
+            elif "portal2.uni-mannheim.de" in url:
+                payload[url] = {
+                    "content": "Apply online via portal: https://portal2.uni-mannheim.de/",
+                    "published_date": "2026-03-01",
+                }
+            else:
+                payload[url] = {
+                    "content": (
+                        "MSc Business Informatics is an English-taught master's program "
+                        "with duration 4 semesters and 120 ECTS."
+                    ),
+                    "published_date": "2026-03-01",
+                }
+        return payload
+
+    monkeypatch.setattr(service, "_resolve_query_plan", _fake_plan)
+    monkeypatch.setattr(service, "_asearch_payloads", _fake_payloads)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+
+    result = await service.aretrieve_web_chunks(
+        (
+            "Tell me University of Mannheim MSc Business Informatics language requirements, "
+            "GPA and ECTS requirements, application deadline for international students, "
+            "and where to apply."
+        ),
+        top_k=3,
+        search_mode="deep",
+    )
+
+    assert result["verification"]["required_field_coverage"] == 1.0
+    assert result["verification"]["required_fields_missing"] == []
+    assert result["verification"]["verified"] is True
+    assert any(
+        "selection statute" in query.lower() or "application deadlines" in query.lower()
+        for query in result["query_variants"]
+    )
+
+
+def test_required_fields_from_query_adds_instruction_language_slot():
+    fields = service._required_fields_from_query(
+        "Tell me the language of instruction for University of Mannheim MSc Business Informatics."
+    )
+    field_ids = {str(item.get("id", "")) for item in fields if isinstance(item, dict)}
+    assert "instruction_language" in field_ids
+
+
+def test_required_field_evidence_table_requires_typed_gpa_value():
+    required_fields = [{"id": "gpa_threshold", "label": "GPA threshold"}]
+    candidates = [
+        {
+            "content": "Admission requires a strong grade profile.",
+            "metadata": {
+                "url": "https://www.uni-example.de/admission",
+                "source_tier": "tier0_official",
+                "trust_score": 0.7,
+            },
+        }
+    ]
+    rows = service._required_field_evidence_table(required_fields, candidates)
+    assert rows[0]["status"] == "missing"
+
+    candidates[0]["content"] = "Minimum grade (Mindestnote) is 2.5 for admission."
+    rows = service._required_field_evidence_table(required_fields, candidates)
+    assert rows[0]["status"] == "found"
+    assert rows[0]["value"] == "2.5"
+
+
+def test_required_field_evidence_table_extracts_instruction_language():
+    required_fields = [{"id": "instruction_language", "label": "Language of instruction"}]
+    candidates = [
+        {
+            "content": "Language of instruction: English and German.",
+            "metadata": {
+                "url": "https://www.uni-example.de/program",
+                "source_tier": "tier0_official",
+                "trust_score": 0.8,
+            },
+        }
+    ]
+    rows = service._required_field_evidence_table(required_fields, candidates)
+    assert rows[0]["status"] == "found"
+    assert "English" in rows[0]["value"]
+
+
+def test_student_schema_required_fields_drive_mannheim_prompt():
+    fields = service._required_fields_from_query(
+        "Tell me about University of Mannheim MSc Business Informatics: language of instruction, "
+        "IELTS/German requirement, GPA and ECTS requirements, application deadline for "
+        "international students, and where to apply. Also tell me if this course is competitive."
+    )
+    field_ids = [str(item.get("id", "")) for item in fields]
+    assert "instruction_language" in field_ids
+    assert "language_score_thresholds" in field_ids
+    assert "gpa_threshold" in field_ids
+    assert "ects_breakdown" in field_ids
+    assert "application_deadline" in field_ids
+    assert "application_portal" in field_ids
+    assert "admission_decision_signal" in field_ids
+
+
+def test_required_field_evidence_table_promotes_official_portal_url():
+    required_fields = [{"id": "application_portal", "label": "Application portal"}]
+    candidates = [
+        {
+            "content": "",
+            "metadata": {
+                "title": "Apply online",
+                "snippet": "",
+                "url": "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces",
+                "source_tier": "tier0_official",
+                "trust_score": 0.9,
+            },
+        }
+    ]
+    rows = service._required_field_evidence_table(required_fields, candidates)
+    assert rows[0]["status"] == "found"
+    assert rows[0]["value"].startswith("https://portal2.uni-mannheim.de/")
+
+
+def test_required_field_evidence_table_extracts_german_admissions_terms():
+    required_fields = [
+        {"id": "gpa_threshold", "label": "GPA threshold"},
+        {"id": "ects_breakdown", "label": "ECTS prerequisites"},
+        {"id": "language_score_thresholds", "label": "Language scores"},
+        {"id": "application_deadline", "label": "Application deadline"},
+    ]
+    candidates = [
+        {
+            "content": (
+                "Auswahlsatzung Wirtschaftsinformatik Master: Mindestnote 2,5. "
+                "Voraussetzungen: 36 ECTS in Informatik. "
+                "Sprachnachweis Englisch IELTS 6,5. "
+                "Bewerbungsfrist Wintersemester 31.05.2026."
+            ),
+            "metadata": {
+                "url": "https://www.uni-mannheim.de/auswahlsatzung-wirtschaftsinformatik.pdf",
+                "source_tier": "tier0_official",
+                "trust_score": 0.9,
+            },
+        }
+    ]
+    rows = service._required_field_evidence_table(required_fields, candidates)
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["gpa_threshold"]["value"] == "2.5"
+    assert by_id["ects_breakdown"]["value"] == "36 ECTS"
+    assert by_id["language_score_thresholds"]["value"] == "IELTS 6.5"
+    assert by_id["application_deadline"]["value"] == "31.05.2026"
+
+
+def test_program_specific_critical_fields_reject_related_program_evidence():
+    query_token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics GPA and ECTS requirements"
+    )
+    required_token = service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.set(("gpa_threshold",))
+    try:
+        rows = service._required_field_evidence_table(
+            [{"id": "gpa_threshold", "label": "GPA threshold"}],
+            [
+                {
+                    "content": "Auswahlsatzung Master Management: Mindestnote 2.0.",
+                    "metadata": {
+                        "title": "Selection statute MSc Management",
+                        "url": "https://www.uni-mannheim.de/auswahlsatzung-management.pdf",
+                        "source_tier": "tier0_official",
+                        "trust_score": 0.9,
+                    },
+                }
+            ],
+        )
+    finally:
+        service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.reset(required_token)
+        service._RETRIEVAL_QUERY_CTX.reset(query_token)
+    assert rows[0]["status"] == "missing"
+    assert rows[0]["rejected_candidates"][0]["reason"] == "program_scope_mismatch"
+
+
+def test_required_field_evidence_table_rejects_incoming_portal2_ilias_noise():
+    query_token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics eligibility requirements and portal"
+    )
+    required_token = service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.set(
+        ("admission_requirements", "application_portal")
+    )
+    try:
+        rows = service._required_field_evidence_table(
+            [
+                {"id": "admission_requirements", "label": "Eligibility requirements"},
+                {"id": "application_portal", "label": "Application portal"},
+            ],
+            [
+                {
+                    "content": (
+                        "Portal2 and ILIAS for incoming students. It gives you access to course "
+                        "documents such as lecture scripts, videos, PowerPoint slides, and helpful literature."
+                    ),
+                    "metadata": {
+                        "title": "Portal2 and ILIAS",
+                        "url": "https://www.wim.uni-mannheim.de/en/internationales/informationen-fuer-incomings/portal2-and-ilias-1/",
+                        "source_tier": "tier0_official",
+                        "trust_score": 0.9,
+                    },
+                }
+            ],
+        )
+    finally:
+        service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.reset(required_token)
+        service._RETRIEVAL_QUERY_CTX.reset(query_token)
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["admission_requirements"]["status"] == "missing"
+    assert by_id["application_portal"]["status"] == "missing"
+
+
+def test_required_field_evidence_table_rejects_mmm_study_organization_noise():
+    query_token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics ECTS and language requirements"
+    )
+    required_token = service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.set(
+        ("ects_breakdown", "language_requirements")
+    )
+    try:
+        rows = service._required_field_evidence_table(
+            [
+                {"id": "ects_breakdown", "label": "ECTS prerequisites"},
+                {"id": "language_requirements", "label": "Language requirements"},
+            ],
+            [
+                {
+                    "content": (
+                        "MMM Study Organization Presentation. Master thesis registration requires "
+                        "24 ECTS. Language requirements: German/English."
+                    ),
+                    "metadata": {
+                        "title": "MMM Study Organization Presentation Program Management",
+                        "url": "https://www.bwl.uni-mannheim.de/media/Fakultaeten/bwl/Dokumente/Studium/MMM/MMM_Study_Organization_Presentation_Program_Management.pdf",
+                        "source_tier": "tier0_official",
+                        "trust_score": 0.9,
+                    },
+                }
+            ],
+        )
+    finally:
+        service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.reset(required_token)
+        service._RETRIEVAL_QUERY_CTX.reset(query_token)
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["ects_breakdown"]["status"] == "missing"
+    assert by_id["language_requirements"]["status"] == "missing"

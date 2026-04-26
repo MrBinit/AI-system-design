@@ -1,20 +1,11 @@
 import { SendIcon } from "./Icons";
-import type { ChatExecutionMode } from "../types";
-
-const MODE_OPTIONS: Array<{ value: ChatExecutionMode; label: string }> = [
-  { value: "auto", label: "Auto" },
-  { value: "standard", label: "Standard" },
-  { value: "deep", label: "Deep" },
-];
 
 interface ChatInputProps {
   value: string;
   disabled: boolean;
-  mode: ChatExecutionMode;
   suggestionChips: string[];
   autoScrollPaused: boolean;
   onChange: (value: string) => void;
-  onModeChange: (mode: ChatExecutionMode) => void;
   onSuggestionClick: (value: string) => Promise<void>;
   onToggleAutoScroll: () => void;
   onSubmit: () => Promise<void>;
@@ -23,11 +14,9 @@ interface ChatInputProps {
 export function ChatInput({
   value,
   disabled,
-  mode,
   suggestionChips,
   autoScrollPaused,
   onChange,
-  onModeChange,
   onSuggestionClick,
   onToggleAutoScroll,
   onSubmit,
@@ -59,33 +48,6 @@ export function ChatInput({
         }}
       >
         <div className="w-full">
-          <div className="mb-1 flex items-center gap-1">
-            {MODE_OPTIONS.map((option) => {
-              const selected = mode === option.value;
-              return (
-                <button
-                  key={option.value}
-                  type="button"
-                  disabled={disabled}
-                  onClick={() => onModeChange(option.value)}
-                  className={[
-                    "rounded-md border px-2 py-0.5 text-[11px] font-medium transition",
-                    selected
-                      ? option.value === "deep"
-                        ? "border-brand-red bg-rose-50 text-brand-red dark:border-rose-400 dark:bg-rose-950/30 dark:text-rose-200"
-                        : "border-brand-blue bg-blue-50 text-brand-blue dark:border-blue-400 dark:bg-blue-950/40 dark:text-blue-200"
-                      : "border-slate-200 text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800",
-                    disabled ? "cursor-not-allowed opacity-60" : "",
-                  ]
-                    .filter(Boolean)
-                    .join(" ")}
-                  aria-label={`Use ${option.label.toLowerCase()} mode`}
-                >
-                  {option.label}
-                </button>
-              );
-            })}
-          </div>
           <textarea
             value={value}
             disabled={disabled}

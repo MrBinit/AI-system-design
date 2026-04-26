@@ -8,7 +8,6 @@ import { Sidebar } from "./components/Sidebar";
 import { clearChatHistory, fetchChatJobTrace, fetchConversations, loginWithPassword, streamChatResponse } from "./lib/api";
 import type {
   AuthSession,
-  ChatExecutionMode,
   ChatMessage,
   ConversationItem,
   ReactionType,
@@ -19,7 +18,6 @@ import type {
 const AUTH_STORAGE_KEY = "ai.chat.frontend.auth";
 const THEME_STORAGE_KEY = "ai.chat.frontend.theme";
 const ACTIVE_JOB_STORAGE_KEY = "ai.chat.frontend.active_job_id";
-const CHAT_MODE_STORAGE_KEY = "ai.chat.frontend.mode";
 const CONVERSATION_META_STORAGE_KEY = "ai.chat.frontend.conversation_meta";
 
 type ConversationDateFilter = "all" | "7d" | "30d";
@@ -32,7 +30,6 @@ interface ConversationMeta {
 
 interface PromptCommandResult {
   prompt: string;
-  mode: ChatExecutionMode | null;
 }
 
 function makeId(): string {
@@ -60,23 +57,6 @@ function getStoredTheme(): boolean {
   }
 }
 
-function getStoredChatMode(): ChatExecutionMode {
-  try {
-    const candidate = String(localStorage.getItem(CHAT_MODE_STORAGE_KEY) ?? "")
-      .trim()
-      .toLowerCase();
-    if (candidate === "fast" || candidate === "standard") {
-      return "standard";
-    }
-    if (candidate === "deep" || candidate === "auto") {
-      return candidate;
-    }
-  } catch {
-    // ignore localStorage access failures and use default
-  }
-  return "auto";
-}
-
 function getStoredConversationMeta(): Record<string, ConversationMeta> {
   try {
     const raw = localStorage.getItem(CONVERSATION_META_STORAGE_KEY);
@@ -93,25 +73,17 @@ function getStoredConversationMeta(): Record<string, ConversationMeta> {
   }
 }
 
-function parsePromptCommands(rawInput: string, defaultMode: ChatExecutionMode): PromptCommandResult {
+function parsePromptCommands(rawInput: string): PromptCommandResult {
   const text = rawInput.trim();
   if (!text.startsWith("/")) {
-    return { prompt: text, mode: null };
+    return { prompt: text };
   }
 
   const [rawCommand, ...rest] = text.split(/\s+/);
   const command = rawCommand.toLowerCase();
   const remaining = rest.join(" ").trim();
-  let modeOverride: ChatExecutionMode | null = null;
   let prompt = remaining;
-
-  if (command === "/standard" || command === "/fast") {
-    modeOverride = "standard";
-  } else if (command === "/deep") {
-    modeOverride = "deep";
-  } else if (command === "/auto") {
-    modeOverride = "auto";
-  } else if (command === "/cite") {
+  if (command === "/cite") {
     prompt = remaining ? `${remaining}\n\nPlease include clear source citations.` : "";
   } else if (command === "/summarize") {
     prompt = remaining ? `Summarize clearly and concisely:\n\n${remaining}` : "";
@@ -119,10 +91,9 @@ function parsePromptCommands(rawInput: string, defaultMode: ChatExecutionMode): 
     prompt = remaining
       ? `${remaining}\n\nPrioritize web retrieval and provide source links for all key claims.`
       : "";
-    modeOverride = defaultMode === "fast" || defaultMode === "standard" ? "standard" : "deep";
   }
 
-  return { prompt: prompt.trim(), mode: modeOverride };
+  return { prompt: prompt.trim() };
 }
 
 function mergeStreamText(current: string, incoming: string): string {
@@ -533,7 +504,6 @@ function isLowSignalReasoningStep(step: string): boolean {
 export default function App() {
   const [auth, setAuth] = useState<AuthSession | null>(() => getStoredAuth());
   const [darkMode, setDarkMode] = useState<boolean>(() => getStoredTheme());
-  const [chatMode, setChatMode] = useState<ChatExecutionMode>(() => getStoredChatMode());
   const [statusText, setStatusText] = useState("Ready");
   const [statusError, setStatusError] = useState(false);
   const [canCancelQueued, setCanCancelQueued] = useState(false);
@@ -595,10 +565,6 @@ export default function App() {
     document.documentElement.classList.toggle("dark", darkMode);
     localStorage.setItem(THEME_STORAGE_KEY, darkMode ? "dark" : "light");
   }, [darkMode]);
-
-  useEffect(() => {
-    localStorage.setItem(CHAT_MODE_STORAGE_KEY, chatMode);
-  }, [chatMode]);
 
   useEffect(() => {
     localStorage.setItem(CONVERSATION_META_STORAGE_KEY, JSON.stringify(conversationMetaById));
@@ -827,7 +793,7 @@ export default function App() {
   const sendPrompt = async (
     prompt: string,
     includeUserMessage = true,
-    options?: { modeOverride?: ChatExecutionMode; statusLabel?: string }
+    options?: { statusLabel?: string }
   ) => {
     if (!auth || isSending) {
       return;
@@ -838,7 +804,7 @@ export default function App() {
       return;
     }
 
-    const requestedMode = options?.modeOverride ?? chatMode;
+    const requestedMode = "deep";
 
     setIsSending(true);
     setStatusError(false);
@@ -873,7 +839,6 @@ export default function App() {
       content: "Thinking...",
       createdAt: new Date().toISOString(),
       sourcePrompt: cleanPrompt,
-      executionMode: requestedMode,
       reaction: null,
     };
 
@@ -1283,13 +1248,9 @@ export default function App() {
     await sendPrompt(sourcePrompt, false);
   };
 
-  const handleRegenerateInDeep = async (sourcePrompt: string) => {
-    await sendPrompt(sourcePrompt, false, { modeOverride: "deep", statusLabel: "Regenerating in deep mode..." });
-  };
-
   const handleRetryWebOnly = async (sourcePrompt: string) => {
     const webFirstPrompt = `${sourcePrompt}\n\nPrioritize web retrieval and include direct source URLs for key claims.`;
-    await sendPrompt(webFirstPrompt, false, { modeOverride: "deep", statusLabel: "Retrying with web-first strategy..." });
+    await sendPrompt(webFirstPrompt, false, { statusLabel: "Retrying with web-first strategy..." });
   };
 
   const handleReaction = (messageId: string, reaction: ReactionType) => {
@@ -1297,18 +1258,14 @@ export default function App() {
   };
 
   const handleSubmitFromComposer = async (rawInput: string) => {
-    const parsed = parsePromptCommands(rawInput, chatMode);
+    const parsed = parsePromptCommands(rawInput);
     if (!parsed.prompt) {
       setStatusText("Write a prompt after the slash command.");
       setStatusError(true);
       return;
     }
-    if (parsed.mode && parsed.mode !== chatMode) {
-      setChatMode(parsed.mode);
-    }
     await sendPrompt(parsed.prompt, true, {
-      modeOverride: parsed.mode ?? chatMode,
-      statusLabel: parsed.mode ? `Submitting prompt in ${parsed.mode} mode...` : "Submitting prompt...",
+      statusLabel: "Submitting prompt...",
     });
   };
 
@@ -1493,7 +1450,6 @@ export default function App() {
                   key={message.id}
                   message={message}
                   onRegenerate={handleRegenerate}
-                  onRegenerateInDeep={handleRegenerateInDeep}
                   onRetryWebOnly={handleRetryWebOnly}
                   onReaction={handleReaction}
                 />
@@ -1563,11 +1519,9 @@ export default function App() {
           <ChatInput
             value={inputValue}
             disabled={isSending}
-            mode={chatMode}
             suggestionChips={followUpChips}
             autoScrollPaused={autoScrollPaused}
             onChange={setInputValue}
-            onModeChange={setChatMode}
             onSuggestionClick={async (chip) => {
               await handleSubmitFromComposer(chip);
             }}

@@ -428,7 +428,7 @@ export async function streamChatResponse(
       user_id: payload.userId,
       session_id: payload.sessionId,
       prompt: payload.prompt,
-      mode: payload.mode ?? "auto",
+      mode: payload.mode ?? "deep",
     }),
   });
 

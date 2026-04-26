@@ -234,8 +234,48 @@ def _apply_env_overrides(data: dict) -> dict:
     )
     _set(["web_search", "retrieval_loop_max_steps"], "WEB_SEARCH_RETRIEVAL_LOOP_MAX_STEPS", int)
     _set(
+        ["web_search", "retrieval_loop_max_stagnant_steps"],
+        "WEB_SEARCH_RETRIEVAL_LOOP_MAX_STAGNANT_STEPS",
+        int,
+    )
+    _set(
         ["web_search", "retrieval_loop_max_gap_queries"],
         "WEB_SEARCH_RETRIEVAL_LOOP_MAX_GAP_QUERIES",
+        int,
+    )
+    _set(
+        ["web_search", "deterministic_controller_enabled"],
+        "WEB_SEARCH_DETERMINISTIC_CONTROLLER_ENABLED",
+        bool,
+    )
+    _set(
+        ["web_search", "deep_standard_first_enabled"],
+        "WEB_SEARCH_DEEP_STANDARD_FIRST_ENABLED",
+        bool,
+    )
+    _set(
+        ["web_search", "deep_escalate_only_if_unresolved"],
+        "WEB_SEARCH_DEEP_ESCALATE_ONLY_IF_UNRESOLVED",
+        bool,
+    )
+    _set(
+        ["web_search", "standard_search_max_queries"],
+        "WEB_SEARCH_STANDARD_SEARCH_MAX_QUERIES",
+        int,
+    )
+    _set(
+        ["web_search", "deep_search_max_queries"],
+        "WEB_SEARCH_DEEP_SEARCH_MAX_QUERIES",
+        int,
+    )
+    _set(
+        ["web_search", "deep_extract_max_urls"],
+        "WEB_SEARCH_DEEP_EXTRACT_MAX_URLS",
+        int,
+    )
+    _set(
+        ["web_search", "retrieval_no_progress_cutoff"],
+        "WEB_SEARCH_RETRIEVAL_NO_PROGRESS_CUTOFF",
         int,
     )
     _set(

@@ -30,6 +30,12 @@ from app.services.quality_metrics_service import citation_accuracy_score, genera
 from app.services.reranker_service import arerank_retrieval_results
 from app.services.sqs_event_queue_service import enqueue_metrics_record_event
 from app.services.retrieval_service import aretrieve_document_chunks
+from app.services.student_qa_schema_registry import (
+    required_answer_fields_from_schema,
+    resolve_question_schema,
+)
+from app.services.german_source_routes import is_likely_german_university_query
+from app.services.german_university_research_orchestrator import research_german_university
 from app.services.web_retrieval_service import aretrieve_web_chunks
 
 settings = get_settings()
@@ -38,9 +44,9 @@ logger = logging.getLogger(__name__)
 
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 _RETRIEVAL_QUERY_MAX_CHARS = 900
-_RETRIEVAL_CONTEXT_MAX_CHARS = 1500
-_RETRIEVAL_CHUNK_MAX_CHARS = 360
-_RETRIEVAL_MAX_PROMPT_RESULTS = 3
+_RETRIEVAL_CONTEXT_MAX_CHARS = 4200
+_RETRIEVAL_CHUNK_MAX_CHARS = 520
+_RETRIEVAL_MAX_PROMPT_RESULTS = 6
 _RETRIEVAL_EVIDENCE_MAX_ITEMS = 3
 _RETRIEVAL_EVIDENCE_CONTENT_MAX_CHARS = 700
 _CITATION_URL_RE = re.compile(r"https?://[^\s<>\")\]]+")
@@ -52,8 +58,12 @@ _LLM_MOCK_DELAY_MS_ENV = "LLM_MOCK_DELAY_MS"
 _LLM_MOCK_STREAM_CHUNK_CHARS_ENV = "LLM_MOCK_STREAM_CHUNK_CHARS"
 _RETRIEVAL_DISABLED_ENV = "RETRIEVAL_DISABLED"
 _NO_RELEVANT_INFORMATION_DETAIL = "Sorry, no relevant information is found."
+_NOT_VERIFIED_OFFICIAL_DETAIL = "Not verified from official sources."
 _WEB_RETRIEVAL_TIMEOUT_DETAIL = (
     "Web retrieval timed out while verifying official sources. Please retry."
+)
+_WEB_PROVIDER_ERROR_DETAIL = (
+    "Web retrieval provider is unavailable (quota/access limit). Please retry later."
 )
 _DEFAULT_EXECUTION_MODE = "deep"
 _FAST_MODE = "fast"
@@ -165,6 +175,11 @@ _SPECULATIVE_FACTUAL_FIELD_RE = re.compile(
     r"requirements?|eligibility|duration|semesters?|fees?|tuition)\b",
     flags=re.IGNORECASE,
 )
+_WEAK_CRITICAL_EVIDENCE_RE = re.compile(
+    r"\b(related (?:document|page|program)|broader (?:document|listing|program)|"
+    r"direct applicability|should be confirmed|indicative|caveat|may not apply)\b",
+    flags=re.IGNORECASE,
+)
 _LOW_SIGNAL_SCAFFOLD_LINE_RE = re.compile(
     r"^(evidence and caveats|claim-by-claim citations|uncertainty|missing info|caveats|evidence)\s*:?\s*$",
     flags=re.IGNORECASE,
@@ -195,7 +210,7 @@ _COMPARISON_ENTITY_DOMAIN_HINTS: tuple[tuple[str, str], ...] = (
     ("rwth", "rwth-aachen.de"),
     ("rwth aachen", "rwth-aachen.de"),
 )
-_CHAT_CACHE_VERSION = "v3"
+_CHAT_CACHE_VERSION = "v4"
 _CACHE_LOW_QUALITY_NOT_VERIFIED_RE = re.compile(
     r"\bnot verified from (?:evidence|sources)\b",
     flags=re.IGNORECASE,
@@ -206,17 +221,28 @@ _REQUIRED_FIELD_LABELS = {
     "application_portal": "Application portal",
     "required_documents": "Required documents",
     "eligibility_requirements": "Eligibility requirements",
+    "instruction_language": "Instruction language",
+    "gpa_threshold": "GPA/grade threshold",
     "gpa_or_grade_threshold": "GPA/grade threshold",
+    "ects_prerequisites": "ECTS/prerequisite credit breakdown",
     "ects_or_prerequisite_credit_breakdown": "ECTS/prerequisite credit breakdown",
     "tuition_or_fees": "Tuition/fees",
     "language_requirements": "Language requirements",
+    "language_test_thresholds": "Language test score thresholds",
     "language_test_score_thresholds": "Language test score thresholds",
+    "international_deadline": "Application deadline (international)",
     "curriculum_focus": "Curriculum focus",
     "career_outcomes": "Career outcomes",
     "scholarship_options": "Scholarship options",
     "visa_or_work_rights": "Visa/work rights",
     "aps_requirement_stage": "APS requirement stage",
     "admission_decision_signal": "Admission decision signal",
+    "professors_or_supervisors": "Professors/supervisors",
+    "labs_or_research_groups": "Labs/research groups",
+    "department_or_faculty": "Department/faculty",
+    "contact_information": "Contact information",
+    "funding_or_scholarship": "Funding/scholarship",
+    "publication_or_profile_links": "Publications/profile links",
 }
 _ADMISSIONS_CRITICAL_WEB_REQUIRED_FIELDS = {
     "admission_requirements",
@@ -226,6 +252,14 @@ _ADMISSIONS_CRITICAL_WEB_REQUIRED_FIELDS = {
     "language_score_thresholds",
     "application_deadline",
     "application_portal",
+}
+_RESEARCHER_REQUIRED_ANSWER_FIELDS = {
+    "professors_or_supervisors",
+    "labs_or_research_groups",
+    "department_or_faculty",
+    "contact_information",
+    "funding_or_scholarship",
+    "publication_or_profile_links",
 }
 
 
@@ -492,58 +526,95 @@ def _admissions_answer_schema_message(state: dict) -> dict | None:
     required_fields = required_fields if isinstance(required_fields, list) else []
     required_set = {str(item).strip() for item in required_fields if str(item).strip()}
 
-    sections: list[str] = ["Program Snapshot"]
+    sections: list[str] = ["Direct Summary"]
+    if required_set & {
+        "instruction_language",
+    }:
+        sections.append("Language of Instruction")
+    if required_set & {
+        "language_requirements",
+        "language_test_thresholds",
+        "language_test_score_thresholds",
+    }:
+        sections.append("IELTS/German Requirements")
     if required_set & {
         "eligibility_requirements",
+        "gpa_threshold",
         "gpa_or_grade_threshold",
+        "ects_prerequisites",
         "ects_or_prerequisite_credit_breakdown",
     }:
+        sections.append("GPA and ECTS Requirements")
+    if required_set & {
+        "eligibility_requirements",
+    } and "GPA and ECTS Requirements" not in sections:
         sections.append("Eligibility Requirements")
-    if required_set & {"language_requirements", "language_test_score_thresholds"}:
-        sections.append("Language Requirements")
-    if "application_deadline" in required_set or bool(state.get("deadline_query", False)):
-        sections.append("Deadlines")
-    if "tuition_or_fees" in required_set:
-        sections.append("Fees")
-    if "curriculum_focus" in required_set:
-        sections.append("Curriculum")
-    if "career_outcomes" in required_set:
-        sections.append("Career Outcomes")
-    include_admission_decision = "admission_decision_signal" in required_set
-    if include_admission_decision:
-        sections.append("Admission Decision")
-    sections.extend(["Missing Information", "Sources"])
-
-    content = (
-        "Admissions answer schema (deep):\n"
-        "- Use only the sections below, in this order:\n"
-    )
-    lines = [content.rstrip("\n")]
-    for index, section in enumerate(sections, start=1):
-        lines.append(f"  {index}) {section}")
-    lines.append("- Do not include sections not requested by the query.")
-    lines.append("- For requested fields, provide exact numbers/dates when present in evidence.")
+    if (
+        "application_deadline" in required_set
+        or "international_deadline" in required_set
+        or bool(state.get("deadline_query", False))
+    ):
+        sections.append("Application Deadline")
+    if "application_portal" in required_set:
+        sections.append("Application Portal")
+    if "admission_decision_signal" in required_set:
+        sections.append("Admission Competitiveness")
     if required_set & {
-        "eligibility_requirements",
-        "gpa_or_grade_threshold",
-        "ects_or_prerequisite_credit_breakdown",
+        "tuition_or_fees",
+        "curriculum_focus",
+        "career_outcomes",
     }:
-        lines.append("- Under Eligibility Requirements include explicit lines for:")
+        sections.append("Other Requested Details")
+    sections.extend(["Missing or Uncertain Information", "Sources"])
+
+    seen_sections: set[str] = set()
+    sections = [
+        section
+        for section in sections
+        if section and not (section in seen_sections or seen_sections.add(section))
+    ]
+    include_admission_decision = "admission_decision_signal" in required_set
+
+    lines = [
+        "Admissions answer schema (deep):",
+        "- Use only the sections below, in this order:",
+    ]
+    for index, section in enumerate(sections, start=1):
+        lines.append(f"  {index}. {section}")
+    lines.append("- Start with a short direct answer; do not start with retrieval/planner/coverage text.")
+    lines.append("- Do not include the field evidence ledger or phrases like 'Official evidence found for'.")
+    lines.append("- For requested fields, provide exact numbers/dates when present in evidence.")
+    if "Language of Instruction" in sections:
+        lines.append("- Under Language of Instruction, state the teaching language only if verified for the requested program.")
+    if "IELTS/German Requirements" in sections:
+        lines.append("- Under IELTS/German Requirements, separate accepted language/proof requirements from exact test score thresholds.")
+    if "GPA and ECTS Requirements" in sections:
+        lines.append("- Under GPA and ECTS Requirements include explicit lines for:")
         lines.append("  - Degree/background requirement")
         lines.append("  - GPA/grade threshold")
         lines.append("  - ECTS/prerequisite credit breakdown")
-    if required_set & {"language_requirements", "language_test_score_thresholds"}:
-        lines.append("- Under Language Requirements include explicit lines for:")
-        lines.append("  - Accepted tests")
-        lines.append("  - Minimum scores")
+    if (
+        "application_deadline" in required_set
+        or "international_deadline" in required_set
+        or bool(state.get("deadline_query", False))
+    ):
+        lines.append("- Under Application Deadline, give exact dates only; otherwise mark not verified.")
     if include_admission_decision:
-        lines.append("- Under Admission Decision include:")
-        lines.append("  - Verdict: Likely / Risky / Unknown")
-        lines.append("  - Why (1-2 lines grounded in evidence)")
-        lines.append("  - What applicant profile data is still needed")
+        lines.append("- Under Admission Competitiveness include:")
+        lines.append("  - Verdict: likely competitive / risky / unknown, not a guaranteed admission prediction.")
+        lines.append("  - Use official minimum grade, ECTS prerequisites, selection rules, ranking formula, capacity, or historical cutoffs when available.")
+        lines.append("  - If only minimum eligibility is verified, say eligibility can be assessed but competitiveness cannot be confirmed.")
+        lines.append("  - For an applicant GPA such as ~3.2, give a cautious risk classification only when official selection evidence supports it.")
+        lines.append("  - Do not require an official source to literally say 'competitive' or 'safe'.")
+        lines.append("  - Do not call a course safe unless the verified thresholds/selection evidence make that conclusion defensible.")
     else:
-        lines.append("- Do not include an Admission Decision section unless explicitly requested.")
-    lines.append('- If a field is unavailable, write exactly: "Not verified from sources."')
+        lines.append("- Do not include an Admission Competitiveness section unless explicitly requested.")
+    lines.append(
+        f'- If a field is unavailable, write exactly: "{_NOT_VERIFIED_OFFICIAL_DETAIL}"'
+    )
+    lines.append(
+        "- Do not present 'related document', 'broader listing', or 'indicative' evidence as a verified critical admission fact."
+    )
     return {"role": "system", "content": "\n".join(lines)[:_RETRIEVAL_CONTEXT_MAX_CHARS]}
 
 
@@ -568,14 +639,16 @@ def _answer_style_instruction_message(mode: str, state: dict) -> dict:
     content = (
         "Answer style policy (deep):\n"
         "- Start with a 1-2 sentence direct answer.\n"
-        "- Then use clear markdown sections only when relevant (for example: Program Overview, "
-        "Eligibility Requirements, Language Requirements, Deadlines, Fees, Missing Information, Sources).\n"
+        "- Then use clear markdown sections only when relevant (for example: Language of Instruction, "
+        "IELTS/German Requirements, GPA and ECTS Requirements, Application Deadline, Application Portal, "
+        "Admission Competitiveness, Missing or Uncertain Information, Sources).\n"
         "- Use only sections requested by the query/required fields; do not pad with extra sections.\n"
         "- Ensure required fields are explicitly covered: "
         f"{required_text}.\n"
         "- Keep one fact per bullet and avoid duplicated lines.\n"
         "- Prefer structured field lines over long paragraphs for admissions questions.\n"
-        "- Do not include an Admission Decision section unless the user explicitly asks for admission likelihood.\n"
+        "- Do not include an Admission Competitiveness section unless the user explicitly asks for admission likelihood, competitiveness, safety, or chances.\n"
+        "- Never output internal ledger/coverage text such as 'Official evidence found for' or 'Requested fields'.\n"
         "- Add one inline URL citation to each factual bullet.\n"
         "- Do not output scaffolding headings like 'Evidence and caveats' or 'Claim-by-Claim Citations'.\n"
         "- End with one 'Sources' section listing unique URLs only."
@@ -961,6 +1034,12 @@ def _build_json_metrics_record(
             "trust_contradiction_flag": bool(state.get("trust_contradiction_flag", False)),
             "trust_authority_score": state.get("trust_authority_score"),
             "trust_agreement_score": state.get("trust_agreement_score"),
+            "web_required_field_coverage": state.get("web_required_field_coverage"),
+            "web_required_fields_missing": state.get("web_required_fields_missing") or [],
+            "web_source_policy": str(state.get("web_source_policy", "")),
+            "web_unresolved_fields": state.get("web_unresolved_fields") or [],
+            "web_research_objective_coverage": state.get("web_research_objective_coverage"),
+            "web_research_objectives_missing": state.get("web_research_objectives_missing") or [],
             "claim_citation_coverage": state.get("claim_citation_coverage"),
             "claim_snippet_grounding_coverage": state.get("claim_snippet_grounding_coverage"),
             "claim_snippet_conflict_count": int(state.get("claim_snippet_conflict_count", 0) or 0),
@@ -1277,6 +1356,40 @@ def _required_answer_fields(user_prompt: str, *, intent: str) -> list[str]:
             text,
         )
     )
+    has_professor_scope = bool(
+        re.search(
+            r"\b(professor|professors|faculty|faculties|supervisor|supervisors|advisor|advisors|mentor|mentors|lecturer|lecturers)\b",
+            text,
+        )
+    )
+    has_lab_scope = bool(
+        re.search(
+            r"\b(lab|labs|laboratory|laboratories|research group|research groups|institute|institutes|research center|research centres|chair)\b",
+            text,
+        )
+    )
+    has_department_scope = bool(
+        re.search(r"\b(department|faculty|school|institute|chair)\b", text)
+    )
+    has_contact_scope = bool(
+        re.search(
+            r"\b(contact|contacts|email|e-mail|phone|telephone|office|admissions office|who to contact|contact person)\b",
+            text,
+        )
+    )
+    has_publication_scope = bool(
+        re.search(
+            r"\b(publication|publications|papers|journal|google scholar|researchgate|profile link|homepage)\b",
+            text,
+        )
+    )
+    has_research_context = bool(
+        re.search(
+            r"\b(university|universit[a-z]*|uni|program|programme|course|department|faculty|school|"
+            r"master|m\.sc|msc|phd|admission|college)\b",
+            text,
+        )
+    )
     if intent == "comparison":
         required.append("comparison_between_requested_entities")
     if "deadline" in text or "apply by" in text or "last date" in text:
@@ -1301,6 +1414,18 @@ def _required_answer_fields(user_prompt: str, *, intent: str) -> list[str]:
         required.append("career_outcomes")
     if "scholarship" in text:
         required.append("scholarship_options")
+    if has_professor_scope and has_research_context:
+        required.append("professors_or_supervisors")
+    if has_lab_scope and has_research_context:
+        required.append("labs_or_research_groups")
+    if has_research_context and has_department_scope and (has_professor_scope or has_lab_scope):
+        required.append("department_or_faculty")
+    if has_contact_scope and has_research_context:
+        required.append("contact_information")
+    if has_research_context and ("scholarship" in text or "funding" in text or "assistantship" in text):
+        required.append("funding_or_scholarship")
+    if has_publication_scope and has_research_context:
+        required.append("publication_or_profile_links")
     if "visa" in text or "work-right" in text or "work right" in text:
         required.append("visa_or_work_rights")
     if "aps" in text:
@@ -1371,6 +1496,28 @@ def _admissions_critical_web_fields_missing(state: dict) -> list[str]:
     return [item for item in missing if item in _ADMISSIONS_CRITICAL_WEB_REQUIRED_FIELDS]
 
 
+def _is_researcher_objective_query(state: dict) -> bool:
+    required_fields = state.get("required_answer_fields")
+    required_fields = required_fields if isinstance(required_fields, list) else []
+    required_set = {str(item).strip() for item in required_fields if str(item).strip()}
+    return bool(required_set & _RESEARCHER_REQUIRED_ANSWER_FIELDS)
+
+
+def _research_objectives_missing_from_web(state: dict) -> list[str]:
+    raw = state.get("web_research_objectives_missing")
+    if not isinstance(raw, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        value = " ".join(str(item).split()).strip().lower()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized[:8]
+
+
 def _required_fields_system_message(state: dict) -> dict | None:
     required_fields = state.get("required_answer_fields")
     required_fields = required_fields if isinstance(required_fields, list) else []
@@ -1381,8 +1528,10 @@ def _required_fields_system_message(state: dict) -> dict | None:
     lines = [
         "Answer schema requirements:",
         "- Cover every required field below using evidence-backed facts.",
-        '- If a required field cannot be verified, explicitly write: "Not verified from sources."',
+        f'- If a required field cannot be verified, explicitly write: "{_NOT_VERIFIED_OFFICIAL_DETAIL}"',
         "- Prefer exact numbers/dates over generic wording when present in evidence.",
+        "- For applicant-critical facts, do not use weak caveats like 'related document', 'indicative', or 'should be confirmed' as factual answers.",
+        "- If exact official evidence is not tied to the requested program, mark the field as not verified instead of guessing.",
         "- Do not return a generic disclaimer as the primary answer.",
         "Required fields:",
     ]
@@ -1396,7 +1545,11 @@ def _required_fields_system_message(state: dict) -> dict | None:
 
 def _has_not_verified_marker(answer: str) -> bool:
     lowered = str(answer or "").lower()
-    return "not verified from evidence" in lowered or "not verified from sources" in lowered
+    return (
+        "not verified from evidence" in lowered
+        or "not verified from sources" in lowered
+        or "not verified from official sources" in lowered
+    )
 
 
 def _answer_matches_required_field(
@@ -1406,10 +1559,14 @@ def _answer_matches_required_field(
     if not lowered:
         return False
     if field == "application_deadline":
-        return _has_date_like_value(answer) or bool(
+        return _has_not_verified_marker(answer) or _has_date_like_value(answer) or bool(
             re.search(r"\bdeadline|apply by|last date\b", lowered)
         )
+    if field == "international_deadline":
+        return _answer_matches_required_field("application_deadline", answer)
     if field == "application_portal":
+        if _has_not_verified_marker(answer):
+            return True
         return bool(
             re.search(
                 r"\b(application portal|apply online|online application|bewerbungsportal|application system)\b",
@@ -1421,7 +1578,7 @@ def _answer_matches_required_field(
         return bool(re.search(r"\bdocument|documents|required\b", lowered))
     if field == "eligibility_requirements":
         return bool(re.search(r"\brequirement|requirements|eligibility|eligible\b", lowered))
-    if field == "gpa_or_grade_threshold":
+    if field in {"gpa_or_grade_threshold", "gpa_threshold"}:
         return bool(
             re.search(r"\b(gpa|grade point|minimum grade|cgpa|grade average)\b", lowered)
             and (
@@ -1429,7 +1586,7 @@ def _answer_matches_required_field(
                 or _has_not_verified_marker(answer)
             )
         )
-    if field == "ects_or_prerequisite_credit_breakdown":
+    if field in {"ects_or_prerequisite_credit_breakdown", "ects_prerequisites"}:
         return bool(
             re.search(r"\b(ects|credit|credits|cp|prerequisite)\b", lowered)
             and (
@@ -1441,9 +1598,14 @@ def _answer_matches_required_field(
         return bool(
             re.search(r"\btuition|fee|fees|semester contribution|eur|€|no tuition\b", lowered)
         )
+    if field == "instruction_language":
+        return bool(
+            re.search(r"\b(language of instruction|teaching language|taught in|english|german)\b", lowered)
+            or _has_not_verified_marker(answer)
+        )
     if field == "language_requirements":
         return bool(re.search(r"\blanguage|english|german|ielts|toefl|c1|c2|b2\b", lowered))
-    if field == "language_test_score_thresholds":
+    if field in {"language_test_score_thresholds", "language_test_thresholds"}:
         return bool(
             re.search(r"\b(ielts|toefl|cefr|cambridge|duolingo)\b", lowered)
             and (
@@ -1457,6 +1619,42 @@ def _answer_matches_required_field(
         return bool(re.search(r"\bcareer|employment|outcome|job|industry\b", lowered))
     if field == "scholarship_options":
         return bool(re.search(r"\bscholarship|funding|grant|stipend\b", lowered))
+    if field == "professors_or_supervisors":
+        return bool(
+            re.search(r"\bprofessor|faculty|supervisor|advisor|lecturer\b", lowered)
+            or _has_not_verified_marker(answer)
+        )
+    if field == "labs_or_research_groups":
+        return bool(
+            re.search(r"\blab|laboratory|research group|institute|chair|research center\b", lowered)
+            or _has_not_verified_marker(answer)
+        )
+    if field == "department_or_faculty":
+        return bool(
+            re.search(r"\bdepartment|faculty|school|institute|chair\b", lowered)
+            or _has_not_verified_marker(answer)
+        )
+    if field == "contact_information":
+        has_contact_marker = bool(
+            re.search(r"\bcontact|email|e-mail|phone|telephone|office|admissions office\b", lowered)
+        )
+        has_contact_value = bool(
+            re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", answer)
+            or re.search(r"https?://|www\.", lowered)
+            or re.search(r"\+\d|\b\d{6,}\b", lowered)
+        )
+        return bool((has_contact_marker and (has_contact_value or _has_not_verified_marker(answer))))
+    if field == "funding_or_scholarship":
+        return bool(
+            re.search(r"\bscholarship|funding|grant|stipend|assistantship|tuition waiver\b", lowered)
+            or _has_not_verified_marker(answer)
+        )
+    if field == "publication_or_profile_links":
+        has_pub_marker = bool(
+            re.search(r"\bpublication|publications|paper|papers|google scholar|researchgate|profile\b", lowered)
+        )
+        has_link = bool(re.search(r"https?://|www\.", lowered))
+        return bool((has_pub_marker and (has_link or _has_not_verified_marker(answer))))
     if field == "visa_or_work_rights":
         return bool(re.search(r"\bvisa|work|hours|residence permit\b", lowered))
     if field == "aps_requirement_stage":
@@ -1466,9 +1664,10 @@ def _answer_matches_required_field(
     if field == "admission_decision_signal":
         return bool(
             re.search(
-                r"\b(admission decision|decision snapshot|verdict|likely|risky|unclear|cannot determine)\b",
+                r"\b(admission decision|admission competitiveness|competitiveness|decision snapshot|verdict|likely|risky|unknown|unclear|cannot determine)\b",
                 lowered,
             )
+            or _has_not_verified_marker(answer)
         )
     if field == "comparison_between_requested_entities":
         entities = comparison_entities if isinstance(comparison_entities, list) else []
@@ -1526,6 +1725,8 @@ def _decompose_retrieval_queries(*, base_query: str, state: dict) -> list[str]:
     required_fields = required_fields if isinstance(required_fields, list) else []
     required_set = {str(item).strip() for item in required_fields if str(item).strip()}
     variants: list[str] = [query]
+    if "publication_or_profile_links" in required_set:
+        variants.append(f"{query} professor publication list google scholar profile official")
     if intent == "deadline":
         variants.extend(
             [
@@ -1559,7 +1760,9 @@ def _decompose_retrieval_queries(*, base_query: str, state: dict) -> list[str]:
 
     if required_set & {
         "eligibility_requirements",
+        "gpa_threshold",
         "gpa_or_grade_threshold",
+        "ects_prerequisites",
         "ects_or_prerequisite_credit_breakdown",
     }:
         variants.extend(
@@ -1569,17 +1772,33 @@ def _decompose_retrieval_queries(*, base_query: str, state: dict) -> list[str]:
                 f"{query} official examination regulations admission criteria PDF",
             ]
         )
-    if required_set & {"language_requirements", "language_test_score_thresholds"}:
+    if required_set & {
+        "instruction_language",
+        "language_requirements",
+        "language_test_thresholds",
+        "language_test_score_thresholds",
+    }:
         variants.extend(
             [
+                f"{query} official language of instruction taught in",
                 f"{query} official language requirements IELTS TOEFL minimum score",
                 f"{query} accepted English tests CEFR minimum score official",
             ]
         )
-    if "application_deadline" in required_set:
+    if "application_deadline" in required_set or "international_deadline" in required_set:
         variants.append(f"{query} official application deadline exact date")
+    if required_set & _RESEARCHER_REQUIRED_ANSWER_FIELDS:
+        variants.extend(
+            [
+                f"{query} official faculty professors supervisors contacts",
+                f"{query} official labs research groups department",
+                f"{query} scholarship funding assistantship official",
+            ]
+        )
 
     limit = _query_decomposition_limit(state)
+    if required_set & _RESEARCHER_REQUIRED_ANSWER_FIELDS:
+        limit = max(limit, 4)
     normalized: list[str] = []
     max_queries = 4 if intent == "comparison" else 3
     seen: set[str] = set()
@@ -1638,12 +1857,36 @@ def _web_expansion_queries(
             ]
         )
     for field in [str(item).strip() for item in missing_fields if str(item).strip()][:4]:
-        if field in {"admission_requirements", "eligibility_requirements", "gpa_or_grade_threshold"}:
+        if field in {
+            "admission_requirements",
+            "eligibility_requirements",
+            "gpa_threshold",
+            "gpa_or_grade_threshold",
+            "ects_prerequisites",
+            "ects_or_prerequisite_credit_breakdown",
+        }:
             variants.append(f"{query} official admission requirements minimum grade GPA ECTS")
-        elif field in {"language_requirements", "language_test_score_thresholds"}:
+        elif field in {
+            "instruction_language",
+            "language_requirements",
+            "language_test_thresholds",
+            "language_test_score_thresholds",
+        }:
             variants.append(f"{query} official IELTS TOEFL CEFR minimum score")
-        elif field == "application_deadline":
+        elif field in {"application_deadline", "international_deadline"}:
             variants.append(f"{query} official application deadline exact date")
+        elif field == "professors_or_supervisors":
+            variants.append(f"{query} official faculty professors supervisors")
+        elif field == "labs_or_research_groups":
+            variants.append(f"{query} official labs research groups institute")
+        elif field == "department_or_faculty":
+            variants.append(f"{query} official department faculty school")
+        elif field == "contact_information":
+            variants.append(f"{query} official contact email phone admissions office")
+        elif field == "funding_or_scholarship":
+            variants.append(f"{query} official scholarship funding assistantship")
+        elif field == "publication_or_profile_links":
+            variants.append(f"{query} official professor publications profile links")
     if intent == "deadline":
         variants.append(f"{query} official deadline date")
     elif intent == "comparison":
@@ -2150,10 +2393,17 @@ def _derive_evidence_trust_signals(results: list[dict], state: dict) -> None:
         # Penalize confidence when deep retrieval did not close required fields.
         confidence -= (1.0 - web_required_coverage) * 0.25
     admissions_critical_missing = _admissions_critical_web_fields_missing(state)
+    research_objectives_missing = _research_objectives_missing_from_web(state)
     if admissions_critical_missing:
         confidence -= min(0.35, 0.1 * len(admissions_critical_missing))
     if _is_admissions_requirements_query(state) and web_required_coverage is None:
         confidence -= 0.12
+    web_research_coverage = _safe_float(state.get("web_research_objective_coverage"))
+    web_research_coverage = (
+        _clamp01(web_research_coverage, fallback=1.0) if web_research_coverage is not None else None
+    )
+    if _is_researcher_objective_query(state) and web_research_coverage is not None:
+        confidence -= (1.0 - web_research_coverage) * 0.12
     confidence = _clamp01(confidence, fallback=0.5)
 
     state["trust_confidence"] = round(confidence, 4)
@@ -2179,6 +2429,14 @@ def _derive_evidence_trust_signals(results: list[dict], state: dict) -> None:
         uncertainty_reasons.append("Independent source corroboration is limited.")
     if web_required_coverage is not None and web_required_coverage < 0.999:
         uncertainty_reasons.append("Some requested fields are not fully verified from web evidence.")
+    if (
+        _is_researcher_objective_query(state)
+        and web_research_coverage is not None
+        and web_research_coverage < 0.999
+    ):
+        uncertainty_reasons.append(
+            "Some requested research objectives are not fully verified from official sources."
+        )
     if admissions_critical_missing:
         uncertainty_reasons.append(
             "Critical admissions fields are still missing from verified official evidence."
@@ -2197,6 +2455,12 @@ def _derive_evidence_trust_signals(results: list[dict], state: dict) -> None:
                 round(web_required_coverage, 4) if web_required_coverage is not None else None
             ),
             "web_required_fields_missing": (state.get("web_required_fields_missing") or [])[:4],
+            "web_research_objective_coverage": (
+                round(web_research_coverage, 4) if web_research_coverage is not None else None
+            ),
+            "web_research_objectives_missing": (
+                state.get("web_research_objectives_missing") or []
+            )[:4],
             "uncertainty_reasons": state["trust_uncertainty_reasons"],
         },
     )
@@ -2295,7 +2559,11 @@ def _web_retrieval_timeout_seconds(search_mode: str | None = None, *, query: str
     if normalized_mode == _DEEP_MODE:
         explicit = _safe_float(getattr(settings.web_search, "deep_timeout_seconds", 0.0))
         if explicit is not None and explicit > 0:
-            return max(30.0, min(300.0, explicit))
+            tuned = float(explicit)
+            compact_query = " ".join(str(query or "").split()).strip()
+            if compact_query and _is_admissions_high_precision_query(compact_query):
+                tuned = max(tuned, 150.0)
+            return max(30.0, min(300.0, tuned))
         multiplier = 8.0
         floor_seconds = 45.0
         ceiling_seconds = 180.0
@@ -2309,6 +2577,10 @@ def _web_retrieval_timeout_seconds(search_mode: str | None = None, *, query: str
     timeout_seconds = configured * multiplier
     compact_query = " ".join(str(query or "").split()).strip()
     if normalized_mode == _DEEP_MODE and compact_query:
+        if _is_admissions_high_precision_query(compact_query):
+            timeout_seconds *= 1.25
+            floor_seconds = max(floor_seconds, 75.0)
+            ceiling_seconds = max(ceiling_seconds, 240.0)
         if len(compact_query) >= 220:
             timeout_seconds *= 1.35
         if len(compact_query) >= 420:
@@ -2355,14 +2627,39 @@ async def _run_one_web_query_with_timeout(
             "_search_mode": str(search_mode),
         }
     except Exception as exc:
-        logger.warning("Web retrieval query failed; query=%s error=%s", query, exc)
-        return None
+        error_message = " ".join(str(exc).split()).strip()
+        logger.warning("Web retrieval query failed; query=%s error=%s", query, error_message)
+        hard_error = bool(
+            re.search(
+                r"\b(exceeds your plan|usage limit|quota|insufficient credits|invalid api key|unauthorized|forbidden|401|403)\b",
+                error_message,
+                flags=re.IGNORECASE,
+            )
+        )
+        return {
+            "results": [],
+            "_failed": True,
+            "_hard_error": hard_error,
+            "_error_message": error_message[:260],
+            "_query": query,
+            "_search_mode": str(search_mode),
+        }
 
 
 def _web_result_timed_out(result: dict | None) -> bool:
     if not isinstance(result, dict):
         return False
     return bool(result.get("_timed_out", False))
+
+
+def _truncate_query_safely(text: str, *, max_chars: int) -> str:
+    compact = " ".join(str(text or "").split()).strip()
+    if not compact:
+        return ""
+    if len(compact) <= max_chars:
+        return compact
+    clipped = compact[:max_chars]
+    return clipped.rsplit(" ", 1)[0].strip() or clipped
 
 
 def _compact_web_retrieval_query(*, base_query: str, state: dict) -> str:
@@ -2391,13 +2688,18 @@ def _compact_web_retrieval_query(*, base_query: str, state: dict) -> str:
     field_hints: list[str] = []
     for field in required_fields:
         key = str(field).strip()
-        if key == "application_deadline":
+        if key in {"application_deadline", "international_deadline"}:
             field_hints.append("application deadline")
-        elif key in {"language_requirements", "language_test_score_thresholds"}:
+        elif key in {
+            "instruction_language",
+            "language_requirements",
+            "language_test_thresholds",
+            "language_test_score_thresholds",
+        }:
             field_hints.append("IELTS TOEFL language requirement")
-        elif key in {"eligibility_requirements", "gpa_or_grade_threshold"}:
+        elif key in {"eligibility_requirements", "gpa_threshold", "gpa_or_grade_threshold"}:
             field_hints.append("admission requirement GPA")
-        elif key == "ects_or_prerequisite_credit_breakdown":
+        elif key in {"ects_prerequisites", "ects_or_prerequisite_credit_breakdown"}:
             field_hints.append("ECTS prerequisite credits")
         elif key == "application_portal":
             field_hints.append("application portal")
@@ -2406,9 +2708,7 @@ def _compact_web_retrieval_query(*, base_query: str, state: dict) -> str:
         lowered = compact.lower()
         if suffix and suffix.lower() not in lowered:
             compact = f"{compact} {suffix}".strip()
-    if len(compact) <= _WEB_QUERY_MAX_CHARS:
-        return compact
-    return compact[:_WEB_QUERY_MAX_CHARS].rsplit(" ", 1)[0].strip() or compact[:_WEB_QUERY_MAX_CHARS]
+    return _truncate_query_safely(compact, max_chars=_WEB_QUERY_MAX_CHARS)
 
 
 def _timeout_rescue_queries(*, base_query: str, state: dict) -> list[str]:
@@ -2422,14 +2722,88 @@ def _timeout_rescue_queries(*, base_query: str, state: dict) -> list[str]:
         compact = " ".join(str(candidate).split()).strip()
         if not compact:
             continue
-        key = compact.lower()
+        trimmed = _truncate_query_safely(compact, max_chars=_WEB_QUERY_MAX_CHARS)
+        if not trimmed:
+            continue
+        key = trimmed.lower()
         if key in seen:
             continue
         seen.add(key)
-        normalized.append(compact[:_WEB_QUERY_MAX_CHARS])
+        normalized.append(trimmed)
         if len(normalized) >= _WEB_TIMEOUT_RESCUE_MAX_QUERIES:
             break
     return normalized
+
+
+async def _attempt_web_timeout_rescue(
+    *,
+    base_query: str,
+    state: dict,
+    top_k: int,
+    search_mode: str,
+) -> dict | None:
+    rescue_queries = _timeout_rescue_queries(base_query=base_query, state=state)
+    if not rescue_queries:
+        return None
+    normalized_mode = _normalized_request_mode(search_mode)
+    rescue_mode = _FAST_MODE if normalized_mode == _DEEP_MODE else normalized_mode
+    emit_trace_event(
+        "web_timeout_rescue_started",
+        {
+            "base_query": base_query[:220],
+            "rescue_mode": rescue_mode,
+            "query_variants": rescue_queries[:8],
+        },
+    )
+    best_result: dict | None = None
+    best_score: tuple[float, int, int] = (-1.0, -10**6, -1)
+    timed_out_count = 0
+    for rescue_query in rescue_queries:
+        candidate = await _run_one_web_query_with_timeout(
+            rescue_query,
+            top_k=max(2, int(top_k or 2)),
+            search_mode=rescue_mode,
+        )
+        if not isinstance(candidate, dict):
+            continue
+        if _web_result_timed_out(candidate):
+            timed_out_count += 1
+            continue
+        rows = _result_dicts(candidate.get("results", []))
+        verification = candidate.get("verification", {})
+        verification = verification if isinstance(verification, dict) else {}
+        coverage = _safe_float(verification.get("required_field_coverage"))
+        if coverage is None:
+            coverage = 1.0 if rows else 0.0
+        missing_ids = verification.get("required_fields_missing", [])
+        missing_count = (
+            len([item for item in missing_ids if " ".join(str(item).split()).strip()])
+            if isinstance(missing_ids, list)
+            else (0 if rows else 999)
+        )
+        score = (float(coverage), -int(missing_count), len(rows))
+        if score <= best_score:
+            continue
+        best_score = score
+        best_result = dict(candidate)
+
+    rescued = bool(best_result and _result_dicts(best_result.get("results", [])))
+    emit_trace_event(
+        "web_timeout_rescue_completed",
+        {
+            "rescued": rescued,
+            "rescue_mode": rescue_mode,
+            "timed_out_count": timed_out_count,
+            "query_count": len(rescue_queries),
+        },
+    )
+    if not rescued or best_result is None:
+        return None
+    best_result["_timeout_rescued"] = True
+    best_result["_timeout_rescue_mode"] = rescue_mode
+    best_result["_timeout_rescue_queries"] = rescue_queries[:8]
+    best_result["_timeout_rescue_timed_out_count"] = timed_out_count
+    return best_result
 
 
 def _result_dicts(rows) -> list[dict]:
@@ -2577,8 +2951,6 @@ async def _retrieve_web_candidates_if_needed(
 ) -> tuple[list[dict], bool]:
     web_ready, web_ready_reason = _web_retrieval_ready()
     deep_mode = str(search_mode).strip().lower() == _DEEP_MODE
-    min_domain_count = _web_expansion_min_domain_count()
-    expansion_similarity_threshold = _web_expansion_similarity_threshold()
     always_web_retrieval = web_ready and (_should_run_web_retrieval() or deep_mode)
     fallback_for_low_confidence = _should_use_web_fallback(state, top_similarity)
     fallback_for_missing_urls = (
@@ -2588,28 +2960,34 @@ async def _retrieve_web_candidates_if_needed(
         and settings.web_search.fallback_enabled
     )
     vector_domain_count = len(_allowed_citation_hosts(_evidence_urls(vector_results)))
-    low_similarity = (
-        top_similarity is not None and top_similarity < expansion_similarity_threshold
-    )
-    insufficient_domains = vector_domain_count < min_domain_count
-    expansion_needed = web_ready and deep_mode and (low_similarity or insufficient_domains)
     state["web_fallback_attempted"] = False
     state["web_result_count"] = 0
     state["web_expansion_used"] = False
     state["web_retrieval_verified"] = None
     state["web_required_field_coverage"] = None
     state["web_required_fields_missing"] = []
+    state["web_field_evidence"] = []
+    state["web_source_policy"] = ""
+    state["web_unresolved_fields"] = []
+    state["web_research_objective_coverage"] = None
+    state["web_research_objectives_missing"] = []
     state["web_timeout_count"] = 0
     state["web_timed_out_queries"] = []
     state["web_timeout_rescued"] = False
+    state["web_provider_error"] = ""
+    state["coverage_ledger"] = []
+    state["unresolved_slots"] = []
+    state["source_policy_decisions"] = []
+    state["retrieval_budget_usage"] = {}
+    state["question_schema_id"] = (
+        " ".join(str(state.get("question_schema_id", "")).split()).strip() or "student_general"
+    )
+    state["required_slots"] = (
+        state.get("required_slots", []) if isinstance(state.get("required_slots", []), list) else []
+    )
     web_query = _compact_web_retrieval_query(base_query=retrieval_query, state=state) or retrieval_query
 
-    if not (
-        always_web_retrieval
-        or fallback_for_low_confidence
-        or fallback_for_missing_urls
-        or expansion_needed
-    ):
+    if not (always_web_retrieval or fallback_for_low_confidence or fallback_for_missing_urls):
         if not web_ready:
             skip_reason = web_ready_reason
         elif not settings.web_search.fallback_enabled and not always_web_retrieval:
@@ -2644,8 +3022,6 @@ async def _retrieve_web_candidates_if_needed(
         reason = "deep_mode_always_web"
     elif not always_web_retrieval:
         reason = "low_confidence" if fallback_for_low_confidence else "missing_urls"
-        if expansion_needed and not (fallback_for_low_confidence or fallback_for_missing_urls):
-            reason = "query_expansion"
     state["web_fallback_attempted"] = True
     emit_trace_event(
         "web_fallback_started",
@@ -2664,12 +3040,7 @@ async def _retrieve_web_candidates_if_needed(
         state["retrieval_strategy"] = "vector_missing_urls"
 
     try:
-        emit_trace_event(
-            "query_planner_started",
-            {
-                "query": web_query[:220],
-            },
-        )
+        emit_trace_event("query_planner_started", {"query": web_query[:220], "planner": "deterministic"})
         if web_prefetch_task is not None:
             try:
                 web_result = await asyncio.wait_for(
@@ -2699,26 +3070,223 @@ async def _retrieve_web_candidates_if_needed(
                 or {}
             )
         web_result = web_result if isinstance(web_result, dict) else {}
+        web_hard_error = bool(web_result.get("_hard_error", False))
+        if web_hard_error:
+            state["web_provider_error"] = " ".join(
+                str(web_result.get("_error_message", "")).split()
+            ).strip()[:260]
         web_timeout_count = 1 if _web_result_timed_out(web_result) else 0
-        timed_out_queries: list[str] = [web_query] if web_timeout_count else []
+        if web_timeout_count > 0 and not web_hard_error:
+            rescued_result = await _attempt_web_timeout_rescue(
+                base_query=web_query,
+                state=state,
+                top_k=_default_retrieval_top_k(),
+                search_mode=search_mode,
+            )
+            if isinstance(rescued_result, dict):
+                web_result = rescued_result
+                web_timeout_count = 0
+                state["web_timeout_rescued"] = True
+
+        if not web_hard_error:
+            web_result = await _augment_with_german_researcher(web_query, web_result, state)
+
+        def _field_evidence_quality(rows: list[dict]) -> tuple[int, float]:
+            found_count = 0
+            confidence_sum = 0.0
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                status = str(item.get("status", "")).strip().lower()
+                if status != "found":
+                    continue
+                found_count += 1
+                confidence_sum += float(_safe_float(item.get("confidence")) or 0.0)
+            avg_confidence = (confidence_sum / found_count) if found_count else 0.0
+            return found_count, avg_confidence
+
+        def _normalize_field_evidence(payload_rows) -> list[dict]:
+            if not isinstance(payload_rows, list):
+                return []
+            normalized: list[dict] = []
+            for row in payload_rows:
+                if not isinstance(row, dict):
+                    continue
+                field_id = " ".join(str(row.get("id", row.get("field", ""))).split()).strip()
+                label = " ".join(str(row.get("label", field_id)).split()).strip() or field_id
+                status = " ".join(str(row.get("status", "")).split()).strip().lower() or "missing"
+                value = " ".join(str(row.get("value", "")).split()).strip()
+                source_url = " ".join(str(row.get("source_url", "")).split()).strip()
+                source_type = " ".join(str(row.get("source_type", "")).split()).strip().lower() or "discovery"
+                evidence_text = " ".join(
+                    str(row.get("evidence_snippet", row.get("evidence_text", ""))).split()
+                ).strip()
+                confidence = float(_safe_float(row.get("confidence")) or 0.0)
+                retrieved_at = " ".join(str(row.get("retrieved_at", "")).split()).strip()
+                if not field_id:
+                    continue
+                normalized.append(
+                    {
+                        "field": field_id,
+                        "id": field_id,
+                        "label": label,
+                        "status": (
+                            status
+                            if status in {"found", "missing", "conflict", "stale"}
+                            else "missing"
+                        ),
+                        "value": value,
+                        "source_url": source_url,
+                        "source_type": source_type if source_type in {"official", "discovery"} else "discovery",
+                        "evidence_snippet": evidence_text,
+                        "evidence_text": evidence_text,
+                        "confidence": round(max(0.0, min(1.0, confidence)), 4),
+                        "retrieved_at": retrieved_at,
+                    }
+                )
+                if len(normalized) >= 16:
+                    break
+            return normalized
+
+        def _absorb_web_field_evidence(payload: dict) -> None:
+            rows = _normalize_field_evidence(payload.get("coverage_ledger", []))
+            if not rows:
+                rows = _normalize_field_evidence(payload.get("evidence_ledger", []))
+            if not rows:
+                rows = _normalize_field_evidence(payload.get("field_evidence", []))
+            if not rows:
+                verification_payload = payload.get("verification", {})
+                verification_payload = (
+                    verification_payload if isinstance(verification_payload, dict) else {}
+                )
+                rows = _normalize_field_evidence(verification_payload.get("field_evidence", []))
+            if not rows:
+                return
+            existing_rows = state.get("web_field_evidence", [])
+            existing_rows = existing_rows if isinstance(existing_rows, list) else []
+            existing_quality = _field_evidence_quality(existing_rows)
+            candidate_quality = _field_evidence_quality(rows)
+            if (not existing_rows) or candidate_quality > existing_quality:
+                state["web_field_evidence"] = rows
+
+        def _absorb_web_verification(payload: dict) -> None:
+            local_verification = payload.get("verification", {})
+            local_verification = local_verification if isinstance(local_verification, dict) else {}
+
+            required_coverage = _safe_float(local_verification.get("required_field_coverage"))
+            if required_coverage is not None:
+                normalized_required = round(_clamp01(required_coverage, fallback=1.0), 4)
+                existing_required = _safe_float(state.get("web_required_field_coverage"))
+                if existing_required is None or normalized_required > existing_required:
+                    state["web_required_field_coverage"] = normalized_required
+
+            missing_required = local_verification.get("required_fields_missing", [])
+            if isinstance(missing_required, list):
+                normalized_missing_required = [
+                    " ".join(str(item).split()).strip()
+                    for item in missing_required
+                    if " ".join(str(item).split()).strip()
+                ][:6]
+                existing_missing_required = state.get("web_required_fields_missing", [])
+                existing_missing_required = (
+                    existing_missing_required if isinstance(existing_missing_required, list) else []
+                )
+                if not existing_missing_required or (
+                    normalized_missing_required
+                    and len(normalized_missing_required) < len(existing_missing_required)
+                ):
+                    state["web_required_fields_missing"] = normalized_missing_required
+
+            research_coverage = _safe_float(local_verification.get("research_objective_coverage"))
+            if research_coverage is not None:
+                normalized_research = round(_clamp01(research_coverage, fallback=1.0), 4)
+                existing_research = _safe_float(state.get("web_research_objective_coverage"))
+                if existing_research is None or normalized_research > existing_research:
+                    state["web_research_objective_coverage"] = normalized_research
+
+            missing_research = local_verification.get("research_objectives_missing", [])
+            if isinstance(missing_research, list):
+                normalized_missing_research = [
+                    " ".join(str(item).split()).strip()
+                    for item in missing_research
+                    if " ".join(str(item).split()).strip()
+                ][:6]
+                existing_missing_research = state.get("web_research_objectives_missing", [])
+                existing_missing_research = (
+                    existing_missing_research if isinstance(existing_missing_research, list) else []
+                )
+                if not existing_missing_research or (
+                    normalized_missing_research
+                    and len(normalized_missing_research) < len(existing_missing_research)
+                ):
+                    state["web_research_objectives_missing"] = normalized_missing_research
+
+            verified = local_verification.get("verified")
+            if isinstance(verified, bool):
+                if state.get("web_retrieval_verified") is None:
+                    state["web_retrieval_verified"] = verified
+                else:
+                    state["web_retrieval_verified"] = bool(state["web_retrieval_verified"]) or verified
+
+            source_policy = " ".join(str(local_verification.get("source_policy", "")).split()).strip()
+            if source_policy:
+                state["web_source_policy"] = source_policy
+
+            unresolved_fields = local_verification.get("unresolved_fields", [])
+            if isinstance(unresolved_fields, list):
+                state["web_unresolved_fields"] = [
+                    " ".join(str(item).split()).strip()
+                    for item in unresolved_fields
+                    if " ".join(str(item).split()).strip()
+                ][:10]
+
+        _absorb_web_verification(web_result)
+        _absorb_web_field_evidence(web_result)
+        coverage_ledger = web_result.get("coverage_ledger", [])
+        if isinstance(coverage_ledger, list):
+            normalized_coverage = _normalize_field_evidence(coverage_ledger)
+            if normalized_coverage:
+                state["coverage_ledger"] = normalized_coverage
+                state["web_field_evidence"] = normalized_coverage
+        unresolved_slots = web_result.get("unresolved_slots", [])
+        if isinstance(unresolved_slots, list):
+            state["unresolved_slots"] = [
+                " ".join(str(item).split()).strip()
+                for item in unresolved_slots
+                if " ".join(str(item).split()).strip()
+            ][:12]
+        source_policy_decisions = web_result.get("source_policy_decisions", [])
+        if isinstance(source_policy_decisions, list):
+            state["source_policy_decisions"] = [
+                dict(item) for item in source_policy_decisions if isinstance(item, dict)
+            ][:20]
+        retrieval_budget_usage = web_result.get("retrieval_budget_usage", {})
+        if isinstance(retrieval_budget_usage, dict):
+            state["retrieval_budget_usage"] = dict(retrieval_budget_usage)
+        question_schema_id = " ".join(str(web_result.get("question_schema_id", "")).split()).strip()
+        if question_schema_id:
+            state["question_schema_id"] = question_schema_id
+        required_slots_payload = web_result.get("required_slots", [])
+        if isinstance(required_slots_payload, list):
+            state["required_slots"] = [
+                dict(item) for item in required_slots_payload if isinstance(item, dict)
+            ][:20]
+        coverage_summary = web_result.get("coverage_summary", {})
+        coverage_summary = coverage_summary if isinstance(coverage_summary, dict) else {}
+        summary_policy = " ".join(str(coverage_summary.get("source_policy", "")).split()).strip()
+        if summary_policy and not state.get("web_source_policy"):
+            state["web_source_policy"] = summary_policy
+        summary_unresolved = coverage_summary.get("unresolved_fields", [])
+        if isinstance(summary_unresolved, list) and summary_unresolved and not state.get(
+            "web_unresolved_fields"
+        ):
+            state["web_unresolved_fields"] = [
+                " ".join(str(item).split()).strip()
+                for item in summary_unresolved
+                if " ".join(str(item).split()).strip()
+            ][:10]
         verification = web_result.get("verification", {})
         verification = verification if isinstance(verification, dict) else {}
-        web_required_coverage = _safe_float(verification.get("required_field_coverage"))
-        if web_required_coverage is not None:
-            state["web_required_field_coverage"] = round(
-                _clamp01(web_required_coverage, fallback=1.0),
-                4,
-            )
-        missing_required = verification.get("required_fields_missing", [])
-        if isinstance(missing_required, list):
-            state["web_required_fields_missing"] = [
-                " ".join(str(item).split()).strip()
-                for item in missing_required
-                if " ".join(str(item).split()).strip()
-            ][:6]
-        verified = verification.get("verified")
-        if isinstance(verified, bool):
-            state["web_retrieval_verified"] = verified
         query_plan = web_result.get("query_plan", {})
         emit_trace_event(
             "query_planner_completed",
@@ -2727,178 +3295,14 @@ async def _retrieve_web_candidates_if_needed(
                 "llm_used": bool(query_plan.get("llm_used", False)),
                 "subquestions": query_plan.get("subquestions", []),
                 "required_fields": query_plan.get("required_fields", []),
+                "research_objectives": query_plan.get("research_objectives", []),
                 "queries": web_result.get("query_variants", []),
             },
         )
         web_results = _result_dicts(web_result.get("results", []))
-        max_web_results = _max_context_results_for_mode(search_mode)
-        expansion_queries = _web_expansion_queries(
-            base_query=web_query,
-            state=state,
-            low_similarity=low_similarity,
-            insufficient_domains=insufficient_domains,
-            current_results=web_results,
-        )
-        existing_queries = {
-            str(item).strip().lower() for item in expansion_queries if str(item).strip()
-        }
-        current_domains = _allowed_citation_hosts(_evidence_urls(web_results))
-        recovery_needed = deep_mode and (
-            not web_results or len(current_domains) < min_domain_count
-        )
-        if recovery_needed:
-            recovery_queries = _web_expansion_queries(
-                base_query=web_query,
-                state=state,
-                low_similarity=True,
-                insufficient_domains=True,
-                current_results=web_results,
-            )
-            recovery_added = 0
-            for query in recovery_queries:
-                compact = " ".join(str(query).split()).strip()
-                key = compact.lower()
-                if not compact or key in existing_queries:
-                    continue
-                existing_queries.add(key)
-                expansion_queries.append(compact)
-                recovery_added += 1
-                if recovery_added >= _WEB_RECOVERY_MAX_QUERIES:
-                    break
-        extra_results: list[dict] = []
-        if expansion_queries:
-            emit_trace_event(
-                "web_query_expansion_started",
-                {
-                    "reasons": [
-                        reason
-                        for reason, enabled in (
-                            ("low_similarity", low_similarity),
-                            ("insufficient_domains", insufficient_domains),
-                        )
-                        if enabled
-                    ],
-                    "query_variants": expansion_queries,
-                    "recovery_mode": recovery_needed,
-                },
-            )
-            expansion_tasks = [
-                asyncio.create_task(
-                    _run_one_web_query_with_timeout(
-                        expansion_query,
-                        top_k=_default_retrieval_top_k(),
-                        # Keep high-precision admissions expansion in deep mode for better exact-field recall.
-                        search_mode=(
-                            search_mode
-                            if (deep_mode and _is_admissions_requirements_query(state))
-                            else (_FAST_MODE if deep_mode else search_mode)
-                        ),
-                    )
-                )
-                for expansion_query in expansion_queries
-            ]
-            gathered_expansions = await asyncio.gather(*expansion_tasks, return_exceptions=True)
-            for expansion_result in gathered_expansions:
-                if isinstance(expansion_result, Exception) or not isinstance(
-                    expansion_result, dict
-                ):
-                    continue
-                if _web_result_timed_out(expansion_result):
-                    web_timeout_count += 1
-                    timeout_query = " ".join(str(expansion_result.get("_query", "")).split()).strip()
-                    if timeout_query:
-                        timed_out_queries.append(timeout_query)
-                    continue
-                rows = _result_dicts(expansion_result.get("results", []))
-                extra_results = _merge_retrieval_results(
-                    extra_results,
-                    rows,
-                    limit=max_web_results,
-                )
-            if extra_results:
-                state["web_expansion_used"] = True
-                web_results = _merge_retrieval_results(
-                    web_results,
-                    extra_results,
-                    limit=max_web_results,
-                )
-            emit_trace_event(
-                "web_query_expansion_completed",
-                {
-                    "query_count": len(expansion_queries),
-                    "extra_result_count": len(extra_results),
-                    "total_result_count": len(web_results),
-                },
-            )
-
-        if deep_mode and not web_results and web_timeout_count > 0:
-            rescue_queries = _timeout_rescue_queries(base_query=web_query, state=state)
-            if rescue_queries:
-                emit_trace_event(
-                    "web_timeout_rescue_started",
-                    {
-                        "query_variants": rescue_queries,
-                        "timeout_count": web_timeout_count,
-                    },
-                )
-                rescue_results: list[dict] = []
-                rescue_tasks = [
-                    asyncio.create_task(
-                        _run_one_web_query_with_timeout(
-                            rescue_query,
-                            top_k=_default_retrieval_top_k(),
-                            search_mode=_FAST_MODE,
-                        )
-                    )
-                    for rescue_query in rescue_queries
-                ]
-                gathered_rescue = await asyncio.gather(*rescue_tasks, return_exceptions=True)
-                for rescue_result in gathered_rescue:
-                    if isinstance(rescue_result, Exception) or not isinstance(rescue_result, dict):
-                        continue
-                    if _web_result_timed_out(rescue_result):
-                        web_timeout_count += 1
-                        timeout_query = " ".join(str(rescue_result.get("_query", "")).split()).strip()
-                        if timeout_query:
-                            timed_out_queries.append(timeout_query)
-                        continue
-                    rows = _result_dicts(rescue_result.get("results", []))
-                    rescue_results = _merge_retrieval_results(
-                        rescue_results,
-                        rows,
-                        limit=max_web_results,
-                    )
-                if rescue_results:
-                    state["web_timeout_rescued"] = True
-                    state["web_expansion_used"] = True
-                    web_results = _merge_retrieval_results(
-                        web_results,
-                        rescue_results,
-                        limit=max_web_results,
-                    )
-                emit_trace_event(
-                    "web_timeout_rescue_completed",
-                    {
-                        "query_count": len(rescue_queries),
-                        "rescued_result_count": len(web_results),
-                        "timeout_count": web_timeout_count,
-                    },
-                )
-
         if web_timeout_count > 0:
-            deduped_timeout_queries: list[str] = []
-            seen_timeout_queries: set[str] = set()
-            for timeout_query in timed_out_queries:
-                compact = " ".join(str(timeout_query).split()).strip()
-                if not compact:
-                    continue
-                key = compact.lower()
-                if key in seen_timeout_queries:
-                    continue
-                seen_timeout_queries.add(key)
-                deduped_timeout_queries.append(compact)
             state["web_timeout_count"] = int(state.get("web_timeout_count", 0) or 0) + web_timeout_count
-            state["web_timed_out_queries"] = deduped_timeout_queries[:6]
+            state["web_timed_out_queries"] = [web_query[:220]]
 
         state["web_result_count"] = len(web_results)
         web_urls = _traceable_urls(_evidence_urls(web_results))
@@ -2912,9 +3316,21 @@ async def _retrieve_web_candidates_if_needed(
                 "retrieval_loop": web_result.get("retrieval_loop", {}),
                 "query_plan": web_result.get("query_plan", {}),
                 "verification": verification,
+                "field_evidence": (state.get("web_field_evidence") or [])[:10],
+                "coverage_ledger": (state.get("coverage_ledger") or [])[:10],
+                "question_schema_id": state.get("question_schema_id", ""),
+                "required_slots": [
+                    str(item.get("slot_id", "")).strip()
+                    for item in (state.get("required_slots", []) or [])
+                    if isinstance(item, dict) and str(item.get("slot_id", "")).strip()
+                ][:12],
+                "unresolved_slots": (state.get("unresolved_slots") or [])[:8],
+                "source_policy_decisions": (state.get("source_policy_decisions") or [])[:8],
+                "retrieval_budget_usage": state.get("retrieval_budget_usage") or {},
                 "timeout_count": web_timeout_count,
                 "timed_out_queries": (state.get("web_timed_out_queries") or [])[:4],
                 "timeout_rescued": bool(state.get("web_timeout_rescued", False)),
+                "metrics": web_result.get("metrics", {}),
             },
         )
         if web_results:
@@ -2962,6 +3378,167 @@ async def _aretrieve_web_chunks_with_mode(
         if "search_mode" not in str(exc):
             raise
         return await aretrieve_web_chunks(retrieval_query, top_k=top_k)
+
+
+def _field_evidence_quality_score(rows: list[dict]) -> tuple[int, float]:
+    found_count = 0
+    confidence_total = 0.0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("status", "")).strip().lower() != "found":
+            continue
+        found_count += 1
+        confidence_total += float(_safe_float(row.get("confidence")) or 0.0)
+    return found_count, (confidence_total / found_count if found_count else 0.0)
+
+
+_GERMAN_REQUIRED_FIELD_ALIASES = {
+    "gpa_or_grade_threshold": "gpa_threshold",
+    "ects_or_subject_credit_requirements": "ects_prerequisites",
+    "application_deadline": "international_deadline",
+    "language_test_score_thresholds": "language_test_score_thresholds",
+    "german_language_requirement": "german_language_requirement",
+    "application_portal": "application_portal",
+    "selection_criteria": "selection_criteria",
+    "competitiveness_signal": "competitiveness_signal",
+}
+
+
+def _canonical_required_field_id(field_id: str) -> str:
+    compact = " ".join(str(field_id or "").split()).strip()
+    return _GERMAN_REQUIRED_FIELD_ALIASES.get(compact, compact)
+
+
+def _canonical_required_field_list(field_ids) -> list[str]:
+    if not isinstance(field_ids, list):
+        return []
+    output: list[str] = []
+    seen: set[str] = set()
+    for item in field_ids:
+        field_id = _canonical_required_field_id(str(item))
+        if not field_id or field_id in seen:
+            continue
+        seen.add(field_id)
+        output.append(field_id)
+    return output
+
+
+def _merge_german_research_result(web_result: dict, german_result: dict) -> dict:
+    if not isinstance(german_result, dict) or not german_result.get("applicable"):
+        return web_result
+    merged = dict(web_result if isinstance(web_result, dict) else {})
+
+    existing_results = _result_dicts(merged.get("results", []))
+    german_results = _result_dicts(german_result.get("results", []))
+    if german_results:
+        merged["results"] = _merge_retrieval_results(
+            german_results,
+            existing_results,
+            limit=max(len(german_results), len(existing_results), _max_context_results_for_mode("deep")),
+        )
+
+    existing_ledger = merged.get("coverage_ledger", merged.get("field_evidence", []))
+    existing_ledger = existing_ledger if isinstance(existing_ledger, list) else []
+    german_ledger = german_result.get("coverage_ledger", [])
+    german_ledger = german_ledger if isinstance(german_ledger, list) else []
+    if german_ledger and _field_evidence_quality_score(german_ledger) >= _field_evidence_quality_score(
+        existing_ledger
+    ):
+        merged["coverage_ledger"] = german_ledger
+        merged["field_evidence"] = german_ledger
+        merged["evidence_ledger"] = german_ledger
+
+    verification = merged.get("verification", {})
+    verification = verification if isinstance(verification, dict) else {}
+    german_verification = german_result.get("verification", {})
+    german_verification = german_verification if isinstance(german_verification, dict) else {}
+    if german_verification:
+        verification = dict(verification)
+        for key in (
+            "required_field_coverage",
+            "required_fields_missing",
+            "unresolved_fields",
+            "source_policy",
+            "official_domains",
+            "source_urls",
+        ):
+            if key in german_verification:
+                if key in {"required_fields_missing", "unresolved_fields"}:
+                    verification[key] = _canonical_required_field_list(german_verification[key])
+                else:
+                    verification[key] = german_verification[key]
+        verification["german_researcher_applied"] = True
+        merged["verification"] = verification
+
+    coverage_summary = merged.get("coverage_summary", {})
+    coverage_summary = coverage_summary if isinstance(coverage_summary, dict) else {}
+    german_summary = german_result.get("coverage_summary", {})
+    german_summary = german_summary if isinstance(german_summary, dict) else {}
+    if german_summary:
+        coverage_summary = dict(coverage_summary)
+        coverage_summary.update(german_summary)
+        coverage_summary["german_researcher_applied"] = True
+        merged["coverage_summary"] = coverage_summary
+
+    query_variants = []
+    for collection in (merged.get("query_variants", []), german_result.get("query_variants", [])):
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            text = " ".join(str(item).split()).strip()
+            if text and text not in query_variants:
+                query_variants.append(text)
+    if query_variants:
+        merged["query_variants"] = query_variants[:40]
+
+    merged["german_research"] = {
+        "applied": True,
+        "source_routes_attempted": german_result.get("source_routes_attempted", {}),
+        "verification": german_result.get("verification", {}),
+        "timings_ms": german_result.get("timings_ms", {}),
+    }
+    merged["retrieval_strategy"] = (
+        f"{str(merged.get('retrieval_strategy', 'web_search')).strip() or 'web_search'}_german_research"
+    )
+    return merged
+
+
+async def _augment_with_german_researcher(web_query: str, web_result: dict, state: dict) -> dict:
+    if not bool(getattr(settings.web_search, "german_university_mode_enabled", True)):
+        return web_result
+    if not is_likely_german_university_query(web_query):
+        return web_result
+    emit_trace_event(
+        "german_researcher_started",
+        {
+            "query": web_query[:220],
+        },
+    )
+    try:
+        german_result = await research_german_university(web_query)
+    except Exception as exc:
+        emit_trace_event(
+            "german_researcher_error",
+            {
+                "error_type": type(exc).__name__,
+                "error_message": " ".join(str(exc).split())[:260],
+            },
+        )
+        logger.warning("German researcher retrieval failed; using base web result. %s", exc)
+        return web_result
+    state["german_researcher_applied"] = bool(german_result.get("applicable", False))
+    state["german_researcher_verification"] = german_result.get("verification", {})
+    emit_trace_event(
+        "german_researcher_completed",
+        {
+            "applied": bool(german_result.get("applicable", False)),
+            "verification": german_result.get("verification", {}),
+            "source_routes_attempted": german_result.get("source_routes_attempted", {}),
+            "timings_ms": german_result.get("timings_ms", {}),
+        },
+    )
+    return _merge_german_research_result(web_result, german_result)
 
 
 def _merge_vector_and_web_results(
@@ -3200,7 +3777,12 @@ def _apply_grounded_retrieval_context(
     )
 
     context_message = (
-        _format_web_retrieval_context({"results": merged_results})
+        _format_web_retrieval_context(
+            {
+                "results": merged_results,
+                "field_evidence": state.get("web_field_evidence", []),
+            }
+        )
         if used_web_results
         else _format_retrieval_context({"results": merged_results})
     )
@@ -3223,7 +3805,6 @@ async def _augment_messages_with_retrieval(
     vector_prefetch_result: dict | None = None,
 ) -> tuple[list | None, str | None]:
     retrieval_started_at = time.perf_counter()
-    web_prefetch_task: asyncio.Task | None = None
     web_query = _compact_web_retrieval_query(base_query=retrieval_query, state=state) or retrieval_query
     query_variants = _decompose_retrieval_queries(base_query=web_query, state=state)
     emit_trace_event(
@@ -3235,87 +3816,82 @@ async def _augment_messages_with_retrieval(
         },
     )
     try:
-        web_ready, _ = _web_retrieval_ready()
-        deep_mode = str(search_mode).strip().lower() == _DEEP_MODE
-        if _retrieval_fanout_enabled() and web_ready and (_should_run_web_retrieval() or deep_mode):
-            # Fan-out: prefetch web retrieval while vector retrieval is in-flight.
-            web_prefetch_task = asyncio.create_task(
-                _run_one_web_query_with_timeout(
-                    web_query,
-                    top_k=_default_retrieval_top_k(),
-                    search_mode=search_mode,
-                )
-            )
-        vector_results, top_similarity = await _retrieve_vector_candidates(
-            retrieval_query,
-            state,
-            prefetched_result=vector_prefetch_result,
-            query_variants=query_variants,
-        )
-        vector_has_urls = bool(_evidence_urls(vector_results))
+        # Web-only runtime path: retrieval context is sourced from the web pipeline.
+        # Keep the vector-prefetch argument for backward compatibility with older tests/callers.
+        _ = vector_prefetch_result
         web_results, web_fallback_attempted = await _retrieve_web_candidates_if_needed(
             retrieval_query,
-            vector_results=vector_results,
-            vector_has_urls=vector_has_urls,
-            top_similarity=top_similarity,
+            vector_results=[],
+            vector_has_urls=False,
+            top_similarity=None,
             search_mode=search_mode,
             state=state,
-            web_prefetch_task=web_prefetch_task,
+            web_prefetch_task=None,
         )
         if web_fallback_attempted and not web_results:
+            web_provider_error = " ".join(str(state.get("web_provider_error", "")).split()).strip()
+            if web_provider_error:
+                state["context_guard_reason"] = "web_provider_unavailable"
+                state["retrieval_strategy"] = "web_provider_error"
+                return None, _WEB_PROVIDER_ERROR_DETAIL
             web_timeout_count = int(state.get("web_timeout_count", 0) or 0)
             freshness_sensitive = _is_freshness_sensitive_query(
                 str(state.get("safe_user_prompt", ""))
             )
-            if web_timeout_count > 0 and (not vector_results or not vector_has_urls):
+            if web_timeout_count > 0 and not bool(state.get("web_timeout_rescued", False)):
                 state["context_guard_reason"] = "web_retrieval_timeout"
                 state["retrieval_strategy"] = "web_timeout_no_results"
                 return None, _WEB_RETRIEVAL_TIMEOUT_DETAIL
-            if not vector_results:
-                if _is_citation_grounding_required() or freshness_sensitive:
-                    state["context_guard_reason"] = "no_relevant_information"
-                    return None, _NO_RELEVANT_INFORMATION_DETAIL
-                state["retrieval_strategy"] = "web_fallback_empty_no_vector"
-                logger.info("Web fallback returned no results and vector was empty; continuing.")
-            if vector_results and not vector_has_urls:
+            if web_timeout_count > 0:
+                state["retrieval_strategy"] = "web_timeout_rescued_no_results"
+            if _is_citation_grounding_required() or freshness_sensitive:
                 state["context_guard_reason"] = "weak_evidence_no_urls"
                 return None, _NO_RELEVANT_INFORMATION_DETAIL
-            state["retrieval_strategy"] = "vector_fallback_web_empty"
-            logger.info("Web fallback returned no results; using available vector evidence.")
+            state["retrieval_strategy"] = "web_empty_non_citation"
+            logger.info("Web retrieval returned no results; continuing without retrieval context.")
+            return messages, None
 
-        merged_results = _merge_vector_and_web_results(
-            vector_results,
-            web_results,
-            search_mode=search_mode,
-        )
-        merged_results = await _rerank_if_configured(retrieval_query, merged_results, state)
+        if not web_results:
+            if _is_citation_grounding_required():
+                state["context_guard_reason"] = "no_relevant_information"
+                state["retrieval_strategy"] = "web_no_results"
+                return None, _NO_RELEVANT_INFORMATION_DETAIL
+            state["retrieval_strategy"] = "web_skipped_no_results"
+            return messages, None
+
+        state["retrieval_strategy"] = "web_only"
+        merged_results = await _rerank_if_configured(retrieval_query, web_results, state)
         merged_results = _selective_retrieval_results(merged_results, state)
         return _apply_grounded_retrieval_context(
             messages=messages,
             merged_results=merged_results,
-            used_web_results=bool(web_results),
+            used_web_results=True,
             state=state,
         )
     except Exception as exc:
-        state["retrieval_strategy"] = "error"
+        state["retrieval_strategy"] = "web_error"
         logger.warning(
             "Long-term retrieval failed; continuing without retrieved context. %s",
             exc,
         )
+        if _is_citation_grounding_required():
+            state["context_guard_reason"] = "no_relevant_information"
+            return None, _NO_RELEVANT_INFORMATION_DETAIL
         return messages, None
     finally:
-        if web_prefetch_task is not None:
-            if not web_prefetch_task.done():
-                web_prefetch_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await web_prefetch_task
         state["retrieval_ms"] = _elapsed_ms(retrieval_started_at)
 
 
 def _validate_citation_grounding_state(state: dict) -> str | None:
     if not _is_citation_grounding_required():
         return None
+    if str(state.get("web_provider_error", "")).strip() and not state.get("evidence_urls"):
+        state["context_guard_reason"] = "web_provider_unavailable"
+        return _WEB_PROVIDER_ERROR_DETAIL
     if int(state.get("web_timeout_count", 0) or 0) > 0 and not state.get("evidence_urls"):
+        if bool(state.get("web_timeout_rescued", False)):
+            state["context_guard_reason"] = "weak_evidence_no_urls"
+            return _NO_RELEVANT_INFORMATION_DETAIL
         state["context_guard_reason"] = "web_retrieval_timeout"
         return _WEB_RETRIEVAL_TIMEOUT_DETAIL
     if not bool(state.get("citation_required", False)):
@@ -3326,6 +3902,134 @@ def _validate_citation_grounding_state(state: dict) -> str | None:
         state["context_guard_reason"] = "weak_evidence_no_urls"
         return _NO_RELEVANT_INFORMATION_DETAIL
     return None
+
+
+def _validate_german_university_answer(answer_text: str, query: str, evidence: list[dict]) -> dict:
+    """Validate answer quality for German university queries."""
+    if not getattr(settings.web_search, "answer_validation_enabled", True):
+        return {"pass": True, "quality_score": 1.0, "issues": [], "warnings": []}
+
+    validation = {
+        "pass": True,
+        "quality_score": 1.0,
+        "issues": [],
+        "warnings": [],
+        "specific_data_found": {},
+    }
+
+    if not answer_text or not answer_text.strip():
+        validation["pass"] = False
+        validation["quality_score"] = 0.0
+        validation["issues"].append("Empty answer")
+        return validation
+
+    # Check for generic placeholder responses
+    generic_markers = [
+        "typically requires",
+        "generally includes",
+        "usually around",
+        "varies by program",
+        "depends on the university",
+        "please check the official",
+        "contact the university for",
+        "may require",
+        "might need",
+        "approximately",
+    ]
+
+    generic_count = sum(1 for marker in generic_markers if marker in answer_text.lower())
+    if generic_count >= 3:
+        validation["quality_score"] -= 0.3
+        validation["issues"].append(f"Answer contains {generic_count} generic placeholders")
+
+    # Check for "Not verified from official sources" overuse
+    not_verified_count = answer_text.count("Not verified from official sources")
+    if not_verified_count >= 3:
+        validation["quality_score"] -= 0.2
+        validation["issues"].append(f"Too many unverified fields ({not_verified_count}) - evidence may be insufficient")
+
+    # Validate specific data presence for critical queries
+    query_lower = query.lower()
+
+    # Deadline queries must have specific dates
+    if any(keyword in query_lower for keyword in ["deadline", "frist", "last date", "apply by", "closing date"]):
+        date_pattern = re.compile(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b")
+        dates_found = date_pattern.findall(answer_text)
+        if dates_found:
+            validation["specific_data_found"]["deadline"] = dates_found[0]
+        else:
+            validation["quality_score"] -= 0.4
+            validation["issues"].append("Deadline query but no specific date provided")
+
+    # GPA queries must have specific thresholds
+    if any(keyword in query_lower for keyword in ["gpa", "grade", "mindestnote", "minimum grade"]):
+        gpa_pattern = re.compile(r"\b[1-4][.,]\d{1,2}\b")
+        gpa_found = gpa_pattern.search(answer_text)
+        if gpa_found:
+            validation["specific_data_found"]["gpa"] = gpa_found.group(0)
+        else:
+            validation["quality_score"] -= 0.3
+            validation["warnings"].append("GPA query but no specific threshold provided")
+
+    # Language requirement queries must have specific scores
+    if any(keyword in query_lower for keyword in ["ielts", "toefl", "language requirement", "english requirement", "sprachnachweis"]):
+        lang_pattern = re.compile(r"(IELTS|TOEFL|TestDaF|DSH|CEFR)[^.]{0,40}\d", re.IGNORECASE)
+        lang_found = lang_pattern.search(answer_text)
+        if lang_found:
+            validation["specific_data_found"]["language"] = lang_found.group(0)
+        else:
+            validation["quality_score"] -= 0.3
+            validation["warnings"].append("Language requirement query but no specific score provided")
+
+    # ECTS/duration queries
+    if any(keyword in query_lower for keyword in ["ects", "credits", "duration", "semester"]):
+        ects_pattern = re.compile(r"\b\d{1,3}\s*ECTS\b", re.IGNORECASE)
+        ects_found = ects_pattern.search(answer_text)
+        if ects_found:
+            validation["specific_data_found"]["ects"] = ects_found.group(0)
+
+    # Tuition/fee queries
+    if any(keyword in query_lower for keyword in ["tuition", "fee", "cost", "semester contribution"]):
+        fee_pattern = re.compile(r"\b\d{1,5}(?:[.,]\d{1,2})?\s*(?:EUR|€|Euro)\b", re.IGNORECASE)
+        fee_found = fee_pattern.search(answer_text)
+        if fee_found:
+            validation["specific_data_found"]["fee"] = fee_found.group(0)
+
+    # Check source diversity and quality
+    source_urls = _CITATION_URL_RE.findall(answer_text)
+    unique_domains = set()
+    german_official_count = 0
+
+    for url in source_urls:
+        parsed = urlparse(url)
+        domain = (parsed.hostname or "").lower()
+        if domain:
+            unique_domains.add(domain)
+            # Check if German official source
+            if any(pattern in domain for pattern in ["uni-", "tu-", "fh-", "hs-", "daad.de", "hochschule"]):
+                german_official_count += 1
+
+    if len(unique_domains) < 2:
+        validation["warnings"].append("Answer relies on single source - consider additional verification")
+
+    if getattr(settings.web_search, "german_university_mode_enabled", True):
+        if german_official_count == 0 and len(source_urls) > 0:
+            validation["warnings"].append("No German official university sources cited")
+        elif german_official_count > 0:
+            validation["quality_score"] += 0.05  # Bonus for official German sources
+
+    # Check for vague date references instead of specific dates
+    vague_date_markers = ["in july", "in summer", "usually in", "typically in", "around"]
+    for marker in vague_date_markers:
+        if marker in answer_text.lower() and "deadline" in query_lower:
+            validation["warnings"].append(f"Vague date reference: '{marker}' - prefer specific dates")
+
+    # Final pass/fail determination
+    min_quality_score = float(getattr(settings.web_search, "answer_validation_min_quality_score", 0.6))
+    validation["quality_score"] = max(0.0, min(1.0, validation["quality_score"]))
+    validation["pass"] = validation["quality_score"] >= min_quality_score and len(validation["issues"]) == 0
+
+    return validation
 
 
 def _web_context_line(result: dict, index: int) -> str | None:
@@ -3359,22 +4063,78 @@ def _web_context_result_lines(results: list[dict], *, max_items: int) -> list[st
     return lines
 
 
+def _field_evidence_context_lines(field_evidence: list[dict], *, max_items: int) -> list[str]:
+    lines: list[str] = []
+    used = 0
+    for row in field_evidence:
+        if not isinstance(row, dict):
+            continue
+        label = " ".join(
+            str(row.get("label", row.get("field", row.get("id", "")))).split()
+        ).strip()
+        status = " ".join(str(row.get("status", "")).split()).strip().lower()
+        value = " ".join(str(row.get("value", "")).split()).strip()
+        source_url = " ".join(str(row.get("source_url", "")).split()).strip()
+        source_type = " ".join(str(row.get("source_type", "")).split()).strip().lower()
+        evidence_snippet = " ".join(
+            str(row.get("evidence_snippet", row.get("evidence_text", ""))).split()
+        ).strip()
+        confidence = float(_safe_float(row.get("confidence")) or 0.0)
+        if not label:
+            continue
+        if status not in {"found", "conflict", "stale"}:
+            lines.append(f"- {label}: {_NOT_VERIFIED_OFFICIAL_DETAIL}")
+        else:
+            if status == "conflict":
+                value = value or "Conflict across official sources."
+            elif status == "stale":
+                value = value or "Stale evidence. Refresh required."
+            source_part = f" | source={source_url}" if source_url else ""
+            source_type_part = f" | source_type={source_type}" if source_type else ""
+            snippet_part = f" | evidence={evidence_snippet[:140]}" if evidence_snippet else ""
+            value_text = value or "Verified from sources."
+            lines.append(
+                f"- {label}: {value_text}{source_part}{source_type_part}{snippet_part} | confidence={confidence:.2f}"
+            )
+        used += 1
+        if used >= max_items:
+            break
+    return lines
+
+
 def _format_web_retrieval_context(web_result: dict) -> dict | None:
     """Convert web fallback results into one system context message with URLs."""
     results = web_result.get("results", []) if isinstance(web_result, dict) else []
-    if not isinstance(results, list) or not results:
+    header = ["Live web fallback context (Tavily web search)."]
+    field_evidence = (
+        web_result.get(
+            "coverage_ledger",
+            web_result.get("evidence_ledger", web_result.get("field_evidence", [])),
+        )
+        if isinstance(web_result, dict)
+        else []
+    )
+    has_field_ledger = isinstance(field_evidence, list) and bool(field_evidence)
+    if not has_field_ledger and (not isinstance(results, list) or not results):
         return None
-
-    header = [
-        "Live web fallback context (Tavily web search). Use only if relevant and cite URLs.",
-    ]
+    if has_field_ledger:
+        header.append(
+            "Use the field evidence ledger to track verified, missing, and conflicting fields. "
+            "Do not output the ledger verbatim; synthesize a readable answer from the ledger and source excerpts."
+        )
+    if isinstance(field_evidence, list) and field_evidence:
+        header.append("Field evidence table (verification-first):")
+        header.extend(_field_evidence_context_lines(field_evidence, max_items=10))
     result_lines = _web_context_result_lines(
-        results,
+        results if isinstance(results, list) else [],
         max_items=_prompt_retrieval_result_limit(),
     )
-    if not result_lines:
+    if result_lines:
+        header.append("Official source excerpts:")
+        header.extend(result_lines)
+    elif not has_field_ledger:
         return None
-    joined = "\n".join(header + result_lines)
+    joined = "\n".join(header)
     return {"role": "system", "content": joined[:_RETRIEVAL_CONTEXT_MAX_CHARS]}
 
 
@@ -3780,6 +4540,7 @@ def _agentic_result_issues(result: str, state: dict) -> list[str]:
     required_fields = state.get("required_answer_fields")
     required_fields = required_fields if isinstance(required_fields, list) else []
     admissions_critical_missing = _admissions_critical_web_fields_missing(state)
+    research_objectives_missing = _research_objectives_missing_from_web(state)
 
     if (
         citation_policy_enabled
@@ -3858,6 +4619,17 @@ def _agentic_result_issues(result: str, state: dict) -> list[str]:
         )
         if _is_admissions_requirements_query(state):
             max_not_verified = min(max_not_verified, 1)
+            ledger_rows = state.get("coverage_ledger", [])
+            if isinstance(ledger_rows, list) and ledger_rows:
+                max_not_verified = max(
+                    max_not_verified,
+                    sum(
+                        1
+                        for row in ledger_rows
+                        if isinstance(row, dict)
+                        and str(row.get("status", "")).strip().lower() != "found"
+                    ),
+                )
         if not_verified_mentions > max_not_verified:
             issues.append("too_many_unverified_fields")
         if total_fields and coverage <= 0.34:
@@ -3866,6 +4638,14 @@ def _agentic_result_issues(result: str, state: dict) -> list[str]:
         issues.append("web_required_fields_missing")
         for field in admissions_critical_missing[:4]:
             issues.append(f"web_missing:{field}")
+    if (
+        result != _NO_RELEVANT_INFORMATION_DETAIL
+        and _is_researcher_objective_query(state)
+        and research_objectives_missing
+    ):
+        issues.append("web_research_objectives_missing")
+        for objective in research_objectives_missing[:4]:
+            issues.append(f"web_missing:{objective}")
     if (
         result != _NO_RELEVANT_INFORMATION_DETAIL
         and _mode_from_state(state) == _DEEP_MODE
@@ -3881,6 +4661,8 @@ def _agentic_result_issues(result: str, state: dict) -> list[str]:
         state.get("retrieval_single_domain_low_quality", False)
     ):
         issues.append("weak_evidence_single_domain")
+    if result != _NO_RELEVANT_INFORMATION_DETAIL and _has_weak_critical_evidence_claim(result, state):
+        issues.append("weak_critical_evidence_claim")
     if bool(state.get("deadline_query", False)) and result != _NO_RELEVANT_INFORMATION_DETAIL:
         if not _has_date_like_value(result):
             issues.append("missing_deadline_date")
@@ -4143,6 +4925,7 @@ def _issue_requests_required_field_rescue(issue: str) -> bool:
     direct_markers = {
         "missing_required_answer_fields",
         "web_required_fields_missing",
+        "web_research_objectives_missing",
         "too_many_unverified_fields",
         "missing_deadline_date",
     }
@@ -4168,6 +4951,16 @@ def _issue_requests_required_field_rescue(issue: str) -> bool:
                 "credit",
                 "eligibility",
                 "requirement",
+                "professor",
+                "faculty",
+                "supervisor",
+                "lab",
+                "research group",
+                "department",
+                "contact",
+                "scholarship",
+                "funding",
+                "publication",
             )
         )
     return False
@@ -4200,6 +4993,18 @@ def _required_field_focus_terms(field_hint: str) -> list[str]:
         return ["eligibility admission requirements", "entry criteria requirements"]
     if "document" in normalized:
         return ["required documents checklist", "application documents official"]
+    if any(token in normalized for token in ("professor", "faculty", "supervisor", "advisor")):
+        return ["official professors supervisors faculty directory", "department faculty contact profile"]
+    if any(token in normalized for token in ("lab", "research group", "institute", "chair")):
+        return ["official labs research groups institutes", "research chair projects"]
+    if any(token in normalized for token in ("department", "school")):
+        return ["official department faculty school page", "program department contact"]
+    if any(token in normalized for token in ("contact", "email", "phone", "office")):
+        return ["official contact email phone admissions office", "program coordinator contact"]
+    if any(token in normalized for token in ("scholarship", "funding", "assistantship", "grant")):
+        return ["official scholarship funding assistantship", "tuition waiver funding opportunity"]
+    if any(token in normalized for token in ("publication", "google scholar", "researchgate", "profile")):
+        return ["official professor publication profile links", "faculty google scholar profile"]
     return [normalized]
 
 
@@ -4328,6 +5133,9 @@ def _targeted_required_field_rescue_queries(*, base_query: str, state: dict, iss
     web_missing = state.get("web_required_fields_missing", [])
     web_missing = web_missing if isinstance(web_missing, list) else []
     missing_hints.extend(str(item).strip() for item in web_missing if str(item).strip())
+    web_research_missing = state.get("web_research_objectives_missing", [])
+    web_research_missing = web_research_missing if isinstance(web_research_missing, list) else []
+    missing_hints.extend(str(item).strip() for item in web_research_missing if str(item).strip())
     for issue in issues:
         hint = _issue_missing_field_hint(issue)
         if hint:
@@ -4361,22 +5169,44 @@ def _targeted_required_field_rescue_queries(*, base_query: str, state: dict, iss
         for focus in deduped_focus[:3]:
             candidates.append(f"{compact_base} {focus} site:{host}")
 
-    max_gap_queries = max(1, int(getattr(settings.web_search, "retrieval_loop_max_gap_queries", 2)))
-    limit = max(8, min(18, max_gap_queries * 4))
+    configured_limit = _safe_int(getattr(settings.web_search, "deep_required_field_rescue_max_queries", 3))
+    if configured_limit is None:
+        configured_limit = 3
+    limit = max(1, min(6, configured_limit))
     normalized: list[str] = []
     seen: set[str] = set()
     for candidate in candidates:
         compact = " ".join(str(candidate).split()).strip()
         if not compact:
             continue
-        key = compact.lower()
+        trimmed = _truncate_query_safely(compact, max_chars=_WEB_QUERY_MAX_CHARS)
+        if not trimmed:
+            continue
+        key = trimmed.lower()
         if key in seen:
             continue
         seen.add(key)
-        normalized.append(compact[:_WEB_QUERY_MAX_CHARS])
+        normalized.append(trimmed)
         if len(normalized) >= limit:
             break
     return normalized
+
+
+def _required_field_rescue_signature(state: dict) -> str:
+    parts: list[str] = []
+    for key in ("web_required_fields_missing", "required_fields_missing", "web_research_objectives_missing"):
+        raw = state.get(key, [])
+        raw = raw if isinstance(raw, list) else []
+        normalized = sorted(
+            {
+                " ".join(str(item).split()).strip().lower()
+                for item in raw
+                if " ".join(str(item).split()).strip()
+            }
+        )
+        if normalized:
+            parts.append(",".join(normalized))
+    return " | ".join(parts)[:300]
 
 
 def _should_attempt_required_field_web_rescue(issues: list[str], state: dict) -> bool:
@@ -4387,7 +5217,16 @@ def _should_attempt_required_field_web_rescue(issues: list[str], state: dict) ->
         return False
     required_fields = state.get("required_answer_fields")
     required_fields = required_fields if isinstance(required_fields, list) else []
-    if not required_fields and not _admissions_missing_web_fields(state):
+    if (
+        not required_fields
+        and not _admissions_missing_web_fields(state)
+        and not _research_objectives_missing_from_web(state)
+    ):
+        return False
+    signature = _required_field_rescue_signature(state)
+    attempted_signatures = state.get("agent_required_field_rescue_signatures", [])
+    attempted_signatures = attempted_signatures if isinstance(attempted_signatures, list) else []
+    if signature and signature in attempted_signatures:
         return False
     return any(_issue_requests_required_field_rescue(issue) for issue in issues)
 
@@ -4406,6 +5245,13 @@ async def _attempt_required_field_web_rescue(
     )
     if not queries:
         return [], False
+    signature = _required_field_rescue_signature(state)
+    attempted_signatures = state.get("agent_required_field_rescue_signatures", [])
+    attempted_signatures = attempted_signatures if isinstance(attempted_signatures, list) else []
+    if signature and signature in attempted_signatures:
+        return [], False
+    if signature:
+        state["agent_required_field_rescue_signatures"] = (attempted_signatures + [signature])[:6]
     emit_trace_event(
         "agent_required_field_rescue_started",
         {
@@ -4426,6 +5272,8 @@ async def _attempt_required_field_web_rescue(
     rescued_rows: list[dict] = []
     best_coverage: float | None = None
     best_missing: list[str] = []
+    best_research_coverage: float | None = None
+    best_research_missing: list[str] = []
     verified_values: list[bool] = []
 
     tasks = [
@@ -4464,6 +5312,22 @@ async def _attempt_required_field_web_rescue(
             ]
             if not best_missing or len(normalized_missing) < len(best_missing):
                 best_missing = normalized_missing[:6]
+        research_coverage = _safe_float(verification.get("research_objective_coverage"))
+        if research_coverage is not None:
+            research_coverage = _clamp01(research_coverage, fallback=1.0)
+            if best_research_coverage is None or research_coverage > best_research_coverage:
+                best_research_coverage = research_coverage
+        research_missing = verification.get("research_objectives_missing", [])
+        if isinstance(research_missing, list):
+            normalized_research_missing = [
+                " ".join(str(value).split()).strip()
+                for value in research_missing
+                if " ".join(str(value).split()).strip()
+            ]
+            if not best_research_missing or len(normalized_research_missing) < len(
+                best_research_missing
+            ):
+                best_research_missing = normalized_research_missing[:6]
         verified = verification.get("verified")
         if isinstance(verified, bool):
             verified_values.append(verified)
@@ -4495,6 +5359,10 @@ async def _attempt_required_field_web_rescue(
         state["web_required_field_coverage"] = round(best_coverage, 4)
     if best_missing:
         state["web_required_fields_missing"] = best_missing
+    if best_research_coverage is not None:
+        state["web_research_objective_coverage"] = round(best_research_coverage, 4)
+    if best_research_missing:
+        state["web_research_objectives_missing"] = best_research_missing
     if verified_values:
         state["web_retrieval_verified"] = any(verified_values)
     state["web_fallback_attempted"] = True
@@ -4554,6 +5422,7 @@ async def _attempt_required_field_web_rescue(
             "merged_result_count": len(merged_results),
             "source_count": int(state.get("retrieval_source_count", 0) or 0),
             "required_field_coverage": state.get("web_required_field_coverage"),
+            "research_objective_coverage": state.get("web_research_objective_coverage"),
         },
     )
     return context_messages, True
@@ -4703,13 +5572,42 @@ def _has_speculative_factual_language(answer: str, state: dict) -> bool:
         lowered = sentence.lower().strip()
         if not lowered:
             continue
-        if "not verified from sources" in lowered or "not verified from evidence" in lowered:
+        if (
+            "not verified from sources" in lowered
+            or "not verified from official sources" in lowered
+            or "not verified from evidence" in lowered
+        ):
             continue
         if not _SPECULATIVE_FACTUAL_CLAIM_RE.search(lowered):
             continue
         if _SPECULATIVE_FACTUAL_FIELD_RE.search(lowered):
             return True
     return False
+
+
+def _has_weak_critical_evidence_claim(answer: str, state: dict) -> bool:
+    if not _is_admissions_requirements_query(state):
+        return False
+    required_fields = state.get("required_answer_fields")
+    required_fields = required_fields if isinstance(required_fields, list) else []
+    critical_fields = {
+        "eligibility_requirements",
+        "gpa_threshold",
+        "gpa_or_grade_threshold",
+        "ects_prerequisites",
+        "ects_or_prerequisite_credit_breakdown",
+        "language_test_thresholds",
+        "language_test_score_thresholds",
+        "application_deadline",
+    }
+    if not (set(str(item).strip() for item in required_fields) & critical_fields):
+        return False
+    text = " ".join(str(answer or "").split()).strip()
+    if not text:
+        return False
+    if not _WEAK_CRITICAL_EVIDENCE_RE.search(text):
+        return False
+    return bool(_SPECULATIVE_FACTUAL_FIELD_RE.search(text))
 
 
 def _issues_include_query_not_answered(issues: list[str]) -> bool:
@@ -4792,6 +5690,7 @@ def _is_hard_verification_failure(issues: list[str], result: str, state: dict) -
         "web_required_fields_missing",
         "too_many_unverified_fields",
         "speculative_factual_claim",
+        "weak_critical_evidence_claim",
     )
     for issue in issues:
         lowered = str(issue).strip().lower()
@@ -5049,6 +5948,14 @@ async def _generate_agentic_answer(
         final_result = best_result if best_result else final_result
         final_issues = best_issues if best_issues else final_issues
     state["model_ms"] = model_ms_total
+    if _should_prefer_structured_field_evidence_answer(state):
+        emit_trace_event(
+            "answer_ledger_first_skipped",
+            {
+                "reason": "ledger_is_internal_evidence_not_final_answer",
+                "answer_preview": str(final_result)[:220],
+            },
+        )
     if final_issues and str(state.get("query_intent", "")).strip().lower() == "comparison":
         structured_comparison = _build_structured_comparison_from_evidence(state)
         if structured_comparison:
@@ -5068,8 +5975,26 @@ async def _generate_agentic_answer(
     state["agent_last_issues"] = final_issues
     if final_issues and final_result != _NO_RELEVANT_INFORMATION_DETAIL:
         if _is_hard_verification_failure(final_issues, final_result, state):
-            state["output_guard_reason"] = "agent_verification_failed"
-            final_result = _NO_RELEVANT_INFORMATION_DETAIL
+            recovered = _build_structured_field_evidence_answer(state)
+            if recovered:
+                recovered_issues = _agentic_result_issues(recovered, state)
+                if not _is_hard_verification_failure(recovered_issues, recovered, state):
+                    final_result = recovered
+                    final_issues = recovered_issues
+                    state["output_guard_reason"] = "agent_verification_partial"
+                    emit_trace_event(
+                        "answer_partial_with_field_evidence_recovery",
+                        {
+                            "issues": final_issues[:8],
+                            "answer_preview": str(final_result)[:220],
+                        },
+                    )
+                else:
+                    state["output_guard_reason"] = "agent_verification_failed"
+                    final_result = _NO_RELEVANT_INFORMATION_DETAIL
+            else:
+                state["output_guard_reason"] = "agent_verification_failed"
+                final_result = _NO_RELEVANT_INFORMATION_DETAIL
         else:
             state["output_guard_reason"] = "agent_verification_partial"
             emit_trace_event(
@@ -5226,6 +6151,11 @@ def _new_metrics_state() -> dict:
         "web_retrieval_verified": None,
         "web_required_field_coverage": None,
         "web_required_fields_missing": [],
+        "web_field_evidence": [],
+        "web_source_policy": "",
+        "web_unresolved_fields": [],
+        "web_research_objective_coverage": None,
+        "web_research_objectives_missing": [],
         "web_timeout_count": 0,
         "web_timed_out_queries": [],
         "web_timeout_rescued": False,
@@ -5244,7 +6174,13 @@ def _new_metrics_state() -> dict:
         "evidence_urls": [],
         "evidence_domain_count": 0,
         "comparison_entities": [],
+        "question_schema_id": "",
+        "required_slots": [],
         "required_answer_fields": [],
+        "coverage_ledger": [],
+        "unresolved_slots": [],
+        "source_policy_decisions": [],
+        "retrieval_budget_usage": {},
         "required_field_coverage": None,
         "required_fields_missing": [],
         "trust_confidence": None,
@@ -5266,6 +6202,7 @@ def _new_metrics_state() -> dict:
         "agentic_enabled": _agentic_enabled(),
         "agent_rounds": 0,
         "agent_required_field_rescue_rounds": 0,
+        "agent_required_field_rescue_signatures": [],
         "agent_last_issues": [],
         "abstain_reason": "",
         "requested_mode": _DEFAULT_EXECUTION_MODE,
@@ -5337,6 +6274,30 @@ async def _prepare_messages_for_model(
         safe_user_prompt,
         intent=str(state.get("query_intent", "unknown")),
     )
+    schema_payload = resolve_question_schema(
+        safe_user_prompt,
+        intent=str(state.get("query_intent", "unknown")),
+    )
+    schema_fields = required_answer_fields_from_schema(
+        safe_user_prompt,
+        intent=str(state.get("query_intent", "unknown")),
+    )
+    merged_fields: list[str] = []
+    seen_fields: set[str] = set()
+    for field in list(state.get("required_answer_fields", [])) + list(schema_fields):
+        key = " ".join(str(field).split()).strip()
+        if not key or key in seen_fields:
+            continue
+        seen_fields.add(key)
+        merged_fields.append(key)
+    state["required_answer_fields"] = merged_fields[:10]
+    state["question_schema_id"] = str(schema_payload.get("schema_id", "student_general")).strip()
+    required_slots = schema_payload.get("required_slots", [])
+    state["required_slots"] = [
+        dict(item)
+        for item in required_slots
+        if isinstance(item, dict)
+    ][:20]
     emit_trace_event(
         "query_intent_classified",
         {
@@ -5344,23 +6305,14 @@ async def _prepare_messages_for_model(
             "query": str(safe_user_prompt)[:220],
             "comparison_entities": state.get("comparison_entities", []),
             "required_answer_fields": state.get("required_answer_fields", []),
+            "question_schema_id": state.get("question_schema_id", ""),
+            "required_slots": [
+                str(item.get("slot_id", "")).strip()
+                for item in (state.get("required_slots", []) or [])
+                if isinstance(item, dict) and str(item.get("slot_id", "")).strip()
+            ],
         },
     )
-    vector_prefetch_task: asyncio.Task | None = None
-    prefetched_vector_result: dict | None = None
-    if (
-        _retrieval_fanout_enabled()
-        and bool(getattr(settings.postgres, "enabled", False))
-        and not _truthy_env(_RETRIEVAL_DISABLED_ENV)
-        and str(safe_user_prompt).strip()
-    ):
-        # Fan-out: prefetch vector retrieval while short-term context is loading.
-        vector_prefetch_task = asyncio.create_task(
-            aretrieve_document_chunks(
-                str(safe_user_prompt),
-                top_k=_default_retrieval_top_k(),
-            )
-        )
     messages = await build_context(conversation_user_id, safe_user_prompt)
     state["build_context_ms"] = _elapsed_ms(build_context_started_at)
 
@@ -5369,30 +6321,15 @@ async def _prepare_messages_for_model(
         state["retrieval_strategy"] = "disabled"
         state["retrieval_ms"] = 0
     elif retrieval_query:
-        if vector_prefetch_task is not None:
-            if retrieval_query.strip() == str(safe_user_prompt).strip():
-                with suppress(Exception):
-                    prefetched_vector_result = await vector_prefetch_task
-            else:
-                if not vector_prefetch_task.done():
-                    vector_prefetch_task.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await vector_prefetch_task
         messages, detail = await _augment_messages_with_retrieval(
             messages=messages,
             retrieval_query=retrieval_query,
             search_mode=str(policy.get("web_search_mode", _DEEP_MODE)),
             state=state,
-            vector_prefetch_result=prefetched_vector_result,
         )
         if detail:
             return None, detail
     else:
-        if vector_prefetch_task is not None:
-            if not vector_prefetch_task.done():
-                vector_prefetch_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await vector_prefetch_task
         state["retrieval_ms"] = 0
 
     citation_detail = _validate_citation_grounding_state(state)
@@ -5409,7 +6346,7 @@ async def _prepare_messages_for_model(
                     "Date-answer policy: when the user asks for deadlines/dates, "
                     "return exact date values from evidence with URL citations. "
                     "If exact dates are absent, explicitly write: "
-                    '"Application deadline: Not verified from sources."'
+                    '"Application deadline: Not verified from official sources."'
                 ),
             }
         )
@@ -5515,7 +6452,7 @@ def _extract_guarded_result(*, user_id: str, raw_result, state: dict) -> str:
         lowered = grounded_result.lower()
         if _has_not_verified_marker(grounded_result) and "application deadline" in lowered:
             return grounded_result
-        deadline_line = "Application deadline: Not verified from sources."
+        deadline_line = "Application deadline: Not verified from official sources."
         if "application deadline" not in lowered:
             return f"{grounded_result.rstrip()}\n\n{deadline_line}".strip()
     return grounded_result
@@ -5718,6 +6655,17 @@ def _cache_skip_reason(result: str, state: dict) -> str:
             and required_coverage < min_required_coverage
         ):
             return "deep_required_field_coverage_low"
+        research_coverage = _safe_float(state.get("web_research_objective_coverage"))
+        min_research_coverage = float(
+            getattr(settings.web_search, "deep_cache_min_required_field_coverage", 0.85)
+        ) - 0.1
+        if (
+            web_fallback_attempted
+            and _is_researcher_objective_query(state)
+            and research_coverage is not None
+            and research_coverage < max(0.55, min_research_coverage)
+        ):
+            return "deep_research_objective_coverage_low"
 
         min_sources = max(1, int(getattr(settings.web_search, "deep_cache_min_source_count", 2)))
         source_count = int(state.get("retrieval_source_count", 0) or 0)
@@ -5752,6 +6700,13 @@ def _uncertainty_reasons(state: dict) -> list[str]:
     web_required_coverage = _safe_float(state.get("web_required_field_coverage"))
     if web_required_coverage is not None and web_required_coverage < 0.999:
         derived.append("Some requested fields are not fully verified from web evidence.")
+    web_research_coverage = _safe_float(state.get("web_research_objective_coverage"))
+    if (
+        _is_researcher_objective_query(state)
+        and web_research_coverage is not None
+        and web_research_coverage < 0.999
+    ):
+        derived.append("Some requested research objectives are not fully verified from official sources.")
     return derived[:3]
 
 
@@ -5861,6 +6816,105 @@ def _append_missing_info_section(result: str, state: dict) -> str:
     return result
 
 
+def _build_structured_field_evidence_answer(state: dict) -> str:
+    rows = state.get("coverage_ledger", [])
+    if not isinstance(rows, list) or not rows:
+        rows = state.get("web_field_evidence", [])
+    rows = rows if isinstance(rows, list) else []
+    rows = [row for row in rows if isinstance(row, dict)]
+    if not rows:
+        return ""
+
+    evidence_urls = _traceable_urls(state.get("evidence_urls", []), limit=10)
+    fallback_url = evidence_urls[0] if evidence_urls else ""
+    found_rows = [row for row in rows if str(row.get("status", "")).strip().lower() == "found"]
+    total_rows = len(rows)
+    found_count = len(found_rows)
+
+    lines: list[str] = [
+        (
+            f"Official evidence found for {found_count}/{total_rows} requested fields. "
+            f'Unresolved fields are marked as "{_NOT_VERIFIED_OFFICIAL_DETAIL}".'
+        ),
+        "",
+        "Requested fields",
+    ]
+
+    source_pool: list[str] = []
+    for row in rows[:12]:
+        label = " ".join(
+            str(row.get("label", row.get("field", row.get("id", "Field")))).split()
+        ).strip() or "Field"
+        status = str(row.get("status", "")).strip().lower()
+        value = " ".join(str(row.get("value", "")).split()).strip()
+        source_url = _normalized_url(str(row.get("source_url", "")))
+        if not source_url and status == "found":
+            source_url = fallback_url
+        if status == "found":
+            line_value = value or "Verified from official sources."
+        elif status == "conflict":
+            line_value = "Conflict between official sources. Manual verification required."
+        elif status == "stale":
+            line_value = value or "Stale evidence. Refresh required for verification."
+        else:
+            line_value = _NOT_VERIFIED_OFFICIAL_DETAIL
+        if source_url:
+            lines.append(f"- {label}: {line_value} ({source_url})")
+            source_pool.append(source_url)
+        else:
+            lines.append(f"- {label}: {line_value}")
+
+    prompt_text = " ".join(str(state.get("safe_user_prompt", "")).split()).strip().lower()
+    if re.search(r"\b(competitive|safe)\b", prompt_text):
+        competitiveness_line = (
+            f"Admission competitiveness/safety assessment: {_NOT_VERIFIED_OFFICIAL_DETAIL}"
+        )
+        lines.extend(["", competitiveness_line])
+
+    source_urls = _ordered_unique_urls(source_pool + evidence_urls)
+    if source_urls:
+        lines.extend(["", "Sources"])
+        for url in source_urls[:8]:
+            lines.append(f"- {url}")
+    return "\n".join(lines).strip()
+
+
+def _should_prefer_structured_field_evidence_answer(state: dict) -> bool:
+    if not _is_admissions_requirements_query(state):
+        return False
+    rows = state.get("coverage_ledger", [])
+    if not isinstance(rows, list) or not rows:
+        rows = state.get("web_field_evidence", [])
+    rows = rows if isinstance(rows, list) else []
+    if not rows:
+        return False
+    found_count = 0
+    critical_found = False
+    critical_fields = {
+        "application_portal",
+        "application_deadline",
+        "international_deadline",
+        "instruction_language",
+        "language_requirements",
+        "language_test_thresholds",
+        "language_test_score_thresholds",
+        "gpa_threshold",
+        "gpa_or_grade_threshold",
+        "ects_prerequisites",
+        "ects_or_prerequisite_credit_breakdown",
+    }
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("status", "")).strip().lower() != "found":
+            continue
+        found_count += 1
+        field_id = str(row.get("id", row.get("field", row.get("slot_id", "")))).strip()
+        if field_id in critical_fields:
+            critical_found = True
+    return found_count > 0 and critical_found
+
+
 def _build_structured_comparison_from_evidence(state: dict) -> str:
     entities = state.get("comparison_entities")
     entities = entities if isinstance(entities, list) else []
@@ -5910,8 +6964,8 @@ def _build_structured_comparison_from_evidence(state: dict) -> str:
             [
                 f"{entity}:",
                 f"- Program details: {evidence_text} ({url})",
-                f"- Eligibility requirements: Not verified from evidence. ({url})",
-                f"- Application deadline: Not verified from evidence. ({url})",
+                f"- Eligibility requirements: {_NOT_VERIFIED_OFFICIAL_DETAIL} ({url})",
+                f"- Application deadline: {_NOT_VERIFIED_OFFICIAL_DETAIL} ({url})",
             ]
         )
 
@@ -6496,6 +7550,18 @@ async def _finalize_success(context: dict, result: str) -> str:
             "web_retrieval_verified": state.get("web_retrieval_verified"),
             "web_required_field_coverage": state.get("web_required_field_coverage"),
             "web_required_fields_missing": (state.get("web_required_fields_missing") or [])[:4],
+            "web_research_objective_coverage": state.get("web_research_objective_coverage"),
+            "web_research_objectives_missing": (
+                state.get("web_research_objectives_missing") or []
+            )[:4],
+            "question_schema_id": state.get("question_schema_id", ""),
+            "required_slots": [
+                str(item.get("slot_id", "")).strip()
+                for item in (state.get("required_slots", []) or [])
+                if isinstance(item, dict) and str(item.get("slot_id", "")).strip()
+            ][:12],
+            "unresolved_slots": (state.get("unresolved_slots") or [])[:8],
+            "retrieval_budget_usage": state.get("retrieval_budget_usage") or {},
             "abstain_reason": str(state.get("abstain_reason", "")),
             "required_field_coverage": state.get("required_field_coverage"),
             "required_fields_missing": (state.get("required_fields_missing") or [])[:4],
@@ -6661,6 +7727,16 @@ async def generate_response_stream(
         if result != str(runtime["streamed_text"]):
             yield result
 
+    if _should_prefer_structured_field_evidence_answer(state):
+        emit_trace_event(
+            "answer_ledger_first_skipped",
+            {
+                "reason": "ledger_is_internal_evidence_not_final_answer",
+                "answer_preview": str(result)[:220],
+                "stream_mode": True,
+            },
+        )
+
     stream_issues = _agentic_result_issues(result, state)
     state["agent_last_issues"] = stream_issues
     emit_trace_event(
@@ -6678,10 +7754,34 @@ async def generate_response_stream(
     )
     if stream_issues and result != _NO_RELEVANT_INFORMATION_DETAIL:
         if _is_hard_verification_failure(stream_issues, result, state):
-            state["output_guard_reason"] = "stream_verification_failed"
-            result = _NO_RELEVANT_INFORMATION_DETAIL
-            if result != str(runtime["streamed_text"]):
-                yield result
+            recovered = _build_structured_field_evidence_answer(state)
+            if recovered:
+                recovered_issues = _agentic_result_issues(recovered, state)
+                if not _is_hard_verification_failure(recovered_issues, recovered, state):
+                    result = recovered
+                    stream_issues = recovered_issues
+                    state["agent_last_issues"] = stream_issues
+                    state["output_guard_reason"] = "stream_verification_partial"
+                    emit_trace_event(
+                        "answer_partial_with_field_evidence_recovery",
+                        {
+                            "issues": stream_issues[:8],
+                            "answer_preview": str(result)[:220],
+                            "stream_mode": True,
+                        },
+                    )
+                    if result != str(runtime["streamed_text"]):
+                        yield result
+                else:
+                    state["output_guard_reason"] = "stream_verification_failed"
+                    result = _NO_RELEVANT_INFORMATION_DETAIL
+                    if result != str(runtime["streamed_text"]):
+                        yield result
+            else:
+                state["output_guard_reason"] = "stream_verification_failed"
+                result = _NO_RELEVANT_INFORMATION_DETAIL
+                if result != str(runtime["streamed_text"]):
+                    yield result
         else:
             state["output_guard_reason"] = "stream_verification_partial"
             emit_trace_event(
