@@ -48,7 +48,14 @@ SearchBatchFn = Callable[[list[str]], Awaitable[list[dict]]]
 PageFetchFn = Callable[[list[dict]], Awaitable[dict[str, dict]]]
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", flags=re.IGNORECASE | re.DOTALL)
-_BLOCK_RE = re.compile(r"</?(p|br|li|tr|td|th|div|section|article|h[1-6])\b[^>]*>", flags=re.IGNORECASE)
+_PAGE_CHROME_RE = re.compile(
+    r"<(nav|header|footer|aside)\b[^>]*>.*?</\1>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_BLOCK_RE = re.compile(
+    r"</?(p|br|li|tr|td|th|div|section|article|h[1-6])\b[^>]*>",
+    flags=re.IGNORECASE,
+)
 _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
 _ANCHOR_RE = re.compile(
@@ -62,7 +69,7 @@ _PDF_HINT_RE = re.compile(
 _OFFICIAL_ROUTE_LINK_RE = re.compile(
     r"\b(admission|admissions|application|apply|deadline|deadlines|selection|requirements?|"
     r"bewerbung|bewerbungsfrist|bewerbungsportal|zulassung|zulassungssatzung|auswahlsatzung|"
-    r"sprachnachweis|sprachkenntnisse|ielts|toefl|ects|mindestnote|portal|online application|"
+    r"sprachnachweis|sprachkenntnisse|proficiency|foreign language|language requirements?|ielts|toefl|ects|mindestnote|portal|online application|"
     r"pruefungsordnung|prüfungsordnung|modulhandbuch)\b|\.pdf($|\?)",
     flags=re.IGNORECASE,
 )
@@ -78,6 +85,7 @@ def _normalize(value: str) -> str:
 
 def _strip_html(raw_html: str) -> str:
     text = _SCRIPT_STYLE_RE.sub(" ", str(raw_html or ""))
+    text = _PAGE_CHROME_RE.sub(" ", text)
     text = _BLOCK_RE.sub("\n", text)
     text = _TAG_RE.sub(" ", text)
     return _normalize(unescape(text))
@@ -150,7 +158,7 @@ async def _fetch_one_page(url: str, *, timeout_seconds: float, max_chars: int) -
 
 async def default_page_fetcher(rows: list[dict]) -> dict[str, dict]:
     timeout_seconds = float(getattr(settings.web_search, "page_fetch_timeout_seconds", 8.0) or 8.0)
-    max_chars = int(getattr(settings.web_search, "max_page_chars", 8000) or 8000)
+    max_chars = max(24000, int(getattr(settings.web_search, "max_page_chars", 8000) or 8000))
     max_pages = min(20, max(1, int(getattr(settings.web_search, "deep_max_pages_to_fetch", 8) or 8)))
     urls: list[str] = []
     seen: set[str] = set()
@@ -228,6 +236,12 @@ def _accepted_research_source(row: dict, *, task: GermanResearchTask, content: s
         program=task.program,
         degree_level=task.degree_level,
     )
+    if (
+        not content
+        and not bool(scope.get("accepted", False))
+        and str(scope.get("reason", "")) == "program_mismatch_program_specific_source"
+    ):
+        return True
     return bool(scope.get("accepted", False))
 
 
@@ -360,6 +374,155 @@ def _result_rows_from_evidence(evidence_rows: list[dict]) -> list[dict]:
     return results
 
 
+def _safe_int_setting(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(getattr(settings.web_search, name, default) or default)
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _research_query_budget(task: GermanResearchTask) -> int:
+    default_budget = 14
+    if len(task.required_slots) >= 8:
+        default_budget = 16
+    return _safe_int_setting(
+        "german_research_total_query_budget",
+        default_budget,
+        minimum=6,
+        maximum=40,
+    )
+
+
+def _research_stage_caps(task: GermanResearchTask, *, total_budget: int) -> tuple[int, int, int]:
+    discovery_default = max(2, min(4, len(task.required_slots) // 3 + 1))
+    route_default = max(4, min(10, len(task.required_slots) + 2))
+    rescue_default = max(2, min(4, len(task.required_slots) // 2))
+    discovery_cap = min(
+        total_budget,
+        _safe_int_setting("german_research_discovery_max_queries", discovery_default, minimum=1, maximum=10),
+    )
+    route_cap = min(
+        max(0, total_budget - discovery_cap),
+        _safe_int_setting("german_research_route_max_queries", route_default, minimum=2, maximum=20),
+    )
+    rescue_cap = min(
+        max(0, total_budget - discovery_cap - route_cap),
+        _safe_int_setting("german_research_rescue_max_queries", rescue_default, minimum=1, maximum=10),
+    )
+    return discovery_cap, route_cap, rescue_cap
+
+
+def _take_budgeted_queries(
+    candidates: list[str],
+    *,
+    remaining_budget: int,
+    seen: set[str],
+) -> list[str]:
+    if remaining_budget <= 0:
+        return []
+    selected: list[str] = []
+    for item in candidates:
+        compact = _normalize(item)
+        if not compact:
+            continue
+        key = compact.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(compact)
+        if len(selected) >= remaining_budget:
+            break
+    return selected
+
+
+def _build_slot_query_plan(
+    task: GermanResearchTask,
+    *,
+    official_domains: list[str],
+    max_queries_per_slot: int = 6,
+) -> dict[str, list[str]]:
+    slot_priority = {
+        "application_deadline": 100,
+        "application_portal": 95,
+        "gpa_or_grade_threshold": 90,
+        "ects_or_subject_credit_requirements": 88,
+        "language_test_score_thresholds": 86,
+        "language_requirements": 84,
+        "language_of_instruction": 82,
+        "selection_criteria": 80,
+        "german_language_requirement": 70,
+        "program_overview": 50,
+        "tuition_or_semester_fee": 40,
+        "competitiveness_signal": 30,
+    }
+    slot_markers = {
+        "application_deadline": ("deadline", "bewerbungsfrist", "application period"),
+        "application_portal": ("portal", "apply online", "bewerbungsportal"),
+        "gpa_or_grade_threshold": ("mindestnote", "minimum grade", "grade threshold"),
+        "ects_or_subject_credit_requirements": ("ects", "credits", "leistungspunkte"),
+        "language_test_score_thresholds": ("ielts", "toefl", "cefr", "minimum score"),
+        "language_requirements": ("language requirements", "sprachnachweis", "sprachkenntnisse"),
+        "language_of_instruction": ("language of instruction", "teaching language", "unterrichtssprache"),
+        "selection_criteria": ("selection criteria", "auswahlsatzung", "auswahlverfahren"),
+        "german_language_requirement": ("german language", "deutschkenntnisse", "testdaf", "dsh"),
+        "program_overview": ("program page", "official program", "master program"),
+        "tuition_or_semester_fee": ("semester fee", "tuition", "semesterbeitrag"),
+        "competitiveness_signal": ("selection", "ranking", "admission score"),
+    }
+    plan: dict[str, list[str]] = {}
+    ordered_slots = sorted(
+        task.required_slots,
+        key=lambda slot: (-slot_priority.get(str(slot), 0), str(slot)),
+    )
+    for slot_id in ordered_slots:
+        slot_queries = build_slot_route_queries(
+            task,
+            official_domains=official_domains,
+            missing_slots=[slot_id],
+            max_queries=max_queries_per_slot,
+        )
+        markers = slot_markers.get(str(slot_id), ())
+        slot_queries = sorted(
+            slot_queries,
+            key=lambda query: (
+                0
+                if any(marker in query.lower() for marker in markers)
+                else 1,
+                len(query),
+                query,
+            ),
+        )
+        plan[str(slot_id)] = slot_queries
+    return plan
+
+
+def _round_robin_slot_queries(
+    slot_query_plan: dict[str, list[str]],
+    *,
+    limit: int,
+) -> list[str]:
+    if limit <= 0:
+        return []
+    output: list[str] = []
+    seen: set[str] = set()
+    buckets = [[query for query in queries if _normalize(query)] for queries in slot_query_plan.values()]
+    max_len = max((len(bucket) for bucket in buckets), default=0)
+    for index in range(max_len):
+        for bucket in buckets:
+            if index >= len(bucket):
+                continue
+            compact = _normalize(bucket[index])
+            key = compact.lower()
+            if not compact or key in seen:
+                continue
+            seen.add(key)
+            output.append(compact)
+            if len(output) >= limit:
+                return output
+    return output
+
+
 class GermanUniversityResearchOrchestrator:
     def __init__(
         self,
@@ -398,9 +561,22 @@ class GermanUniversityResearchOrchestrator:
         if rows_to_fetch:
             page_data.update(await self._page_fetcher(rows_to_fetch))
 
-        linked_rows = _route_link_rows_from_pages(accepted_rows, page_data, task=task)
-        if linked_rows:
-            rows = self._dedupe_rows(rows + linked_rows, limit=96)
+        for _depth in range(2):
+            linked_rows = _route_link_rows_from_pages(accepted_rows, page_data, task=task)
+            new_linked_rows = [
+                row
+                for row in linked_rows
+                if str(row.get("url", "")).strip()
+                and str(row.get("url", "")).strip().lower()
+                not in {
+                    str(existing.get("url", "")).strip().lower()
+                    for existing in rows
+                    if isinstance(existing, dict)
+                }
+            ]
+            if not new_linked_rows:
+                break
+            rows = self._dedupe_rows(rows + new_linked_rows, limit=128)
             accepted_rows = [row for row in rows if _accepted_research_source(row, task=task)]
             linked_to_fetch = [
                 row
@@ -408,8 +584,9 @@ class GermanUniversityResearchOrchestrator:
                 if str(row.get("url", "")).strip()
                 and str(row.get("url", "")).strip() not in page_data
             ]
-            if linked_to_fetch:
-                page_data.update(await self._page_fetcher(linked_to_fetch))
+            if not linked_to_fetch:
+                break
+            page_data.update(await self._page_fetcher(linked_to_fetch))
 
         sources = _source_payloads_from_rows(accepted_rows, page_data, task=task)
         return rows, page_data, sources
@@ -436,8 +613,22 @@ class GermanUniversityResearchOrchestrator:
             },
         )
 
-        discovery_queries = build_discovery_queries(task, max_queries=6)
-        discovery_payloads = await self._search_batch(discovery_queries)
+        total_query_budget = _research_query_budget(task)
+        discovery_cap, route_cap, rescue_cap = _research_stage_caps(
+            task,
+            total_budget=total_query_budget,
+        )
+        query_seen: set[str] = set()
+        queries_executed = 0
+
+        raw_discovery_queries = build_discovery_queries(task, max_queries=max(6, discovery_cap * 2))
+        discovery_queries = _take_budgeted_queries(
+            raw_discovery_queries,
+            remaining_budget=min(discovery_cap, max(0, total_query_budget - queries_executed)),
+            seen=query_seen,
+        )
+        discovery_payloads = await self._search_batch(discovery_queries) if discovery_queries else []
+        queries_executed += len(discovery_queries)
         discovery_rows = _rows_from_search_payloads(discovery_payloads)
         official_domains = discover_official_domains(
             discovery_rows,
@@ -445,12 +636,22 @@ class GermanUniversityResearchOrchestrator:
             limit=4,
         )
 
-        route_queries = build_slot_route_queries(
+        slot_query_plan = _build_slot_query_plan(
             task,
             official_domains=official_domains,
-            max_queries=24,
+            max_queries_per_slot=8,
         )
-        route_payloads = await self._search_batch(route_queries)
+        raw_route_queries = _round_robin_slot_queries(
+            slot_query_plan,
+            limit=max(10, route_cap * 2),
+        )
+        route_queries = _take_budgeted_queries(
+            raw_route_queries,
+            remaining_budget=min(route_cap, max(0, total_query_budget - queries_executed)),
+            seen=query_seen,
+        )
+        route_payloads = await self._search_batch(route_queries) if route_queries else []
+        queries_executed += len(route_queries)
         route_rows = _rows_from_search_payloads(route_payloads)
         rows = self._dedupe_rows(discovery_rows + route_rows)
         rows, page_data, sources = await self._sources_from_rows(rows, task=task)
@@ -458,19 +659,37 @@ class GermanUniversityResearchOrchestrator:
             sources,
             required_slots=task.required_slots,
             institution=task.institution,
+            program=task.program,
         )
 
         missing = unresolved_slots(evidence_rows)
         rescue_queries: list[str] = []
         if missing:
-            rescue_queries = build_slot_route_queries(
-                task,
+            rescue_slot_query_plan = _build_slot_query_plan(
+                GermanResearchTask(
+                    query=task.query,
+                    institution=task.institution,
+                    program=task.program,
+                    degree_level=task.degree_level,
+                    subject_terms=task.subject_terms,
+                    required_slots=tuple(missing),
+                    country=task.country,
+                ),
                 official_domains=official_domains,
-                missing_slots=missing,
-                max_queries=18,
+                max_queries_per_slot=8,
+            )
+            raw_rescue_queries = _round_robin_slot_queries(
+                rescue_slot_query_plan,
+                limit=max(8, rescue_cap * 3),
+            )
+            rescue_queries = _take_budgeted_queries(
+                raw_rescue_queries,
+                remaining_budget=min(rescue_cap, max(0, total_query_budget - queries_executed)),
+                seen=query_seen,
             )
             if rescue_queries:
                 rescue_payloads = await self._search_batch(rescue_queries)
+                queries_executed += len(rescue_queries)
                 rescue_rows = _rows_from_search_payloads(rescue_payloads)
                 rows = self._dedupe_rows(rows + rescue_rows)
                 rows, page_data, sources = await self._sources_from_rows(
@@ -482,6 +701,7 @@ class GermanUniversityResearchOrchestrator:
                     sources,
                     required_slots=task.required_slots,
                     institution=task.institution,
+                    program=task.program,
                 )
                 missing = unresolved_slots(evidence_rows)
 
@@ -499,6 +719,7 @@ class GermanUniversityResearchOrchestrator:
         plan = research_plan_for_task(task, official_domains=official_domains)
         plan["route_queries"] = route_queries
         plan["rescue_queries"] = rescue_queries
+        plan["slot_query_plan"] = slot_query_plan
 
         emit_trace_event(
             "german_research_completed",
@@ -507,6 +728,9 @@ class GermanUniversityResearchOrchestrator:
                 "unresolved_slots": missing,
                 "official_domains": official_domains,
                 "source_count": len(source_urls),
+                "query_budget": total_query_budget,
+                "queries_executed": queries_executed,
+                "queries_remaining": max(0, total_query_budget - queries_executed),
             },
         )
 
@@ -538,6 +762,23 @@ class GermanUniversityResearchOrchestrator:
                 "discovery": discovery_queries,
                 "slot_routes": route_queries,
                 "rescue": rescue_queries,
+                "slot_query_plan": slot_query_plan,
+            },
+            "retrieval_budget_usage": {
+                "query_budget": total_query_budget,
+                "queries_executed": queries_executed,
+                "queries_remaining": max(0, total_query_budget - queries_executed),
+                "budget_exhausted": queries_executed >= total_query_budget,
+                "stage_caps": {
+                    "discovery": discovery_cap,
+                    "route": route_cap,
+                    "rescue": rescue_cap,
+                },
+                "stage_usage": {
+                    "discovery": len(discovery_queries),
+                    "route": len(route_queries),
+                    "rescue": len(rescue_queries),
+                },
             },
             "results": results,
             "timings_ms": {"total": _elapsed_ms(started_at)},

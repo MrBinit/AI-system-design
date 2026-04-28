@@ -41,3 +41,37 @@ def test_augment_retrieval_result_with_student_contract_adds_optional_fields(mon
     assert isinstance(augmented["unresolved_slots"], list)
     assert isinstance(augmented["source_policy_decisions"], list)
     assert isinstance(augmented["retrieval_budget_usage"], dict)
+
+
+def test_student_contract_preserves_german_researcher_slot_aliases(monkeypatch):
+    monkeypatch.setattr(orchestrator, "fetch_canonical_slot_facts", lambda **_kwargs: [])
+    result = {
+        "field_evidence": [
+            {
+                "id": "ects_or_subject_credit_requirements",
+                "status": "found",
+                "value": "30 ECTS; 18 ECTS; 8 ECTS",
+                "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/masters-programs-admission-criteria/",
+                "source_tier": "tier0_official",
+                "confidence": 0.9,
+            },
+            {
+                "id": "selection_criteria",
+                "status": "found",
+                "value": "Selection criteria use final grade and additional criteria.",
+                "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/masters-programs-admission-criteria/",
+                "source_tier": "tier0_official",
+                "confidence": 0.85,
+            },
+        ],
+        "results": [],
+    }
+
+    augmented = orchestrator.augment_retrieval_result_with_student_contract(
+        "Tell me about University of Mannheim MSc Business Informatics ECTS requirements and whether it is competitive.",
+        result,
+    )
+    by_id = {row["id"]: row for row in augmented["coverage_ledger"]}
+
+    assert by_id["ects_prerequisites"]["status"] == "found"
+    assert by_id["admission_decision_signal"]["status"] == "found"

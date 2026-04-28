@@ -143,6 +143,14 @@ def _sanitize_trace_event(event: dict) -> dict:
     }
 
 
+def _dynamodb_json_safe(value):
+    """Convert debug payloads into DynamoDB-compatible JSON values."""
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str), parse_float=Decimal)
+    except Exception:
+        return {}
+
+
 def _put_initial_job(job: dict) -> None:
     _dynamodb_table().put_item(
         Item=job,
@@ -172,10 +180,10 @@ def _update_job(job_id: str, updates: dict) -> None:
 
 
 def _normalized_mode(value: str | None) -> str:
-    # Runtime is intentionally single-mode: deep.
-    # Retrieval cost is controlled inside web retrieval via standard-first then deep escalation.
-    _ = value
-    return "deep"
+    mode = str(value or "").strip().lower()
+    if mode in {"auto", "fast", "standard", "deep"}:
+        return mode
+    return "standard"
 
 
 def enqueue_chat_job(
@@ -184,6 +192,7 @@ def enqueue_chat_job(
     prompt: str,
     session_id: str | None = None,
     mode: str | None = None,
+    debug: bool = False,
 ) -> dict:
     """Create async chat job state and enqueue it into SQS."""
     _require_async_chat_config()
@@ -203,6 +212,7 @@ def enqueue_chat_job(
         "session_id": normalized_session,
         "prompt": normalized_prompt,
         "mode": normalized_mode,
+        "debug_enabled": bool(debug),
         "status": _JOB_STATUS_QUEUED,
         "answer": "",
         "error": "",
@@ -226,6 +236,7 @@ def enqueue_chat_job(
             "session_id": normalized_session,
             "prompt": normalized_prompt,
             "mode": normalized_mode,
+            "debug": bool(debug),
             "submitted_at": now_iso,
         },
         ensure_ascii=False,
@@ -302,18 +313,18 @@ def mark_job_processing(job_id: str) -> None:
     )
 
 
-def mark_job_completed(job_id: str, answer: str) -> None:
+def mark_job_completed(job_id: str, answer: str, debug_info: dict | None = None) -> None:
     now_iso = _now_iso()
-    _update_job(
-        job_id,
-        {
-            "status": _JOB_STATUS_COMPLETED,
-            "answer": str(answer),
-            "error": "",
-            "completed_at": now_iso,
-            "updated_at": now_iso,
-        },
-    )
+    updates = {
+        "status": _JOB_STATUS_COMPLETED,
+        "answer": str(answer),
+        "error": "",
+        "completed_at": now_iso,
+        "updated_at": now_iso,
+    }
+    if isinstance(debug_info, dict) and debug_info:
+        updates["debug"] = _dynamodb_json_safe(debug_info)
+    _update_job(job_id, updates)
 
 
 def mark_job_failed(job_id: str, error_message: str) -> None:

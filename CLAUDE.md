@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-UniGraph is an AI-powered backend system for university/research discovery with RAG (Retrieval Augmented Generation). The system uses AWS Bedrock for LLM generation and embeddings, PostgreSQL with pgvector for long-term memory, Redis for short-term memory and queues, and SQS/DynamoDB for async job processing.
+UniGraph is an AI researcher with web retrieval aimed to develop a system capable to find the information about the universities in germany through authorized .de , .eu, daad or uni-assit.The main aim of the system is to find the most accurate answer through proper research about the university.The system uses AWS Bedrock for LLM generation and embeddings, PostgreSQL with pgvector for long-term memory, Redis for short-term memory and queues, and SQS/DynamoDB for async job processing.
 
 ## Architecture
 

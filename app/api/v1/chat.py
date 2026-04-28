@@ -87,14 +87,16 @@ def _record_trace_events(record: dict) -> list[dict]:
 
 async def _enqueue_stream_job(request: ChatRequest, session_id: str) -> dict:
     """Enqueue one async chat job and return its queued payload."""
+    enqueue_kwargs = {
+        "user_id": request.user_id,
+        "prompt": request.prompt,
+        "session_id": session_id,
+        "mode": request.mode,
+    }
+    if request.debug:
+        enqueue_kwargs["debug"] = True
     try:
-        job = await asyncio.to_thread(
-            enqueue_chat_job,
-            user_id=request.user_id,
-            prompt=request.prompt,
-            session_id=session_id,
-            mode=request.mode,
-        )
+        job = await asyncio.to_thread(enqueue_chat_job, **enqueue_kwargs)
     except RuntimeError as exc:
         logger.warning(
             "Async chat enqueue unavailable for stream user_id=%s",
@@ -147,6 +149,9 @@ async def _stream_job_events(job_id: str) -> AsyncIterator[str]:
 
         if record_status == "completed":
             yield _sse_data({"type": "chunk", "text": str(record.get("answer", ""))})
+            debug_payload = record.get("debug")
+            if isinstance(debug_payload, dict) and debug_payload:
+                yield _sse_data({"type": "debug", "debug": _json_safe(debug_payload)})
             yield 'data: {"type":"done"}\n\n'
             return
 
@@ -189,7 +194,11 @@ async def chat_stream(
     )
 
 
-@router.get("/chat/{job_id}", response_model=AsyncChatStatusResponse)
+@router.get(
+    "/chat/{job_id}",
+    response_model=AsyncChatStatusResponse,
+    response_model_exclude_none=True,
+)
 async def chat_status(
     job_id: str,
     principal: Annotated[Principal, Depends(get_current_principal)],
@@ -206,6 +215,7 @@ async def chat_status(
     authorize_user_access(principal, record_user_id)
     record_status = str(record.get("status", "failed"))
     public_error = _public_job_error(record_status, str(record.get("error", "")))
+    debug_payload = record.get("debug")
     return AsyncChatStatusResponse(
         job_id=str(record.get("job_id", job_id)),
         user_id=record_user_id,
@@ -217,6 +227,9 @@ async def chat_status(
         response=str(record.get("answer", "")),
         error=public_error,
         trace_events=_record_trace_events(record),
+        debug=(
+            _json_safe(debug_payload) if isinstance(debug_payload, dict) and debug_payload else None
+        ),
     )
 
 

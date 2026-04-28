@@ -27,6 +27,8 @@ def _normalize_field_evidence_rows(result: dict) -> list[dict]:
 
 
 def _retrieval_budget_usage(result: dict) -> dict:
+    existing = result.get("retrieval_budget_usage", {})
+    existing = dict(existing) if isinstance(existing, dict) else {}
     query_variants = result.get("query_variants", [])
     query_variants = query_variants if isinstance(query_variants, list) else []
     timings = result.get("timings_ms", {})
@@ -37,7 +39,7 @@ def _retrieval_budget_usage(result: dict) -> dict:
     retrieval_loop = retrieval_loop if isinstance(retrieval_loop, dict) else {}
     verification = result.get("verification", {})
     verification = verification if isinstance(verification, dict) else {}
-    return {
+    usage = {
         "query_count": len(query_variants),
         "pages_fetched": int(timings.get("page_fetch", 0) or 0),
         "search_ms": int(timings.get("search", 0) or 0),
@@ -47,6 +49,12 @@ def _retrieval_budget_usage(result: dict) -> dict:
         "loop_iterations": int(retrieval_loop.get("iterations", 0) or 0),
         "unique_domain_count": int(verification.get("unique_domain_count", 0) or 0),
     }
+    if existing:
+        existing.update(usage)
+        if "queries_executed" not in existing:
+            existing["queries_executed"] = usage["query_count"]
+        return existing
+    return usage
 
 
 def augment_retrieval_result_with_student_contract(query: str, result: dict) -> dict:

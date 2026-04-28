@@ -117,7 +117,7 @@ def test_enqueue_chat_job_persists_normalized_mode(monkeypatch):
     assert '"mode": "deep"' in captured_send["MessageBody"]
 
 
-def test_enqueue_chat_job_maps_standard_mode_to_fast(monkeypatch):
+def test_enqueue_chat_job_preserves_standard_mode(monkeypatch):
     captured_record = {}
     captured_send = {}
 
@@ -152,5 +152,5 @@ def test_enqueue_chat_job_maps_standard_mode_to_fast(monkeypatch):
     )
 
     assert response["status"] == "queued"
-    assert captured_record["mode"] == "fast"
-    assert '"mode": "fast"' in captured_send["MessageBody"]
+    assert captured_record["mode"] == "standard"
+    assert '"mode": "standard"' in captured_send["MessageBody"]

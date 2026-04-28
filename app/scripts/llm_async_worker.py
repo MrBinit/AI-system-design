@@ -58,6 +58,7 @@ async def _process_message(message: dict) -> None:
     session_id = str(payload.get("session_id", user_id)).strip() or user_id
     prompt = str(payload.get("prompt", "")).strip()
     mode = str(payload.get("mode", "deep")).strip().lower() or "deep"
+    debug_enabled = bool(payload.get("debug", False))
 
     if not job_id or not user_id or not prompt:
         if job_id:
@@ -80,6 +81,7 @@ async def _process_message(message: dict) -> None:
                 "user_id": user_id,
                 "session_id": session_id,
                 "mode": mode,
+                "debug": debug_enabled,
             },
         },
     )
@@ -89,8 +91,21 @@ async def _process_message(message: dict) -> None:
 
     try:
         with trace_scope(_trace_callback):
-            answer = await generate_response(user_id, prompt, session_id=session_id, mode=mode)
-        mark_job_completed(job_id, answer)
+            answer_payload = await generate_response(
+                user_id,
+                prompt,
+                session_id=session_id,
+                mode=mode,
+                debug=debug_enabled,
+            )
+        debug_info = {}
+        if isinstance(answer_payload, dict):
+            answer = str(answer_payload.get("response", ""))
+            payload_debug = answer_payload.get("debug")
+            debug_info = payload_debug if isinstance(payload_debug, dict) else {}
+        else:
+            answer = str(answer_payload)
+        mark_job_completed(job_id, answer, debug_info=debug_info if debug_enabled else None)
         _safe_append_trace(
             job_id,
             {

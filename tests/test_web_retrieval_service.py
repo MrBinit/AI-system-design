@@ -1690,6 +1690,41 @@ def test_fetch_page_data_sync_extracts_pdf(monkeypatch):
     assert page["internal_links"] == []
 
 
+@pytest.mark.asyncio
+async def test_afetch_organic_pages_preserves_fetch_error(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "fetch_page_content", True)
+    monkeypatch.setattr(service.settings.web_search, "queue_workers", 1)
+
+    async def _raise_fetch(_url: str):
+        raise TimeoutError("blocked by test")
+
+    monkeypatch.setattr(service, "_afetch_page_data", _raise_fetch)
+
+    pages = await service._afetch_organic_pages(
+        [{"url": "https://uni-example.de/admission", "title": "Admission"}]
+    )
+
+    page = pages["https://uni-example.de/admission"]
+    assert page["content"] == ""
+    assert "TimeoutError" in page["fetch_error"]
+    assert page["internal_links"] == []
+
+
+def test_merge_extracted_page_payload_preserves_internal_links_and_fetch_error():
+    merged = service._merge_extracted_page_payload(
+        {
+            "content": "",
+            "fetch_error": "TimeoutError: blocked",
+            "internal_links": [{"url": "https://uni-example.de/apply", "text": "Apply"}],
+        },
+        {"content": "Recovered extracted page content.", "internal_links": []},
+    )
+
+    assert merged["content"] == "Recovered extracted page content."
+    assert merged["internal_links"] == [{"url": "https://uni-example.de/apply", "text": "Apply"}]
+    assert merged["direct_fetch_error"] == "TimeoutError: blocked"
+
+
 def test_extract_internal_links_keeps_same_domain_and_prioritizes_relevant_paths():
     html = """
     <html><body>
@@ -1982,6 +2017,22 @@ def test_normalize_query_list_trims_and_dedupes_after_trim():
     assert len(normalized) == len({item.lower() for item in normalized})
 
 
+def test_normalize_query_list_preserves_distinct_site_and_filetype_intents():
+    queries = service._normalize_query_list(
+        [
+            "mannheim business informatics admission requirements site:uni-mannheim.de",
+            "mannheim business informatics admission requirements site:daad.de",
+            "mannheim business informatics admission requirements filetype:pdf site:uni-mannheim.de",
+        ],
+        limit=5,
+    )
+
+    assert len(queries) == 3
+    assert any("site:uni-mannheim.de" in item for item in queries)
+    assert any("site:daad.de" in item for item in queries)
+    assert any("filetype:pdf" in item for item in queries)
+
+
 def test_required_field_coverage_for_application_portal_requires_url():
     required_fields = service._required_fields_from_query(
         "application portal for msc machine learning"
@@ -2109,6 +2160,56 @@ def test_required_field_coverage_for_language_separates_requirement_and_score_sl
     assert weak["coverage"] < 1.0
     assert "language_requirements" not in strong["missing_ids"]
     assert strong["coverage"] == 1.0
+
+
+def test_required_field_evidence_rejects_ranking_directory_language_noise():
+    rows = service._required_field_evidence_table(
+        [{"id": "language_requirements", "label": "language requirements"}],
+        [
+            {
+                "content": "Architecture Biochemistry Business Informatics German Language and Literature.",
+                "metadata": {
+                    "url": "https://www.daad.de/en/studying-in-germany/universities/che-ranking/?che-a=department-detail",
+                    "title": "CHE Ranking Department Detail",
+                    "snippet": "German Language and Literature",
+                },
+            }
+        ],
+        emit_events=False,
+    )
+
+    assert rows[0]["status"] == "missing"
+    assert rows[0]["rejected_candidates"][0]["reason"] == "source_page_type_ranking_or_directory"
+
+
+def test_finalize_candidates_preserves_required_field_evidence(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "max_context_results", 2)
+    monkeypatch.setattr(service.settings.web_search, "deep_max_context_results", 2)
+    candidates = [
+        {
+            "_final_score": 0.99,
+            "content": "General overview of the program with no test scores.",
+            "metadata": {"url": "https://uni-example.de/overview", "title": "Overview"},
+        },
+        {
+            "_final_score": 0.98,
+            "content": "Curriculum modules and student life information.",
+            "metadata": {"url": "https://uni-example.de/curriculum", "title": "Curriculum"},
+        },
+        {
+            "_final_score": 0.1,
+            "content": "English requirement: IELTS 6.5 or TOEFL iBT 90.",
+            "metadata": {"url": "https://uni-example.de/language", "title": "Language requirements"},
+        },
+    ]
+
+    results = service._finalize_candidates(
+        candidates,
+        required_fields=[{"id": "language_score_thresholds", "label": "language score thresholds"}],
+    )
+
+    assert len(results) == 2
+    assert any("IELTS 6.5" in item["content"] for item in results)
 
 
 def test_required_field_coverage_for_gpa_and_ects_requires_numeric_thresholds():
@@ -2787,3 +2888,190 @@ def test_required_field_evidence_table_rejects_mmm_study_organization_noise():
     by_id = {row["id"]: row for row in rows}
     assert by_id["ects_breakdown"]["status"] == "missing"
     assert by_id["language_requirements"]["status"] == "missing"
+
+
+def test_required_field_evidence_rejects_mannheim_organizing_page_as_ects_prerequisite():
+    query_token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics GPA and ECTS requirements"
+    )
+    required_token = service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.set(("ects_breakdown",))
+    try:
+        rows = service._required_field_evidence_table(
+            [{"id": "ects_breakdown", "label": "ECTS prerequisites"}],
+            [
+                {
+                    "content": (
+                        "MSc Business Informatics. Degree plans and course schedules. "
+                        "Recognition of coursework and examinations. Modules include 4 ECTS, "
+                        "12 ECTS, and 30 ECTS."
+                    ),
+                    "metadata": {
+                        "title": "MSc Business Informatics - Organizing your studies",
+                        "url": "https://www.wim.uni-mannheim.de/en/academics/organizing-your-studies/msc-business-informatics/",
+                        "source_tier": "tier0_official",
+                        "trust_score": 0.9,
+                    },
+                }
+            ],
+        )
+    finally:
+        service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.reset(required_token)
+        service._RETRIEVAL_QUERY_CTX.reset(query_token)
+
+    assert rows[0]["status"] == "missing"
+    assert rows[0]["value"] == "Not verified from official sources."
+
+
+def test_required_field_evidence_rejects_generic_mannheim_master_brochure_language_noise():
+    query_token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics IELTS German requirement"
+    )
+    required_token = service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.set(("language_score_thresholds",))
+    try:
+        rows = service._required_field_evidence_table(
+            [{"id": "language_score_thresholds", "label": "Language scores"}],
+            [
+                {
+                    "content": (
+                        "The GRE General Test. Master in Business Informatics as well as Mannheim "
+                        "Master in Data Science offer extended deadlines. DSH passed with at least grade 2."
+                    ),
+                    "metadata": {
+                        "title": "Master brochure University of Mannheim",
+                        "url": "https://www.sowi.uni-mannheim.de/media/Einrichtungen/zula/Dokumente_Zula/masterbroschuere_uni_mannheim_en.pdf",
+                        "source_tier": "tier0_official",
+                        "trust_score": 0.9,
+                    },
+                }
+            ],
+        )
+    finally:
+        service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.reset(required_token)
+        service._RETRIEVAL_QUERY_CTX.reset(query_token)
+
+    assert rows[0]["status"] == "missing"
+    assert rows[0]["rejected_candidates"][0]["reason"] == "source_page_type_mismatch:generic_pdf_or_brochure"
+
+
+def test_required_field_evidence_rejects_bachelor_program_for_master_instruction_language():
+    query_token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics language of instruction"
+    )
+    required_token = service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.set(("instruction_language",))
+    try:
+        rows = service._required_field_evidence_table(
+            [{"id": "instruction_language", "label": "Language of instruction"}],
+            [
+                {
+                    "content": "Bachelor's Program in Business Informatics. Language of instruction: German.",
+                    "metadata": {
+                        "title": "Bachelor's Program in Business Informatics",
+                        "url": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/bsc-business-informatics/",
+                        "source_tier": "tier0_official",
+                        "trust_score": 0.9,
+                    },
+                }
+            ],
+        )
+    finally:
+        service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.reset(required_token)
+        service._RETRIEVAL_QUERY_CTX.reset(query_token)
+
+    assert rows[0]["status"] == "missing"
+    assert rows[0]["rejected_candidates"][0]["reason"] == "degree_level_mismatch"
+
+
+def test_required_field_evidence_rejects_going_abroad_language_proof_for_admissions():
+    query_token = service._RETRIEVAL_QUERY_CTX.set(
+        "University of Mannheim MSc Business Informatics IELTS TOEFL requirement"
+    )
+    required_token = service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.set(("language_score_thresholds",))
+    try:
+        rows = service._required_field_evidence_table(
+            [{"id": "language_score_thresholds", "label": "Language scores"}],
+            [
+                {
+                    "content": "TOEFL with a score of at least 80 from 120 is required.",
+                    "metadata": {
+                        "title": "Proof of language proficiency for studying abroad",
+                        "url": "https://www.uni-mannheim.de/en/academics/going-abroad/studying-abroad/proof-of-language-proficiency/",
+                        "source_tier": "tier0_official",
+                        "trust_score": 0.9,
+                    },
+                }
+            ],
+        )
+    finally:
+        service._RETRIEVAL_REQUIRED_FIELD_IDS_CTX.reset(required_token)
+        service._RETRIEVAL_QUERY_CTX.reset(query_token)
+
+    assert rows[0]["status"] == "missing"
+    assert rows[0]["value"] == "Not verified from official sources."
+
+
+@pytest.mark.asyncio
+async def test_deep_retrieval_respects_total_query_budget(monkeypatch):
+    monkeypatch.setattr(service.settings.web_search, "deep_standard_first_enabled", False)
+    monkeypatch.setattr(service.settings.web_search, "query_planner_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_enabled", True)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_max_steps", 4)
+    monkeypatch.setattr(service.settings.web_search, "retrieval_loop_max_gap_queries", 2)
+    monkeypatch.setattr(service.settings.web_search, "deep_search_max_queries", 8)
+    monkeypatch.setattr(service.settings.web_search, "deep_total_query_budget", 24)
+    monkeypatch.setattr(service.settings.web_search, "german_total_query_budget", 7)
+    monkeypatch.setattr(service.settings.web_search, "deep_required_field_rescue_enabled", False)
+    monkeypatch.setattr(service.settings.web_search, "allowed_domain_suffixes", [])
+
+    async def _fake_plan(_query: str, _allowed_suffixes: list[str]):
+        return {
+            "queries": [
+                "mannheim business informatics admissions",
+                "mannheim business informatics deadlines",
+                "mannheim business informatics portal",
+                "mannheim business informatics language score",
+                "mannheim business informatics auswahlsatzung",
+            ],
+            "subquestions": ["deadline", "portal", "ielts", "ects"],
+            "planner": "heuristic",
+            "llm_used": False,
+        }
+
+    calls: list[list[str]] = []
+
+    async def _fake_payloads(queries: list[str], *, top_k: int):
+        calls.append(list(queries))
+        return [
+            {
+                "organic_results": [
+                    {
+                        "title": "University of Mannheim Program",
+                        "link": f"https://www.uni-mannheim.de/en/{index}",
+                        "snippet": "Official admissions information page.",
+                    }
+                ]
+            }
+            for index, _query in enumerate(queries, start=1)
+        ]
+
+    async def _fake_fetch_pages(rows: list[dict], **_kwargs):
+        return {
+            str(row.get("url", "")): {"content": "General admissions info without all required fields."}
+            for row in rows
+        }
+
+    monkeypatch.setattr(service, "_resolve_query_plan", _fake_plan)
+    monkeypatch.setattr(service, "_asearch_payloads", _fake_payloads)
+    monkeypatch.setattr(service, "_afetch_organic_pages", _fake_fetch_pages)
+
+    result = await service.aretrieve_web_chunks(
+        "University of Mannheim MSc Business Informatics IELTS ECTS deadline and portal",
+        top_k=3,
+        search_mode="deep",
+    )
+
+    total_executed = sum(len(batch) for batch in calls)
+    budget = result["retrieval_budget_usage"]["query_budget"]
+    assert budget == 7
+    assert total_executed <= budget
+    assert len(result["query_variants"]) <= budget
+    assert result["retrieval_budget_usage"]["budget_exhausted"] is True

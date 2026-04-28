@@ -15,6 +15,13 @@ class TavilyConfig(BaseModel):
     timeout_seconds: float = Field(default=25.0, ge=1.0, le=120.0)
     fast_timeout_seconds: float = Field(default=0.0, ge=0.0, le=120.0)
     deep_timeout_seconds: float = Field(default=0.0, ge=0.0, le=300.0)
+    phase1_max_queries: int = Field(default=5, ge=1, le=8)
+    phase1_max_results_per_query: int = Field(default=3, ge=1, le=8)
+    phase1_max_total_urls_to_fetch: int = Field(default=8, ge=1, le=16)
+    phase1_max_pdfs_to_read: int = Field(default=3, ge=0, le=6)
+    phase1_max_pdf_size_mb: int = Field(default=15, ge=1, le=50)
+    phase1_max_pdf_pages: int = Field(default=40, ge=1, le=100)
+    phase1_max_evidence_chunks: int = Field(default=12, ge=1, le=30)
     max_concurrency: int = Field(default=8, ge=1, le=256)
     queue_workers: int = Field(default=4, ge=1, le=256)
     queue_max_size: int = Field(default=200, ge=1, le=100000)
@@ -45,7 +52,9 @@ class TavilyConfig(BaseModel):
     deep_standard_first_enabled: bool = True
     deep_escalate_only_if_unresolved: bool = True
     standard_search_max_queries: int = Field(default=2, ge=1, le=8)
+    standard_total_query_budget: int = Field(default=6, ge=2, le=20)
     deep_search_max_queries: int = Field(default=3, ge=1, le=12)
+    deep_total_query_budget: int = Field(default=18, ge=4, le=60)
     deep_extract_max_urls: int = Field(default=4, ge=0, le=20)
     retrieval_no_progress_cutoff: int = Field(default=1, ge=0, le=3)
     deep_required_field_rescue_enabled: bool = True
@@ -101,3 +110,8 @@ class TavilyConfig(BaseModel):
     evidence_specificity_min_score: float = Field(default=0.3, ge=0.0, le=1.0)
     answer_validation_enabled: bool = True
     answer_validation_min_quality_score: float = Field(default=0.6, ge=0.0, le=1.0)
+    german_total_query_budget: int = Field(default=12, ge=4, le=30)
+    german_research_total_query_budget: int = Field(default=14, ge=6, le=40)
+    german_research_discovery_max_queries: int = Field(default=3, ge=1, le=10)
+    german_research_route_max_queries: int = Field(default=8, ge=2, le=20)
+    german_research_rescue_max_queries: int = Field(default=3, ge=1, le=10)

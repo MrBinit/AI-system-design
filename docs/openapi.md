@@ -63,13 +63,14 @@ Request body:
 ```json
 {
   "user_id": "user-1",
-  "mode": "auto",
+  "mode": "standard",
   "prompt": "Find AI research labs at Stanford University"
 }
 ```
 
 Execution modes:
-- `auto`: route to `fast` or `deep` by complexity and quality gates.
+- `standard`: start with fast retrieval and escalate to `deep` only when evidence is missing, timed out, or fails quality gates.
+- `auto`: backward-compatible alias for the same fast-first quality-gated behavior.
 - `fast`: minimal planning/verification for lower latency.
 - `deep`: planner + verification/reflection path for higher answer quality.
 

@@ -51,7 +51,7 @@ def test_chat_stream_endpoint_success(monkeypatch):
         assert user_id == "user-1"
         assert prompt == "hello stream"
         assert session_id is None
-        assert mode == "auto"
+        assert mode == "standard"
         return {
             "job_id": "job-stream-1",
             "status": "queued",
@@ -111,7 +111,7 @@ def test_chat_stream_endpoint_forwards_session_id(monkeypatch):
         assert user_id == "user-1"
         assert prompt == "hello stream"
         assert session_id == "session-xyz"
-        assert mode == "auto"
+        assert mode == "standard"
         return {
             "job_id": "job-stream-2",
             "status": "queued",

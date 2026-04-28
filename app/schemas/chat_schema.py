@@ -18,7 +18,8 @@ class ChatRequest(BaseModel):
         pattern=r"^[A-Za-z0-9_.:@\-]+$",
     )
     prompt: str = Field(min_length=1, max_length=8000)
-    mode: Literal["auto", "fast", "standard", "deep"] = "auto"
+    mode: Literal["auto", "fast", "standard", "deep"] = "standard"
+    debug: bool = False
 
 
 class AsyncChatEnqueueResponse(BaseModel):
@@ -42,6 +43,7 @@ class AsyncChatStatusResponse(BaseModel):
     response: str = Field(default="", max_length=12000)
     error: str = Field(default="", max_length=2000)
     trace_events: list[dict] = Field(default_factory=list)
+    debug: dict | None = None
 
 
 class ChatHistoryClearResponse(BaseModel):

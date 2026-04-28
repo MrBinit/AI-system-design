@@ -111,6 +111,10 @@ _NEWS_HINT_RE = re.compile(
     r"\b(news|latest|recent|today|this week|this month|update|updated)\b",
     flags=re.IGNORECASE,
 )
+_GERMANY_HINT_RE = re.compile(
+    r"\b(germany|german|deutschland|daad|uni-assist)\b",
+    flags=re.IGNORECASE,
+)
 _META_PUBLISHED_RE = [
     re.compile(
         r"<meta[^>]+(?:property|name)\s*=\s*[\"']"
@@ -225,6 +229,11 @@ _PORTAL_SOURCE_URL_RE = re.compile(
 )
 _PORTAL_APPLY_SOURCE_URL_RE = re.compile(
     r"(apply|application-?portal|online-?application|bewerbung|bewerbungsportal|zulassung)",
+    flags=re.IGNORECASE,
+)
+_DIRECTORY_OR_RANKING_PAGE_RE = re.compile(
+    r"\b(che[-\s]?ranking|department-detail|studyportals|mastersportal|coursefinder|"
+    r"program(?:me)?\s+directory|degree\s+finder)\b",
     flags=re.IGNORECASE,
 )
 _GERMAN_DEADLINE_ENHANCED_RE = re.compile(
@@ -851,6 +860,10 @@ _ADMISSIONS_NOISE_MARKERS = (
     "master thesis registration",
     "thesis registration",
     "course documents such as lecture scripts",
+    "organizing-your-studies",
+    "degree plans and course schedules",
+    "recognition of coursework",
+    "learning agreements",
 )
 _ADMISSIONS_HARD_NOISE_MARKERS = (
     "/going-abroad/",
@@ -869,6 +882,10 @@ _ADMISSIONS_HARD_NOISE_MARKERS = (
     "master thesis registration",
     "thesis registration",
     "course documents such as lecture scripts",
+    "organizing-your-studies",
+    "degree plans and course schedules",
+    "recognition of coursework",
+    "learning agreements",
 )
 _MANDATORY_ADMISSIONS_ROUTE_MARKERS = (
     "selection statute",
@@ -1183,7 +1200,7 @@ def _build_official_source_route_queries(
         or _host_matches_domain(domain, "uni-assist.de")
     ]
 
-    for domain in primary_domains[:3]:
+    for domain in primary_domains[:1]:
         candidates.append(f"{query_base} official program page site:{domain}")
         for focus in focus_terms[:4]:
             candidates.append(f"{query_base} official {focus} site:{domain}")
@@ -1199,6 +1216,12 @@ def _build_official_source_route_queries(
             candidates.append(f"{query_base} application portal requirements site:{domain}")
         else:
             candidates.append(f"{query_base} official information site:{domain}")
+
+    for domain in primary_domains[1:3]:
+        candidates.append(f"{query_base} official program page site:{domain}")
+        for focus in focus_terms[:2]:
+            candidates.append(f"{query_base} official {focus} site:{domain}")
+        candidates.append(f"{query_base} auswahlsatzung zulassung filetype:pdf site:{domain}")
 
     return _normalize_query_list(candidates, limit=max(1, max_queries))
 
@@ -1851,8 +1874,14 @@ async def _afetch_organic_pages(
                     continue
                 try:
                     fetched[url] = await _afetch_page_data(url)
-                except Exception:
-                    fetched[url] = {"content": "", "published_date": ""}
+                except Exception as exc:
+                    error = " ".join(f"{exc.__class__.__name__}: {exc}".split()).strip()
+                    fetched[url] = {
+                        "content": "",
+                        "published_date": "",
+                        "internal_links": [],
+                        "fetch_error": error[:240],
+                    }
             finally:
                 queue.task_done()
 
@@ -1958,6 +1987,18 @@ async def _atry_tavily_extract_rows(
             "internal_links": [],
         }
     return extracted
+
+
+def _merge_extracted_page_payload(existing, extracted: dict) -> dict:
+    existing_payload = existing if isinstance(existing, dict) else {}
+    extracted_payload = dict(extracted) if isinstance(extracted, dict) else {}
+    existing_links = existing_payload.get("internal_links")
+    extracted_links = extracted_payload.get("internal_links")
+    if existing_links and not extracted_links:
+        extracted_payload["internal_links"] = existing_links
+    if existing_payload.get("fetch_error") and not extracted_payload.get("direct_fetch_error"):
+        extracted_payload["direct_fetch_error"] = existing_payload.get("fetch_error")
+    return extracted_payload
 
 
 def _should_run_extract_for_step(
@@ -2618,13 +2659,34 @@ def _normalize_query_list(values, *, limit: int) -> list[str]:
         key = candidate.lower()
         if key in seen:
             continue
-        fuzzy_key = re.sub(r"\bsite:[a-z0-9.-]+\b", " ", key)
-        fuzzy_key = re.sub(r"[^a-z0-9\s]", " ", fuzzy_key)
+        site_filters = sorted(
+            {
+                str(item).strip().lower()
+                for item in re.findall(r"\bsite:([a-z0-9.*-]+(?:\.[a-z0-9.*-]+)*)\b", key)
+                if str(item).strip()
+            }
+        )
+        filetype_filters = sorted(
+            {
+                str(item).strip().lower()
+                for item in re.findall(r"\bfiletype:([a-z0-9]+)\b", key)
+                if str(item).strip()
+            }
+        )
+        fuzzy_base = re.sub(r"\bsite:[a-z0-9.*-]+(?:\.[a-z0-9.*-]+)*\b", " ", key)
+        fuzzy_base = re.sub(r"\bfiletype:[a-z0-9]+\b", " ", fuzzy_base)
+        fuzzy_base = re.sub(r"[^a-z0-9\s]", " ", fuzzy_base)
         fuzzy_key = " ".join(
             token
-            for token in fuzzy_key.split()
+            for token in fuzzy_base.split()
             if token and token not in _QUERY_STOPWORDS
         )
+        intent_key = " ".join(
+            [f"site:{item}" for item in site_filters]
+            + [f"filetype:{item}" for item in filetype_filters]
+        )
+        if intent_key:
+            fuzzy_key = f"{fuzzy_key} {intent_key}".strip()
         if fuzzy_key and fuzzy_key in fuzzy_seen:
             continue
         seen.add(key)
@@ -3681,7 +3743,20 @@ def _extract_ects_value(sentence: str, *, require_prerequisite_context: bool = F
         return ""
     if require_prerequisite_context and not re.search(
         r"\b(requirements?|prerequisites?|admission|eligibility|qualifying|"
-        r"voraussetzungen|zulassung|subject area|computer science|mathematics|business)\b",
+        r"applicants?|at least|minimum|voraussetzungen|zulassung|subject area|"
+        r"computer science|informatics|mathematics|statistics|business|programming)\b",
+        compact,
+        flags=re.IGNORECASE,
+    ):
+        return ""
+    if require_prerequisite_context and re.search(
+        r"\b(module|modules|electives?|seminars?|projects?|degree plans?|course schedules?|"
+        r"recognition of coursework|learning agreements|curriculum)\b",
+        compact,
+        flags=re.IGNORECASE,
+    ) and not re.search(
+        r"\b(admission|eligibility|applicants?|at least|minimum|prerequisites?|"
+        r"voraussetzungen|zulassung)\b",
         compact,
         flags=re.IGNORECASE,
     ):
@@ -3998,6 +4073,118 @@ def _field_evidence_source_type(url: str) -> str:
     return "discovery"
 
 
+def _classify_source_page_type(*, url: str, title: str, snippet: str, content: str = "") -> str:
+    route_text = " ".join(str(part or "") for part in (url, title, snippet)).lower()
+    full_text = f"{route_text} {str(content or '').lower()}"
+    if re.search(
+        r"\b(program[-\s]?ambassadors?|student ambassador|testimonial|experience report)\b",
+        route_text,
+    ):
+        return "ambassador_or_testimonial"
+    if _DIRECTORY_OR_RANKING_PAGE_RE.search(route_text):
+        return "ranking_or_directory"
+    if re.search(
+        r"\b(organizing-your-studies|degree plans? and course schedules?|learning agreements|"
+        r"recognition of coursework|course schedules?)\b",
+        route_text,
+    ):
+        return "study_organization_page"
+    if _PORTAL_SOURCE_URL_RE.search(route_text) or _PORTAL_CONTENT_RE.search(route_text):
+        return "application_portal"
+    if _DEADLINE_URL_HINT_RE.search(route_text) or _DEADLINE_CONTENT_RE.search(route_text):
+        return "deadline_page"
+    if re.search(r"\b(auswahlsatzung|zulassungssatzung|selection statute|admission regulations?)\b", route_text):
+        return "official_regulation"
+    if re.search(r"\b(masterbroschuere|masterbroschüre|brochure|flyer|factsheet|info sheet)\b|\.pdf(?:$|\?)", route_text):
+        return "generic_pdf_or_brochure"
+    if re.search(
+        r"\b(organizing your studies|degree plans? and course schedules?|learning agreements|"
+        r"recognition of coursework|course schedules?)\b",
+        full_text,
+    ):
+        return "study_organization_page"
+    if _ADMISSION_CONTENT_RE.search(route_text) or re.search(r"\b(admission|eligibility|requirements?)\b", route_text):
+        return "admission_requirements_page"
+    if _LANGUAGE_CONTENT_RE.search(route_text):
+        return "language_requirements_page"
+    if _ADMISSION_CONTENT_RE.search(full_text):
+        return "admission_requirements_page"
+    if _LANGUAGE_CONTENT_RE.search(full_text):
+        return "language_requirements_page"
+    if re.search(r"\b(master|m\.sc|msc|program|programme|degree)\b", full_text):
+        return "program_page"
+    if _DIRECTORY_OR_RANKING_PAGE_RE.search(full_text):
+        return "ranking_or_directory"
+    return "unknown"
+
+
+_FIELD_ALLOWED_SOURCE_PAGE_TYPES: dict[str, set[str]] = {
+    "program_overview": {"program_page", "admission_requirements_page"},
+    "admission_requirements": {"admission_requirements_page", "official_regulation", "program_page"},
+    "gpa_threshold": {"admission_requirements_page", "official_regulation", "program_page"},
+    "ects_breakdown": {"admission_requirements_page", "official_regulation", "program_page"},
+    "instruction_language": {
+        "program_page",
+        "language_requirements_page",
+        "admission_requirements_page",
+        "official_regulation",
+    },
+    "language_requirements": {
+        "language_requirements_page",
+        "admission_requirements_page",
+        "official_regulation",
+        "program_page",
+        "application_portal",
+    },
+    "language_score_thresholds": {
+        "language_requirements_page",
+        "admission_requirements_page",
+        "official_regulation",
+        "program_page",
+        "application_portal",
+    },
+    "application_deadline": {"deadline_page", "admission_requirements_page", "program_page", "official_regulation"},
+    "application_portal": {
+        "application_portal",
+        "admission_requirements_page",
+        "program_page",
+        "language_requirements_page",
+        "deadline_page",
+    },
+    "admission_decision_signal": {"admission_requirements_page", "official_regulation", "program_page"},
+}
+
+
+def _source_page_type_allowed_for_field(field_id: str, source_page_type: str) -> bool:
+    if not source_page_type or source_page_type == "unknown":
+        return True
+    if source_page_type in {
+        "ranking_or_directory",
+        "ambassador_or_testimonial",
+        "study_organization_page",
+        "generic_pdf_or_brochure",
+    }:
+        return False
+    allowed = _FIELD_ALLOWED_SOURCE_PAGE_TYPES.get(str(field_id or "").strip())
+    if not allowed:
+        return True
+    return source_page_type in allowed
+
+
+def _source_page_type_for_candidate(candidate: dict, content: str) -> str:
+    metadata = candidate.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    existing = str(metadata.get("source_page_type", "")).strip()
+    if existing:
+        return existing
+    return _classify_source_page_type(
+        url=str(metadata.get("url", "")),
+        title=str(metadata.get("title", "")),
+        snippet=str(metadata.get("snippet", "")),
+        content=content,
+    )
+
+
 def _field_evidence_timestamp(value: str) -> str:
     if value and re.match(r"^\d{4}-\d{2}-\d{2}T", value):
         return value
@@ -4133,6 +4320,43 @@ def _required_field_evidence_table(
                     score += 0.25
             normalized_value_key = " ".join(str(value).lower().split())
             source_type = _field_evidence_source_type(source_url)
+            source_page_type = _source_page_type_for_candidate(candidate, content)
+            if (
+                source_page_type == "ranking_or_directory"
+                and field_id
+                in {
+                    "admission_requirements",
+                    "gpa_threshold",
+                    "ects_breakdown",
+                    "instruction_language",
+                    "language_requirements",
+                    "language_score_thresholds",
+                    "application_deadline",
+                    "application_portal",
+                    "admission_decision_signal",
+                }
+            ):
+                rejected = {
+                    "field": field_id,
+                    "source_url": source_url,
+                    "reason": "source_page_type_ranking_or_directory",
+                    "evidence_snippet": sentence,
+                }
+                rejected_rows.append(rejected)
+                if emit_events:
+                    emit_trace_event("slot_candidate_rejected", rejected)
+                continue
+            if not _source_page_type_allowed_for_field(field_id, source_page_type):
+                rejected = {
+                    "field": field_id,
+                    "source_url": source_url,
+                    "reason": f"source_page_type_mismatch:{source_page_type}",
+                    "evidence_snippet": sentence,
+                }
+                rejected_rows.append(rejected)
+                if emit_events:
+                    emit_trace_event("slot_candidate_rejected", rejected)
+                continue
             if strict_official and source_type != "official":
                 rejected = {
                     "field": field_id,
@@ -4177,6 +4401,7 @@ def _required_field_evidence_table(
                 "source_url": source_url,
                 "source_type": source_type,
                 "source_tier": source_tier,
+                "source_page_type": source_page_type,
                 "evidence_snippet": sentence,
                 "evidence_text": sentence,
                 "confidence": round(max(0.0, min(1.0, 0.45 + (trust * 0.5))), 4),
@@ -4220,6 +4445,7 @@ def _required_field_evidence_table(
                     "source_url": str(best_row.get("source_url", "")),
                     "source_type": str(best_row.get("source_type", "official")),
                     "source_tier": str(best_row.get("source_tier", "tier0_official")),
+                    "source_page_type": str(best_row.get("source_page_type", "")),
                     "evidence_snippet": str(best_row.get("evidence_snippet", "")),
                     "evidence_text": str(best_row.get("evidence_text", "")),
                     "confidence": 0.35,
@@ -5650,6 +5876,12 @@ def _organic_row_candidates(
                     "url": url,
                     "published_date": published_date,
                     "source_type": "google_organic",
+                    "source_page_type": _classify_source_page_type(
+                        url=url,
+                        title=title,
+                        snippet=snippet,
+                        content=content,
+                    ),
                 },
             }
         )
@@ -5685,7 +5917,16 @@ def _build_organic_candidates(
     return candidates
 
 
-def _finalize_candidates(candidates: list[dict]) -> list[dict]:
+def _candidate_fills_required_field(candidate: dict, field: dict) -> bool:
+    rows = _required_field_evidence_table([field], [candidate], emit_events=False)
+    return any(str(row.get("status", "")).strip().lower() == "found" for row in rows)
+
+
+def _finalize_candidates(
+    candidates: list[dict],
+    *,
+    required_fields: list[dict] | None = None,
+) -> list[dict]:
     candidates.sort(
         key=lambda item: float(item.get("_final_score", item.get("_score", 0.0))), reverse=True
     )
@@ -5696,6 +5937,26 @@ def _finalize_candidates(candidates: list[dict]) -> list[dict]:
     selected_indexes: set[int] = set()
     selected_domains: set[str] = set()
     ordered_items: list[dict] = []
+
+    for field in required_fields or []:
+        if len(ordered_items) >= max_results:
+            break
+        field_id = str((field or {}).get("id", "")).strip()
+        if not field_id:
+            continue
+        for index, item in enumerate(deduped):
+            if index in selected_indexes:
+                continue
+            if not _candidate_fills_required_field(item, field):
+                continue
+            selected_indexes.add(index)
+            metadata = item.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            domain = _domain_group_key(_normalized_host(str(metadata.get("url", ""))))
+            if domain:
+                selected_domains.add(domain)
+            ordered_items.append(item)
+            break
 
     if min_unique_domains > 1:
         for index, item in enumerate(deduped):
@@ -6067,6 +6328,44 @@ def _build_required_field_queries(
     )
 
 
+def _build_required_field_slot_query_plan(
+    query: str,
+    *,
+    required_fields: list[dict],
+    allowed_suffixes: list[str],
+    unique_domains: list[str],
+    per_slot_limit: int = 4,
+) -> dict[str, list[str]]:
+    plan: dict[str, list[str]] = {}
+    for field in required_fields:
+        field_id = str((field or {}).get("id", "")).strip()
+        if not field_id:
+            continue
+        queries = _build_required_field_queries(
+            query,
+            missing_required_fields=[field],
+            allowed_suffixes=allowed_suffixes,
+            unique_domains=unique_domains,
+        )
+        plan[field_id] = _normalize_query_list(queries, limit=max(1, per_slot_limit))
+    return plan
+
+
+def _round_robin_slot_query_plan(slot_query_plan: dict[str, list[str]], *, limit: int) -> list[str]:
+    if not slot_query_plan:
+        return []
+    buckets = [queries for queries in slot_query_plan.values() if queries]
+    if not buckets:
+        return []
+    candidates: list[str] = []
+    max_bucket_len = max(len(bucket) for bucket in buckets)
+    for index in range(max_bucket_len):
+        for bucket in buckets:
+            if index < len(bucket):
+                candidates.append(bucket[index])
+    return _normalize_query_list(candidates, limit=max(1, limit))
+
+
 def _build_follow_up_queries(
     query: str,
     *,
@@ -6323,6 +6622,54 @@ def _standard_search_max_queries() -> int:
 def _deep_search_max_queries() -> int:
     configured = int(getattr(settings.web_search, "deep_search_max_queries", 3) or 3)
     return max(1, min(12, configured))
+
+
+def _standard_total_query_budget() -> int:
+    configured = int(getattr(settings.web_search, "standard_total_query_budget", 6) or 6)
+    return max(2, min(20, configured))
+
+
+def _deep_total_query_budget() -> int:
+    configured = int(getattr(settings.web_search, "deep_total_query_budget", 18) or 18)
+    return max(6, min(60, configured))
+
+
+def _german_total_query_budget() -> int:
+    configured = int(getattr(settings.web_search, "german_total_query_budget", 12) or 12)
+    return max(4, min(30, configured))
+
+
+def _is_german_university_query(query: str) -> bool:
+    compact = " ".join(str(query or "").split()).strip().lower()
+    if not compact:
+        return False
+    if not bool(getattr(settings.web_search, "german_university_mode_enabled", True)):
+        return False
+    if _GERMANY_HINT_RE.search(compact):
+        return True
+    official_domains = _official_domains_for_query(compact)
+    return any(str(domain).strip().lower().endswith(".de") for domain in official_domains)
+
+
+def _query_budget_for_request(
+    *,
+    query: str,
+    deep_mode: bool,
+    required_fields: list[dict],
+    research_objectives: list[dict],
+) -> int:
+    if not deep_mode:
+        return max(_standard_search_max_queries(), _standard_total_query_budget())
+    base_budget = max(_deep_total_query_budget(), _deep_search_max_queries())
+    slot_component = max(0, len(required_fields) * 2)
+    objective_component = max(0, len(research_objectives))
+    target_budget = min(36, 6 + slot_component + objective_component)
+    budget = max(base_budget, target_budget)
+    if _is_university_program_query(query):
+        budget = min(32, max(8, budget))
+    if _is_german_university_query(query):
+        budget = min(budget, _german_total_query_budget())
+    return max(4, budget)
 
 
 def _deep_extract_max_urls() -> int:
@@ -6664,6 +7011,21 @@ async def _aretrieve_web_chunks_impl(
         query_plan["planner"] = "fast_heuristic"
         query_plan["llm_used"] = False
         query_plan["subquestions"] = []
+    slot_query_plan = _build_required_field_slot_query_plan(
+        query,
+        required_fields=required_fields,
+        allowed_suffixes=allowed_suffixes,
+        unique_domains=[],
+        per_slot_limit=4,
+    )
+    slot_first_queries = (
+        _round_robin_slot_query_plan(
+            slot_query_plan,
+            limit=max(_planner_query_limit_for_query(query), len(required_fields)),
+        )
+        if _is_university_program_query(query)
+        else []
+    )
     emit_trace_event(
         "query_plan_created",
         {
@@ -6673,6 +7035,7 @@ async def _aretrieve_web_chunks_impl(
             "llm_used": bool(query_plan.get("llm_used", False)),
             "subquestions": query_plan.get("subquestions", []),
             "required_fields": [str(field.get("id", "")).strip() for field in required_fields],
+            "slot_query_plan": slot_query_plan,
             "queries": query_plan.get("queries", []),
             "strict_official_sources": strict_official_sources,
             "target_domain_groups": target_domain_groups,
@@ -6697,7 +7060,7 @@ async def _aretrieve_web_chunks_impl(
         _planner_query_limit_for_query(query) if deep_mode else min(2, _max_planner_queries())
     )
     planned_queries = _normalize_query_list(
-        query_plan.get("queries", []),
+        slot_first_queries + list(query_plan.get("queries", [])),
         limit=planned_query_limit,
     ) or _build_query_variants(query, allowed_suffixes)
     official_route_queries = _build_official_source_route_queries(
@@ -6745,6 +7108,14 @@ async def _aretrieve_web_chunks_impl(
     max_steps = _effective_retrieval_loop_max_steps(query, required_fields, deep_mode=deep_mode)
     if not deep_mode or not _retrieval_loop_enabled():
         max_steps = 1
+    query_budget = _query_budget_for_request(
+        query=query,
+        deep_mode=deep_mode,
+        required_fields=required_fields,
+        research_objectives=research_objectives,
+    )
+    queries_executed = 0
+    budget_exhausted = False
     stagnant_steps = 0
     stagnation_limit = _retrieval_loop_max_stagnant_steps()
     best_coverage = -1.0
@@ -6873,12 +7244,31 @@ async def _aretrieve_web_chunks_impl(
             )
         if not loop_queries:
             break
+        remaining_budget = max(0, query_budget - queries_executed)
+        if remaining_budget <= 0:
+            budget_exhausted = True
+            emit_trace_event(
+                "retrieval_query_budget_exhausted",
+                {
+                    "step": step,
+                    "query_budget": query_budget,
+                    "queries_executed": queries_executed,
+                },
+            )
+            break
+        if len(loop_queries) > remaining_budget:
+            loop_queries = loop_queries[:remaining_budget]
+            budget_exhausted = True
         executed_queries.extend(loop_queries)
+        queries_executed += len(loop_queries)
         emit_trace_event(
             "search_started",
             {
                 "step": step,
                 "queries": loop_queries,
+                "query_budget": query_budget,
+                "queries_executed": queries_executed,
+                "queries_remaining": max(0, query_budget - queries_executed),
             },
         )
 
@@ -6938,7 +7328,7 @@ async def _aretrieve_web_chunks_impl(
                 )
                 new_content = " ".join(str((payload or {}).get("content", "")).split())
                 if not existing_content or len(new_content) > len(existing_content):
-                    page_data_by_url[url] = payload
+                    page_data_by_url[url] = _merge_extracted_page_payload(existing, payload)
         fetch_ms_total += _elapsed_ms(fetch_started_at)
         crawl_summary = {
             "enabled": False,
@@ -7163,7 +7553,7 @@ async def _aretrieve_web_chunks_impl(
             )
             break
 
-    results = _finalize_candidates(all_candidates)
+    results = _finalize_candidates(all_candidates, required_fields=required_fields)
     extracted_facts = _extract_facts(
         results,
         limit=_max_context_results_for_mode(),
@@ -7234,6 +7624,20 @@ async def _aretrieve_web_chunks_impl(
             seen_queries,
             max_queries=_required_field_rescue_max_queries(),
         )
+        rescue_budget_remaining = max(0, query_budget - queries_executed)
+        if rescue_budget_remaining <= 0:
+            rescue_queries = []
+            budget_exhausted = True
+            emit_trace_event(
+                "required_field_rescue_skipped_budget_exhausted",
+                {
+                    "query_budget": query_budget,
+                    "queries_executed": queries_executed,
+                },
+            )
+        elif len(rescue_queries) > rescue_budget_remaining:
+            rescue_queries = rescue_queries[:rescue_budget_remaining]
+            budget_exhausted = True
         if rescue_queries:
             emit_trace_event(
                 "required_field_rescue_started",
@@ -7241,9 +7645,13 @@ async def _aretrieve_web_chunks_impl(
                     "queries": rescue_queries,
                     "missing_required_fields": final_missing_required_ids,
                     "missing_research_objectives": final_missing_research_objective_ids,
+                    "query_budget": query_budget,
+                    "queries_executed": queries_executed,
+                    "queries_remaining": max(0, query_budget - queries_executed),
                 },
             )
             executed_queries.extend(rescue_queries)
+            queries_executed += len(rescue_queries)
             rescue_search_started_at = time.perf_counter()
             try:
                 rescue_payloads = await _asearch_payloads(rescue_queries, top_k=top_k)
@@ -7291,7 +7699,7 @@ async def _aretrieve_web_chunks_impl(
                     )
                     new_content = " ".join(str((payload or {}).get("content", "")).split())
                     if not existing_content or len(new_content) > len(existing_content):
-                        rescue_pages[url] = payload
+                        rescue_pages[url] = _merge_extracted_page_payload(existing, payload)
             fetch_ms_total += _elapsed_ms(rescue_fetch_started_at)
             rescue_crawl_summary = {
                 "enabled": False,
@@ -7360,7 +7768,7 @@ async def _aretrieve_web_chunks_impl(
                     all_candidates,
                     limit=max(2, _max_context_results_for_mode() * 3),
                 )
-            results = _finalize_candidates(all_candidates)
+            results = _finalize_candidates(all_candidates, required_fields=required_fields)
             extracted_facts = _extract_facts(
                 results,
                 limit=_max_context_results_for_mode(),
@@ -7458,6 +7866,7 @@ async def _aretrieve_web_chunks_impl(
             "llm_used": bool(query_plan.get("llm_used", False)),
             "subquestions": subquestions,
             "required_fields": [str(field.get("id", "")).strip() for field in required_fields],
+            "slot_query_plan": slot_query_plan,
             "research_objectives": [str(item.get("id", "")).strip() for item in research_objectives],
             "research_objective_mode": research_objective_mode,
         },
@@ -7503,6 +7912,13 @@ async def _aretrieve_web_chunks_impl(
             "search": search_ms_total,
             "page_fetch": fetch_ms_total,
             "total": _elapsed_ms(started_at),
+        },
+        "retrieval_budget_usage": {
+            "query_budget": query_budget,
+            "queries_executed": len(executed_queries),
+            "queries_remaining": max(0, query_budget - len(executed_queries)),
+            "budget_exhausted": bool(budget_exhausted),
+            "max_steps": max_steps,
         },
         "results": results,
     }
@@ -7568,7 +7984,25 @@ async def _aretrieve_web_chunks_impl_deterministic(
         max_queries = max(_deep_search_max_queries(), deep_min_queries)
     else:
         max_queries = _standard_search_max_queries()
+    query_budget = _query_budget_for_request(
+        query=query,
+        deep_mode=deep_mode,
+        required_fields=required_fields,
+        research_objectives=research_objectives,
+    )
+    effective_query_limit = max(1, min(max_queries, query_budget))
     base_queries = _build_query_variants(query, allowed_suffixes)
+    slot_query_plan = _build_required_field_slot_query_plan(
+        query,
+        required_fields=required_fields,
+        allowed_suffixes=allowed_suffixes,
+        unique_domains=[],
+        per_slot_limit=4,
+    )
+    slot_first_queries = _round_robin_slot_query_plan(
+        slot_query_plan,
+        limit=max(effective_query_limit, len(required_fields)),
+    )
     deterministic_route_queries = (
         _deterministic_university_route_queries(query, required_fields)
         if _is_university_program_query(query)
@@ -7590,10 +8024,14 @@ async def _aretrieve_web_chunks_impl_deterministic(
         else []
     )
     query_variants = _normalize_query_list(
-        deterministic_route_queries + routed_required_queries + base_queries + research_queries,
-        limit=max_queries,
+        slot_first_queries
+        + deterministic_route_queries
+        + routed_required_queries
+        + base_queries
+        + research_queries,
+        limit=effective_query_limit,
     )
-    query_variants = _normalize_query_list(query_variants, limit=max_queries)
+    query_variants = _normalize_query_list(query_variants, limit=effective_query_limit)
 
     search_ms_total = 0
     fetch_ms_total = 0
@@ -7603,6 +8041,7 @@ async def _aretrieve_web_chunks_impl_deterministic(
     fields_filled_by_round: list[int] = []
     coverage_deltas: list[float] = []
     stop_reason = "budget_cap"
+    budget_exhausted = bool(query_budget <= len(query_variants))
 
     if not query_variants:
         results: list[dict] = []
@@ -7616,6 +8055,7 @@ async def _aretrieve_web_chunks_impl_deterministic(
                 "llm_used": False,
                 "subquestions": _required_field_subquestions(required_fields),
                 "required_fields": [str(field.get("id", "")).strip() for field in required_fields],
+                "slot_query_plan": slot_query_plan,
                 "research_objectives": [str(item.get("id", "")).strip() for item in research_objectives],
                 "research_objective_mode": research_objective_mode,
             },
@@ -7664,6 +8104,13 @@ async def _aretrieve_web_chunks_impl_deterministic(
             "retrieval_strategy": "web_search",
             "domain_filter_relaxed": False,
             "timings_ms": {"search": 0, "page_fetch": 0, "total": _elapsed_ms(started_at)},
+            "retrieval_budget_usage": {
+                "query_budget": query_budget,
+                "queries_executed": 0,
+                "queries_remaining": query_budget,
+                "budget_exhausted": False,
+                "max_steps": 1,
+            },
             "metrics": {
                 "tavily_calls_total": 0,
                 "tavily_calls_basic": 0,
@@ -7685,10 +8132,20 @@ async def _aretrieve_web_chunks_impl_deterministic(
             "llm_used": False,
             "queries": query_variants,
             "required_fields": [str(field.get("id", "")).strip() for field in required_fields],
+            "slot_query_plan": slot_query_plan,
             "research_objective_mode": research_objective_mode,
         },
     )
-    emit_trace_event("search_started", {"step": 1, "queries": query_variants})
+    emit_trace_event(
+        "search_started",
+        {
+            "step": 1,
+            "queries": query_variants,
+            "query_budget": query_budget,
+            "queries_executed": len(query_variants),
+            "queries_remaining": max(0, query_budget - len(query_variants)),
+        },
+    )
 
     search_started_at = time.perf_counter()
     payloads = await _asearch_payloads(query_variants, top_k=top_k)
@@ -7740,7 +8197,7 @@ async def _aretrieve_web_chunks_impl_deterministic(
             )
             new_content = " ".join(str((payload or {}).get("content", "")).split())
             if not existing_content or len(new_content) > len(existing_content):
-                page_data_by_url[url] = payload
+                page_data_by_url[url] = _merge_extracted_page_payload(existing, payload)
     fetch_ms_total += _elapsed_ms(fetch_started_at)
 
     query_tokens = _query_tokens(" ".join(query_variants))
@@ -7758,7 +8215,7 @@ async def _aretrieve_web_chunks_impl_deterministic(
         candidates.append(ai_candidate)
     candidates = _apply_trust_scores(candidates, allowed_suffixes)
     candidates = _boost_pdf_scores(candidates)  # Boost PDFs after trust scoring
-    results = _finalize_candidates(candidates)
+    results = _finalize_candidates(candidates, required_fields=required_fields)
     facts = _extract_facts(results, limit=_max_context_results_for_mode())
 
     required_status = _required_field_coverage(required_fields, results)
@@ -7787,6 +8244,8 @@ async def _aretrieve_web_chunks_impl_deterministic(
         )
     ):
         stop_reason = "coverage_reached"
+    elif budget_exhausted:
+        stop_reason = "budget_cap"
     elif not results:
         stop_reason = "no_progress"
     elif _retrieval_no_progress_cutoff() <= 0:
@@ -7848,6 +8307,7 @@ async def _aretrieve_web_chunks_impl_deterministic(
             "llm_used": False,
             "subquestions": _required_field_subquestions(required_fields),
             "required_fields": [str(field.get("id", "")).strip() for field in required_fields],
+            "slot_query_plan": slot_query_plan,
             "research_objectives": [str(item.get("id", "")).strip() for item in research_objectives],
             "research_objective_mode": research_objective_mode,
         },
@@ -7915,6 +8375,13 @@ async def _aretrieve_web_chunks_impl_deterministic(
             "search": search_ms_total,
             "page_fetch": fetch_ms_total,
             "total": _elapsed_ms(started_at),
+        },
+        "retrieval_budget_usage": {
+            "query_budget": query_budget,
+            "queries_executed": len(query_variants),
+            "queries_remaining": max(0, query_budget - len(query_variants)),
+            "budget_exhausted": bool(budget_exhausted),
+            "max_steps": 1,
         },
         "metrics": {
             "tavily_calls_total": basic_calls + advanced_calls,

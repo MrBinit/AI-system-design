@@ -22,8 +22,16 @@ _SOURCE_TIER_RANK = {
 _SLOT_ALIASES: dict[str, set[str]] = {
     "gpa_threshold": {"gpa_threshold", "gpa_or_grade_threshold"},
     "gpa_or_grade_threshold": {"gpa_threshold"},
-    "ects_prerequisites": {"ects_prerequisites", "ects_breakdown", "ects_or_prerequisite_credit_breakdown"},
-    "ects_or_prerequisite_credit_breakdown": {"ects_breakdown"},
+    "ects_prerequisites": {
+        "ects_prerequisites",
+        "ects_breakdown",
+        "ects_or_prerequisite_credit_breakdown",
+        "ects_or_subject_credit_requirements",
+    },
+    "ects_or_prerequisite_credit_breakdown": {
+        "ects_breakdown",
+        "ects_or_subject_credit_requirements",
+    },
     "instruction_language": {"instruction_language", "language_of_instruction"},
     "language_test_thresholds": {"language_test_thresholds", "language_score_thresholds", "language_test_score_thresholds"},
     "language_test_score_thresholds": {"language_score_thresholds"},
@@ -38,7 +46,11 @@ _SLOT_ALIASES: dict[str, set[str]] = {
     "labs_or_research_groups": {"labs_or_research_groups"},
     "contact_information": {"contact_information"},
     "visa_or_work_rights": {"visa_or_work_rights"},
-    "admission_decision_signal": {"admission_decision_signal"},
+    "admission_decision_signal": {
+        "admission_decision_signal",
+        "selection_criteria",
+        "competitiveness_signal",
+    },
 }
 
 
@@ -194,7 +206,7 @@ def _ledger_row_from_slot(slot: dict, best_row: dict | None, *, now_utc: datetim
             "retrieved_at": retrieved_at,
         }
     )
-    for key in ("rejection_reason", "rejected_candidates", "unit", "qualifier"):
+    for key in ("rejection_reason", "rejected_candidates", "source_page_type", "unit", "qualifier"):
         if key in best_row:
             base[key] = best_row.get(key)
     if final_status == _STATUS_CONFLICT:

@@ -663,6 +663,522 @@ def test_targeted_required_field_rescue_queries_infer_site_hint_from_query_witho
     assert any("site:uni-mannheim.de" in query.lower() for query in queries)
 
 
+def test_german_selective_filter_preserves_verified_ledger_sources_and_drops_wrong_scope():
+    state = llm_service._new_metrics_state()
+    state.update(
+        {
+            "safe_user_prompt": "Tell me about University of Mannheim MSc Business Informatics IELTS ECTS deadline portal",
+            "coverage_ledger": [
+                {
+                    "id": "language_test_score_thresholds",
+                    "label": "Language test score thresholds",
+                    "status": "found",
+                    "value": "TOEFL iBT 72; IELTS 6.0",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/masters-programs-foreign-language-requirements/",
+                    "confidence": 0.95,
+                },
+                {
+                    "id": "application_deadline",
+                    "label": "Application deadline",
+                    "status": "found",
+                    "value": "1 April - 15 May; 15 October - 15 November",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/",
+                    "confidence": 0.95,
+                },
+            ],
+        }
+    )
+    results = [
+        {
+            "chunk_id": "wrong-bsc",
+            "source_path": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/bsc-business-informatics/",
+            "content": "Bachelor's Program in Business Informatics. German C1.",
+            "metadata": {"url": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/bsc-business-informatics/", "title": "Bachelor's Program in Business Informatics"},
+        },
+        {
+            "chunk_id": "overview",
+            "source_path": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/",
+            "content": "Master's Program in Business Informatics. Language of instruction: English.",
+            "metadata": {"url": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/", "title": "Master's Program in Business Informatics"},
+        },
+        {
+            "chunk_id": "lang",
+            "source_path": "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/masters-programs-foreign-language-requirements/",
+            "content": "Master's Program in Business Informatics. TOEFL iBT 72. IELTS 6.0.",
+            "metadata": {"url": "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/masters-programs-foreign-language-requirements/", "title": "Master's Programs Foreign Language Requirements"},
+        },
+        {
+            "chunk_id": "deadline",
+            "source_path": "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/",
+            "content": "Business Informatics taught in English. 1 April - 15 May. 15 October - 15 November.",
+            "metadata": {"url": "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/", "title": "Application deadlines"},
+        },
+    ]
+
+    selected = llm_service._selective_retrieval_results(results, state)
+    urls = {llm_service._result_source_url(item) for item in selected}
+
+    assert "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/bsc-business-informatics/" not in urls
+    assert "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/masters-programs-foreign-language-requirements/" in urls
+    assert "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/" in urls
+
+
+def test_german_answer_issues_detect_not_verified_against_found_ledger_and_wrong_deadline():
+    state = llm_service._new_metrics_state()
+    state.update(
+        {
+            "safe_user_prompt": "Tell me about University of Mannheim MSc Business Informatics IELTS deadline",
+            "citation_required": False,
+            "required_answer_fields": ["language_test_score_thresholds", "application_deadline"],
+            "coverage_ledger": [
+                {
+                    "id": "language_test_score_thresholds",
+                    "label": "Language test score thresholds",
+                    "status": "found",
+                    "value": "TOEFL iBT 72; IELTS 6.0",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/masters-programs-foreign-language-requirements/",
+                },
+                {
+                    "id": "application_deadline",
+                    "label": "Application deadline",
+                    "status": "found",
+                    "value": "1 April - 15 May; 15 October - 15 November",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/",
+                },
+            ],
+        }
+    )
+    answer = (
+        "IELTS/TOEFL exact minimum score thresholds: Not verified from official sources.\n"
+        "Application Deadline\n"
+        "- Fall semester: 15 August\n"
+        "- Spring semester: 15 January"
+    )
+
+    issues = llm_service._agentic_result_issues(answer, state)
+
+    assert "verified_ledger_field_marked_unverified" in issues
+    assert "deadline_conflicts_with_verified_ledger" in issues
+
+
+def test_has_date_like_value_accepts_month_range_deadlines():
+    text = "Application deadline: 1 April - 15 May; Spring intake: 15 October - 15 November."
+    assert llm_service._has_date_like_value(text) is True
+
+
+def test_structured_recovery_answer_usable_with_partial_verified_admissions_answer():
+    state = llm_service._new_metrics_state()
+    state.update(
+        {
+            "safe_user_prompt": "Tell me about University of Mannheim MSc Business Informatics IELTS ECTS deadline portal",
+            "citation_required": True,
+            "required_answer_fields": [
+                "language_test_score_thresholds",
+                "ects_prerequisites",
+                "application_deadline",
+                "application_portal",
+            ],
+            "evidence_urls": [
+                "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/",
+                "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+            ],
+            "coverage_ledger": [
+                {
+                    "id": "application_deadline",
+                    "label": "Application deadline",
+                    "status": "found",
+                    "value": "1 April - 15 May; 15 October - 15 November",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/",
+                },
+                {
+                    "id": "application_portal",
+                    "label": "Application portal",
+                    "status": "found",
+                    "value": "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+                    "source_url": "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+                },
+                {
+                    "id": "language_test_score_thresholds",
+                    "label": "Language test score thresholds",
+                    "status": "missing",
+                    "value": "Not verified from official sources.",
+                    "source_url": "",
+                },
+            ],
+        }
+    )
+    answer = llm_service._build_structured_field_evidence_answer(state)
+    assert "1 April - 15 May" in answer
+    assert "portal2.uni-mannheim.de" in answer
+    assert llm_service._structured_recovery_answer_usable(answer, state) is True
+
+
+def test_force_structured_recovery_when_evidence_exists_accepts_partial_verified_answer():
+    state = llm_service._new_metrics_state()
+    state.update(
+        {
+            "safe_user_prompt": "Tell me about University of Mannheim MSc Business Informatics language deadline portal ECTS",
+            "citation_required": True,
+            "web_required_field_coverage": 0.625,
+            "required_answer_fields": [
+                "language_of_instruction",
+                "ects_prerequisites",
+                "application_deadline",
+                "application_portal",
+                "gpa_threshold",
+            ],
+            "evidence_urls": [
+                "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/",
+                "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/",
+                "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+            ],
+            "coverage_ledger": [
+                {
+                    "id": "language_of_instruction",
+                    "label": "Language of instruction",
+                    "status": "found",
+                    "value": "English",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/",
+                },
+                {
+                    "id": "ects_prerequisites",
+                    "label": "ECTS / prerequisite credits",
+                    "status": "found",
+                    "value": "30 ECTS informatics; 30 ECTS business/business informatics; 18 ECTS mathematics/statistics; 8 ECTS programming",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/",
+                },
+                {
+                    "id": "application_deadline",
+                    "label": "Application deadline",
+                    "status": "found",
+                    "value": "1 April - 15 May; 15 October - 15 November",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/",
+                },
+                {
+                    "id": "application_portal",
+                    "label": "Application portal",
+                    "status": "found",
+                    "value": "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+                    "source_url": "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+                },
+                {
+                    "id": "gpa_threshold",
+                    "label": "Minimum GPA / grade threshold",
+                    "status": "missing",
+                    "value": "Not verified from official sources.",
+                    "source_url": "",
+                },
+            ],
+        }
+    )
+    answer = llm_service._build_structured_field_evidence_answer(state)
+    assert "Language of Instruction" in answer
+    assert "Application Deadline" in answer
+    assert llm_service._force_structured_recovery_when_evidence_exists(answer, state) is True
+
+
+def test_force_structured_recovery_allows_speculative_wording_when_evidence_is_strong():
+    state = llm_service._new_metrics_state()
+    state.update(
+        {
+            "safe_user_prompt": "Tell me about University of Mannheim MSc Business Informatics deadline and portal",
+            "citation_required": True,
+            "web_required_field_coverage": 0.625,
+            "required_answer_fields": ["application_deadline", "application_portal"],
+            "evidence_urls": [
+                "https://www.uni-mannheim.de/media/Einrichtungen/zula/Auswahlsatzungen_master/satzung_ma_wifo_en.pdf",
+                "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+                "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/",
+            ],
+            "coverage_ledger": [
+                {
+                    "id": "application_deadline",
+                    "status": "found",
+                    "value": "Proof of English proficiency may be submitted by 15 August / 15 January.",
+                    "source_url": "https://www.uni-mannheim.de/media/Einrichtungen/zula/Auswahlsatzungen_master/satzung_ma_wifo_en.pdf",
+                },
+                {
+                    "id": "application_portal",
+                    "status": "found",
+                    "value": "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+                    "source_url": "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+                },
+            ],
+        }
+    )
+    answer = llm_service._build_structured_field_evidence_answer(state)
+    assert llm_service._has_speculative_factual_language(answer, state) is True
+    assert llm_service._force_structured_recovery_when_evidence_exists(answer, state) is True
+
+
+def test_can_return_best_effort_admissions_answer_requires_evidence():
+    state = llm_service._new_metrics_state()
+    state.update(
+        {
+            "safe_user_prompt": "Tell me about University of Mannheim MSc Business Informatics IELTS GPA ECTS deadline and portal",
+            "required_answer_fields": ["language_test_score_thresholds", "gpa_threshold", "application_deadline"],
+            "evidence_urls": ["https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/"],
+        }
+    )
+    assert (
+        llm_service._can_return_best_effort_admissions_answer(
+            "Language of instruction: English", state
+        )
+        is True
+    )
+    state["evidence_urls"] = []
+    assert (
+        llm_service._can_return_best_effort_admissions_answer(
+            "Language of instruction: English", state
+        )
+        is False
+    )
+
+
+def test_structured_recovery_sources_use_only_allowed_evidence_urls_for_german_queries():
+    state = llm_service._new_metrics_state()
+    state.update(
+        {
+            "safe_user_prompt": "Tell me about University of Mannheim MSc Business Informatics IELTS GPA ECTS deadline portal",
+            "required_answer_fields": ["application_deadline", "application_portal", "gpa_threshold"],
+            "evidence_urls": [
+                "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/",
+                "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+            ],
+            "coverage_ledger": [
+                {
+                    "id": "application_portal",
+                    "status": "found",
+                    "value": "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+                    "source_url": "https://www.uni-mannheim.de/en/news/apply-for-academic-year-2025-2026/",
+                },
+                {
+                    "id": "application_deadline",
+                    "status": "missing",
+                    "value": "Not verified from official sources.",
+                    "source_url": "",
+                },
+            ],
+        }
+    )
+    answer = llm_service._build_structured_field_evidence_answer(state)
+    assert "https://www.uni-mannheim.de/en/news/apply-for-academic-year-2025-2026/" not in answer
+    assert "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung" in answer
+
+
+def test_structured_answer_suppresses_unverified_german_requirement_for_english_msc():
+    state = llm_service._new_metrics_state()
+    state.update(
+        {
+            "safe_user_prompt": "Tell me about University of Mannheim MSc Business Informatics IELTS German GPA ECTS deadline portal and if it is safe for 3.2 GPA",
+            "evidence_urls": [
+                "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/",
+                "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/masters-programs-foreign-language-requirements/",
+            ],
+            "coverage_ledger": [
+                {
+                    "id": "language_of_instruction",
+                    "label": "Language of instruction",
+                    "status": "found",
+                    "value": "English",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/",
+                },
+                {
+                    "id": "language_requirements",
+                    "label": "Language requirements",
+                    "status": "found",
+                    "value": "Solid knowledge of English",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/masters-programs-foreign-language-requirements/",
+                },
+                {
+                    "id": "language_test_score_thresholds",
+                    "label": "Language test score thresholds",
+                    "status": "found",
+                    "value": "TOEFL iBT 72; IELTS 6.0",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/applying/the-a-to-z-of-applying/masters-programs-foreign-language-requirements/",
+                },
+                {
+                    "id": "german_language_requirement",
+                    "label": "German language requirement",
+                    "status": "missing",
+                    "value": "Not verified from official sources.",
+                    "source_url": "",
+                },
+                {
+                    "id": "selection_criteria",
+                    "label": "Selection criteria",
+                    "status": "found",
+                    "value": "The final grade, professional activities, and semester abroad are selection criteria.",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/",
+                },
+            ],
+        }
+    )
+
+    answer = llm_service._build_structured_field_evidence_answer(state)
+
+    assert "German language requirement: No separate German requirement was verified" in answer
+    assert "German language requirement: Not verified from official sources" not in answer
+    assert "TOEFL iBT 72; IELTS 6.0" in answer
+    assert "No fixed minimum GPA/grade threshold was found" in answer
+    assert "final grade or grade average is used as a selection criterion" in answer
+    assert "Cannot be classified as safe" in answer
+
+
+def test_structured_answer_cleans_noisy_deadline_ects_and_german_rows():
+    state = llm_service._new_metrics_state()
+    state.update(
+        {
+            "safe_user_prompt": "Tell me about University of Mannheim MSc Business Informatics IELTS German ECTS deadline",
+            "evidence_urls": [
+                "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/",
+                "https://www.wim.uni-mannheim.de/en/academics/organizing-your-studies/msc-business-informatics/",
+            ],
+            "coverage_ledger": [
+                {
+                    "id": "application_deadline",
+                    "label": "Application deadline",
+                    "status": "found",
+                    "value": (
+                        "1 April \u2013 15 May; 15 October \u2013 15 November; "
+                        "1 April \u2013 15 May; 15 October \u2013 15 November"
+                    ),
+                    "source_url": "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/",
+                },
+                {
+                    "id": "ects_or_subject_credit_requirements",
+                    "label": "ECTS / prerequisite credits",
+                    "status": "found",
+                    "value": "2 ECTS; 4 ECTS; 12 ECTS",
+                    "source_url": "https://www.wim.uni-mannheim.de/en/academics/organizing-your-studies/msc-business-informatics/",
+                },
+                {
+                    "id": "german_language_requirement",
+                    "label": "German language requirement",
+                    "status": "found",
+                    "value": (
+                        "For some of the master's programs, applicants have to prove a minimum "
+                        "of German language skills. German citizens do not have to provide proof."
+                    ),
+                    "source_url": "https://www.wim.uni-mannheim.de/en/academics/organizing-your-studies/msc-business-informatics/",
+                },
+                {
+                    "id": "language_test_score_thresholds",
+                    "label": "Language score thresholds",
+                    "status": "found",
+                    "value": "DSH passed with at least grade 2",
+                    "source_url": "https://www.sowi.uni-mannheim.de/media/Einrichtungen/zula/Dokumente_Zula/masterbroschuere_uni_mannheim_en.pdf",
+                },
+                {
+                    "id": "language_requirements",
+                    "label": "Language requirements",
+                    "status": "found",
+                    "value": "TOEFL with a score of at least 80 from 120",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/going-abroad/studying-abroad/proof-of-language-proficiency/",
+                },
+                {
+                    "id": "language_of_instruction",
+                    "label": "Language of instruction",
+                    "status": "found",
+                    "value": "German",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/bsc-business-informatics/",
+                },
+            ],
+        }
+    )
+
+    answer = llm_service._build_structured_field_evidence_answer(state)
+
+    assert answer.count("1 April - 15 May") == 1
+    assert answer.count("15 October - 15 November") == 1
+    assert "ECTS / prerequisite credit breakdown: Not verified from official sources." in answer
+    assert "2 ECTS; 4 ECTS; 12 ECTS" not in answer
+    assert "For some of the master's programs" not in answer
+    assert "DSH passed with at least grade 2" not in answer
+    assert "TOEFL with a score of at least 80" not in answer
+    assert "Language of instruction: German" not in answer
+    assert "IELTS/TOEFL thresholds: Not verified from official sources." in answer
+
+
+@pytest.mark.asyncio
+async def test_generate_agentic_answer_uses_structured_admissions_ledger_when_model_is_noisy(monkeypatch):
+    async def fake_finalize_candidate_with_llm(**_kwargs):
+        return "", {}, 0
+
+    monkeypatch.setattr(llm_service, "_finalize_candidate_with_llm", fake_finalize_candidate_with_llm)
+
+    async def fake_call_model_with_fallback(_messages, _state, role="worker", attempt=1):
+        _ = role, attempt
+        return FakeResponse(
+            "Sources Checked\n"
+            "Application deadline: 1 April - 15 May; 15 October - 15 November; "
+            "1 April - 15 May; 15 October - 15 November\n"
+            "ECTS / prerequisite credit breakdown: 2 ECTS; 4 ECTS; 12 ECTS\n"
+            "Show citations"
+        )
+
+    monkeypatch.setattr(llm_service, "_call_model_with_fallback", fake_call_model_with_fallback)
+
+    state = llm_service._new_metrics_state()
+    state.update(
+        {
+            "safe_user_prompt": "Tell me about University of Mannheim MSc Business Informatics ECTS deadline portal",
+            "citation_required": True,
+            "required_answer_fields": [
+                "ects_or_prerequisite_credit_breakdown",
+                "application_deadline",
+                "application_portal",
+            ],
+            "evidence_urls": [
+                "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/",
+                "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/",
+                "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+            ],
+            "coverage_ledger": [
+                {
+                    "id": "ects_or_prerequisite_credit_breakdown",
+                    "label": "ECTS / prerequisite credits",
+                    "status": "found",
+                    "value": "30 ECTS informatics; 30 ECTS business/business informatics; 18 ECTS mathematics/statistics; 8 ECTS programming",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/before-your-studies/programs/masters-program-in-business-informatics/",
+                },
+                {
+                    "id": "application_deadline",
+                    "label": "Application deadline",
+                    "status": "found",
+                    "value": "1 April - 15 May; 15 October - 15 November",
+                    "source_url": "https://www.uni-mannheim.de/en/academics/dates/application-deadlines/",
+                },
+                {
+                    "id": "application_portal",
+                    "label": "Application portal",
+                    "status": "found",
+                    "value": "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+                    "source_url": "https://portal2.uni-mannheim.de/portal2/pages/cs/sys/portal/hisinoneStartPage.faces?page=Bewerbung",
+                },
+            ],
+        }
+    )
+
+    result, _usage = await llm_service._generate_agentic_answer(
+        user_id="user-1",
+        messages=[{"role": "user", "content": "requirements?"}],
+        policy={
+            "max_attempts": 1,
+            "planner_enabled": False,
+            "verifier_enabled": False,
+            "web_search_mode": "fast",
+            "mode": "fast",
+        },
+        state=state,
+    )
+
+    assert "30 ECTS informatics" in result
+    assert "2 ECTS; 4 ECTS; 12 ECTS" not in result
+    assert "Show citations" not in result
+    assert "portal2.uni-mannheim.de" in result
+
+
 @pytest.mark.asyncio
 async def test_generate_agentic_answer_runs_required_field_rescue_extra_round(monkeypatch):
     monkeypatch.setattr(llm_service, "_web_retrieval_ready", lambda: (True, "ready"))
@@ -2003,19 +2519,20 @@ def test_resolve_initial_execution_mode_routes_auto_queries():
             "auto",
             "tell me fau erlangen-nuernberg msc artificial intelligence course requirements and language requirements for international students",
         )
-        == "deep"
+        == "fast"
     )
     assert (
         llm_service._resolve_initial_execution_mode(
             "auto",
             "compare top AI universities in germany and include latest deadlines",
         )
-        == "deep"
+        == "fast"
     )
+    assert llm_service._resolve_initial_execution_mode("deep", "hello") == "deep"
 
 
-def test_normalized_request_mode_maps_standard_to_fast():
-    assert llm_service._normalized_request_mode("standard") == "fast"
+def test_normalized_request_mode_preserves_standard_fast_first_policy():
+    assert llm_service._normalized_request_mode("standard") == "standard"
     assert llm_service._resolve_initial_execution_mode("standard", "hello") == "fast"
 
 
@@ -2157,6 +2674,50 @@ async def test_prepare_request_auto_escalates_to_deep_on_context_refusal(monkeyp
     assert refusal is None
     assert messages == [{"role": "user", "content": "hello"}]
     assert call_modes == ["fast", "deep"]
+    assert context["execution_mode"] == "deep"
+    assert context["state"]["auto_escalated"] is True
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_standard_escalates_to_deep_on_context_refusal(monkeypatch):
+    fake_redis = FakeRedis()
+    _attach_fake_redis(monkeypatch, fake_redis)
+
+    async def fake_read_cached_response(_cache_key):
+        return None, 0
+
+    call_modes: list[str] = []
+
+    async def fake_prepare_messages_for_model(
+        *,
+        user_id,
+        conversation_user_id,
+        safe_user_prompt,
+        execution_mode,
+        policy,
+        state,
+    ):
+        _ = (user_id, conversation_user_id, policy)
+        call_modes.append(execution_mode)
+        if execution_mode == "fast":
+            state["context_guard_reason"] = "no_relevant_information"
+            return None, llm_service._NO_RELEVANT_INFORMATION_DETAIL
+        return [{"role": "user", "content": safe_user_prompt}], None
+
+    monkeypatch.setattr(llm_service, "_read_cached_response", fake_read_cached_response)
+    monkeypatch.setattr(llm_service, "_prepare_messages_for_model", fake_prepare_messages_for_model)
+
+    context, messages, refusal = await llm_service._prepare_request(
+        "user-1",
+        "hello",
+        None,
+        mode="standard",
+    )
+
+    assert refusal is None
+    assert messages == [{"role": "user", "content": "hello"}]
+    assert call_modes == ["fast", "deep"]
+    assert context["requested_mode"] == "standard"
     assert context["execution_mode"] == "deep"
     assert context["state"]["auto_escalated"] is True
 
@@ -2939,3 +3500,94 @@ def test_apply_answer_policy_rebuilds_clean_sources_section():
     assert "Claim-by-Claim Citations" not in cleaned
     assert "Sources" in cleaned
     assert cleaned.count("https://uni-example.de/program") == 2
+
+
+@pytest.mark.asyncio
+async def test_augment_with_german_researcher_uses_cached_result(monkeypatch):
+    calls = {"count": 0}
+
+    async def _fake_research(_query: str) -> dict:
+        calls["count"] += 1
+        return {
+            "applicable": True,
+            "results": [
+                {
+                    "chunk_id": "german:1",
+                    "source_path": "https://www.uni-mannheim.de/program",
+                    "distance": 0.1,
+                    "content": "Language of instruction: English.",
+                    "metadata": {"url": "https://www.uni-mannheim.de/program"},
+                }
+            ],
+            "coverage_ledger": [
+                {
+                    "id": "language_of_instruction",
+                    "label": "Language of instruction",
+                    "status": "found",
+                    "value": "English",
+                    "source_url": "https://www.uni-mannheim.de/program",
+                    "confidence": 0.9,
+                }
+            ],
+            "verification": {
+                "required_field_coverage": 1.0,
+                "required_fields_missing": [],
+                "unresolved_fields": [],
+                "source_policy": "german_official_first",
+            },
+            "coverage_summary": {"required_field_coverage": 1.0, "unresolved_fields": []},
+            "query_variants": ["mannheim msc business informatics official program page"],
+            "source_routes_attempted": {},
+            "retrieval_budget_usage": {"query_budget": 10, "queries_executed": 4},
+            "timings_ms": {"total": 20},
+        }
+
+    monkeypatch.setattr(llm_service, "research_german_university", _fake_research)
+    monkeypatch.setattr(llm_service, "is_likely_german_university_query", lambda _q: True)
+    monkeypatch.setattr(llm_service.settings.web_search, "german_university_mode_enabled", True)
+
+    state = llm_service._new_metrics_state()
+    base_result = {"results": [], "retrieval_budget_usage": {"queries_executed": 2}}
+
+    first = await llm_service._augment_with_german_researcher(
+        "University of Mannheim MSc Business Informatics",
+        base_result,
+        state,
+    )
+    second = await llm_service._augment_with_german_researcher(
+        "University of Mannheim MSc Business Informatics",
+        base_result,
+        state,
+    )
+
+    assert calls["count"] == 1
+    assert state["german_researcher_cache_hits"] == 1
+    assert first["german_research"]["applied"] is True
+    assert second["german_research"]["applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_required_field_rescue_uses_fast_mode_when_base_mode_is_deep(monkeypatch):
+    captured_modes: list[str] = []
+
+    async def _fake_web_query(query: str, *, top_k: int, search_mode: str):
+        captured_modes.append(str(search_mode))
+        return {"query": query, "verification": {}, "results": []}
+
+    monkeypatch.setattr(llm_service, "_run_one_web_query_with_timeout", _fake_web_query)
+    monkeypatch.setattr(llm_service.settings.web_search, "deep_required_field_rescue_max_queries", 2)
+
+    state = llm_service._new_metrics_state()
+    state["required_answer_fields"] = ["application_deadline", "application_portal"]
+    state["safe_user_prompt"] = "University of Mannheim MSc Business Informatics deadline and portal"
+
+    _messages, rescued = await llm_service._attempt_required_field_web_rescue(
+        issues=["web_missing:application_deadline"],
+        state=state,
+        base_query=state["safe_user_prompt"],
+        search_mode="deep",
+    )
+
+    assert rescued is False
+    assert captured_modes
+    assert all(mode == "fast" for mode in captured_modes)
