@@ -415,7 +415,14 @@ FIELD_KEYWORDS: dict[str, list[str]] = {
     "uni_assist_requirement": ["uni-assist", "uni assist"],
     "tuition_fee": ["tuition", "fees", "studiengebühren", "tuition fee"],
     "semester_contribution": ["semester contribution", "semesterbeitrag", "student services fee"],
-    "gre_gmat_requirement": ["gre", "gmat"],
+    "gre_gmat_requirement": [
+        "gre",
+        "gmat",
+        "standardized test",
+        "standardised test",
+        "aptitude test",
+        "testas",
+    ],
     "program_shortlist": [
         "master",
         "msc",
@@ -1559,11 +1566,60 @@ def _broadened_field_keywords(plan: QueryPlan, *, pdf: bool = False) -> list[str
     elif plan.intent == "tuition_fee_lookup":
         terms = ["tuition fee", "semester contribution", "Studiengebühren", "Semesterbeitrag"]
     elif plan.intent == "standardized_test_lookup":
-        terms = ["GRE", "GMAT", "standardized test", "aptitude test", "TestAS"]
+        terms = [
+            "GRE",
+            "GMAT",
+            "standardized test",
+            "aptitude test",
+            "TestAS",
+            "admission requirements",
+            "selection regulations",
+            "Zulassungsvoraussetzungen",
+            "Auswahlsatzung",
+        ]
+    elif plan.intent == "eligibility_check":
+        terms = [
+            "admission requirements",
+            "eligibility",
+            "selection regulations",
+            "required degree",
+            "ECTS",
+            "GPA",
+            "Zulassungsvoraussetzungen",
+            "Auswahlsatzung",
+        ]
+    elif plan.intent == "document_requirement_lookup":
+        terms = [
+            "required documents",
+            "application documents",
+            "document checklist",
+            "supporting documents",
+            "Bewerbungsunterlagen",
+            "beizufügende Unterlagen",
+        ]
     else:
         terms = [*_field_query_keywords(plan), "FAQ", "admission", "application"]
     if pdf:
-        terms.extend(["supporting documents", "Beizufuegende Unterlagen", "PDF"])
+        if plan.intent in {
+            "document_requirement_lookup",
+            "eligibility_check",
+            "standardized_test_lookup",
+        }:
+            terms.extend(
+                [
+                    "selection regulations",
+                    "admission regulations",
+                    "application checklist",
+                    "supporting documents",
+                    "Auswahlsatzung",
+                    "Zulassungsordnung",
+                    "Bewerbungsunterlagen",
+                    "beizufuegende Unterlagen",
+                    "PDF",
+                ]
+            )
+        else:
+            terms.extend(["supporting documents", "Beizufuegende Unterlagen", "PDF"])
     return list(dict.fromkeys(_compact(term) for term in terms if _compact(term)))
 
 
@@ -2633,9 +2689,12 @@ def classify_page_type(url: str, title: str = "", snippet: str = "") -> str:
         for term in (
             "beizufügende unterlagen",
             "beizufuegende unterlagen",
+            "supporting documents",
+            "application documents",
             "required documents",
             "document checklist",
             "bewerbungsunterlagen",
+            "zulassungsvoraussetzungen",
         )
     ):
         return "document_checklist_pdf" if is_pdf else "document_checklist_page"
@@ -2817,6 +2876,33 @@ def _degree_signal_debug(url: str, title: str, snippet: str, plan: QueryPlan) ->
     }
 
 
+def _wrong_degree_pdf_candidate_reason(url: str, title: str, snippet: str, plan: QueryPlan) -> str:
+    if not _is_pdf_url(url) or not plan.degree_level:
+        return ""
+    debug = _degree_signal_debug(url, title, snippet, plan)
+    if not bool(debug.get("final_degree_match", True)):
+        return "wrong_degree_level_pdf"
+    combined = f"{url} {title} {snippet}".lower()
+    if plan.degree_level == "master" and any(
+        term in combined
+        for term in (
+            "bachelor of science",
+            "b.sc",
+            "bsc",
+            "/bachelor",
+            "bachelor-ai",
+            "ai_ba",
+            "_ba",
+        )
+    ) and not any(term in combined for term in ("master", "msc", "m.sc", "phd", "doctoral")):
+        return "wrong_degree_level_pdf"
+    if plan.degree_level == "bachelor" and any(
+        term in combined for term in ("master", "msc", "m.sc", "phd", "doctoral")
+    ) and not any(term in combined for term in ("bachelor", "bsc", "b.sc")):
+        return "wrong_degree_level_pdf"
+    return ""
+
+
 def _span_degree_rejection_reason(text: str, plan: QueryPlan) -> str:
     signal = _degree_signal(text)
     if plan.degree_level == "master" and signal == "bachelor":
@@ -2899,6 +2985,8 @@ def _is_strong_official_candidate(
         return False, page_type_reason
     if _degree_level_path_rejection_reason(url, plan):
         return False, "wrong_degree_level"
+    if _wrong_degree_pdf_candidate_reason(url, title, snippet, plan):
+        return False, "wrong_degree_level_pdf"
     degree_score = float(score_components.get("degree_level_match", 0.0) or 0.0)
     if degree_score <= 0.0:
         return False, "wrong_degree_level"
@@ -2941,6 +3029,45 @@ def _language_candidate_priority(plan: QueryPlan, candidate: dict[str, Any]) -> 
     if "/bachelor-" in url:
         return -0.60
     return 0.0
+
+
+def _admission_pdf_candidate_priority(plan: QueryPlan, candidate: dict[str, Any]) -> float:
+    if plan.intent not in {
+        "standardized_test_lookup",
+        "eligibility_check",
+        "document_requirement_lookup",
+        "admission_requirement_lookup",
+    }:
+        return 0.0
+    if str(candidate.get("document_type", "")) != "pdf":
+        return 0.0
+    combined = (
+        f"{candidate.get('url', '')} {candidate.get('title', '')} {candidate.get('snippet', '')}"
+        .lower()
+    )
+    boost = 0.0
+    if any(term in combined for term in ("master", "msc", "m.sc", "phd", "doctoral")):
+        boost += 0.35
+    if any(
+        term in combined
+        for term in (
+            "supporting documents",
+            "application documents",
+            "required documents",
+            "admission requirements",
+            "selection regulations",
+            "beizufügende unterlagen",
+            "beizufuegende unterlagen",
+            "bewerbungsunterlagen",
+            "zulassungsvoraussetzungen",
+            "auswahlsatzung",
+            "zulassungsordnung",
+        )
+    ):
+        boost += 0.45
+    if any(term in combined for term in ("bachelor", "bsc", "b.sc", "ai_ba", "bachelor-ai")):
+        boost -= 0.80
+    return boost
 
 
 def _selected_has_strong_retrieval_signal(plan: QueryPlan, selected: list[dict[str, Any]]) -> bool:
@@ -3064,6 +3191,26 @@ def _student_page_rejection_reason(url: str, title: str, snippet: str, plan: Que
                 "international applicants",
             )
         )
+        if (
+            _is_pdf_url(url)
+            and plan.intent
+            in {"standardized_test_lookup", "eligibility_check", "document_requirement_lookup"}
+            and any(
+                term in combined
+                for term in (
+                    "supporting documents",
+                    "application documents",
+                    "required documents",
+                    "beizufügende unterlagen",
+                    "beizufuegende unterlagen",
+                    "bewerbungsunterlagen",
+                    "zulassungsvoraussetzungen",
+                    "selection regulations",
+                    "admission requirements",
+                )
+            )
+        ):
+            general_policy_match = True
         if (
             plan.intent == "language_requirement_lookup"
             and _domain_exactly_configured(domain, resolve_official_domains(plan))
@@ -3273,6 +3420,20 @@ def select_and_deduplicate_urls(
                         "tier": tier,
                     }
                 )
+                if debug_collector is not None and (_is_pdf_url(url) or query_type == "pdf"):
+                    debug_collector.setdefault("pdf_candidates", []).append(
+                        {
+                            "url": url,
+                            "title": title,
+                            "snippet": snippet[:300],
+                            "query": query,
+                            "tier": tier,
+                            "document_type": "pdf",
+                            "pdf_download_attempted": False,
+                            "pdf_download_success": False,
+                            "reason_if_pdf_skipped": tier_rejection,
+                        }
+                    )
                 continue
             skip_reason = _skip_reason_for_search_result(url, title, snippet, plan)
             if skip_reason:
@@ -3291,10 +3452,35 @@ def select_and_deduplicate_urls(
                         "tier": tier,
                     }
                 )
+                if debug_collector is not None and (_is_pdf_url(url) or query_type == "pdf"):
+                    debug_collector.setdefault("pdf_candidates", []).append(
+                        {
+                            "url": url,
+                            "title": title,
+                            "snippet": snippet[:300],
+                            "query": query,
+                            "tier": tier,
+                            "document_type": "pdf",
+                            "pdf_download_attempted": False,
+                            "pdf_download_success": False,
+                            "reason_if_pdf_skipped": skip_reason,
+                        }
+                    )
                 continue
             seen.add(url.lower())
             document_type = "pdf" if _is_pdf_url(url) or query_type == "pdf" else "html"
             source_quality, source_type = calculate_source_quality(url, document_type=document_type)
+            pdf_candidate_debug = {
+                "url": url,
+                "title": title,
+                "snippet": snippet[:300],
+                "query": query,
+                "tier": tier,
+                "document_type": document_type,
+                "pdf_download_attempted": False,
+                "pdf_download_success": False,
+                "reason_if_pdf_skipped": "",
+            }
             official_boost = 0.25 if source_quality >= 0.75 else 0.0
             pdf_boost = 0.10 if document_type == "pdf" else 0.0
             keyword_boost = (
@@ -3309,6 +3495,39 @@ def select_and_deduplicate_urls(
             page_type = classify_page_type(url, title, snippet)
             page_type_before_override = page_type
             degree_debug = _degree_signal_debug(url, title, snippet, plan)
+            wrong_degree_pdf_reason = (
+                _wrong_degree_pdf_candidate_reason(url, title, snippet, plan)
+                if document_type == "pdf"
+                else ""
+            )
+            if wrong_degree_pdf_reason:
+                logger.info(
+                    "UniGraph candidate rejected | url=%s | rejected_candidate_reason=%s | strong_official_candidate=false",
+                    url,
+                    wrong_degree_pdf_reason,
+                )
+                skipped.append(
+                    {
+                        "url": url,
+                        "reason": wrong_degree_pdf_reason,
+                        "strong_official_candidate": "false",
+                        "rejected_candidate_reason": wrong_degree_pdf_reason,
+                        "query": query,
+                        "tier": tier,
+                        "page_type": page_type,
+                        **degree_debug,
+                    }
+                )
+                if debug_collector is not None:
+                    pdf_candidate_debug.update(
+                        {
+                            "page_type": page_type,
+                            "reason_if_pdf_skipped": wrong_degree_pdf_reason,
+                            **degree_debug,
+                        }
+                    )
+                    debug_collector.setdefault("pdf_candidates", []).append(pdf_candidate_debug)
+                continue
             score_components = _url_score_components(
                 url,
                 title,
@@ -3370,7 +3589,23 @@ def select_and_deduplicate_urls(
                         )
                     )
                 )
-                if field_relevance < 0.08 and not likely_answer_page and not strong_official_candidate:
+                likely_answer_pdf = (
+                    document_type == "pdf"
+                    and plan.intent
+                    in {
+                        "standardized_test_lookup",
+                        "eligibility_check",
+                        "document_requirement_lookup",
+                    }
+                    and page_type in {"document_checklist_pdf", "official_policy_pdf"}
+                    and bool(degree_debug.get("final_degree_match", True))
+                )
+                if (
+                    field_relevance < 0.08
+                    and not likely_answer_page
+                    and not likely_answer_pdf
+                    and not strong_official_candidate
+                ):
                     logger.info(
                         "UniGraph candidate rejected | url=%s | rejected_candidate_reason=weak_field_relevance | strong_official_candidate=false",
                         url,
@@ -3385,6 +3620,17 @@ def select_and_deduplicate_urls(
                             "tier": tier,
                         }
                     )
+                    if debug_collector is not None and document_type == "pdf":
+                        pdf_candidate_debug.update(
+                            {
+                                "page_type": page_type,
+                                "reason_if_pdf_skipped": "weak_field_relevance",
+                                **degree_debug,
+                            }
+                        )
+                        debug_collector.setdefault("pdf_candidates", []).append(
+                            pdf_candidate_debug
+                        )
                     continue
             if float(score_components["degree_level_match"]) <= 0.0:
                 logger.info(
@@ -3402,6 +3648,15 @@ def select_and_deduplicate_urls(
                         "page_type": page_type,
                     }
                 )
+                if debug_collector is not None and document_type == "pdf":
+                    pdf_candidate_debug.update(
+                        {
+                            "page_type": page_type,
+                            "reason_if_pdf_skipped": "wrong_degree_level",
+                            **degree_debug,
+                        }
+                    )
+                    debug_collector.setdefault("pdf_candidates", []).append(pdf_candidate_debug)
                 continue
             min_url_score = 0.46 if tier.startswith("tier1") or tier == "legacy" else 0.50
             if tier == "tier3":
@@ -3423,6 +3678,16 @@ def select_and_deduplicate_urls(
                         "url_score": str(round(float(score_components["url_score"]), 4)),
                     }
                 )
+                if debug_collector is not None and document_type == "pdf":
+                    pdf_candidate_debug.update(
+                        {
+                            "page_type": page_type,
+                            "reason_if_pdf_skipped": "low_url_score",
+                            "url_score": str(round(float(score_components["url_score"]), 4)),
+                            **degree_debug,
+                        }
+                    )
+                    debug_collector.setdefault("pdf_candidates", []).append(pdf_candidate_debug)
                 continue
             logger.info(
                 "UniGraph candidate accepted | url=%s | strong_official_candidate=%s | accepted_candidate_reason=%s | fetched_before_field_match=%s",
@@ -3482,9 +3747,26 @@ def select_and_deduplicate_urls(
                     + _language_candidate_priority(plan, {
                         "url": url,
                         "page_type": page_type,
+                    })
+                    + _admission_pdf_candidate_priority(plan, {
+                        "url": url,
+                        "title": title,
+                        "snippet": snippet,
+                        "document_type": document_type,
                     }),
                 }
             )
+            if debug_collector is not None and document_type == "pdf":
+                pdf_candidate_debug.update(
+                    {
+                        "page_type": page_type,
+                        "reason_if_pdf_skipped": "",
+                        "source_type": source_type,
+                        "source_quality": source_quality,
+                        **degree_debug,
+                    }
+                )
+                debug_collector.setdefault("pdf_candidates", []).append(pdf_candidate_debug)
     candidates.sort(
         key=lambda item: (float(item["score"]), float(item["source_quality"])), reverse=True
     )
@@ -3669,18 +3951,28 @@ def _pdf_page_has_signal(text: str, plan: QueryPlan | None) -> bool:
 
 def _extract_pdf_pages(
     path: str, url: str, plan: QueryPlan | None = None, max_pages: int | None = None
-) -> list[ExtractedPage]:
+) -> tuple[list[ExtractedPage], dict[str, Any]]:
+    stats: dict[str, Any] = {
+        "pdf_pages_total": 0,
+        "pdf_pages_read": 0,
+        "pdf_chunks_created": 0,
+        "pdf_extraction_error": "",
+        "reason_if_pdf_skipped": "",
+    }
     if pdfplumber is None:
         logger.warning("UniGraph PDF extraction skipped; pdfplumber is unavailable.")
-        return []
+        stats["reason_if_pdf_skipped"] = "pdfplumber_unavailable"
+        return [], stats
     pages: list[ExtractedPage] = []
     with pdfplumber.open(path) as pdf:
+        stats["pdf_pages_total"] = len(pdf.pages)
         preview_text_parts: list[str] = []
         for page in pdf.pages[:2]:
             preview_text_parts.append(page.extract_text() or "")
         if plan is not None and not _pdf_page_has_signal(" ".join(preview_text_parts), plan):
             logger.info("UniGraph PDF rejected after preview | url=%s", url)
-            return []
+            stats["reason_if_pdf_skipped"] = "preview_missing_requested_signal"
+            return [], stats
         page_limit = max_pages or MAX_PDF_PAGES
         for index, page in enumerate(pdf.pages[:page_limit], start=1):
             parts: list[str] = []
@@ -3710,18 +4002,28 @@ def _extract_pdf_pages(
                         table_count=len(tables),
                     )
                 )
+        stats["pdf_pages_read"] = len(pages)
+        stats["pdf_chunks_created"] = sum(len(chunk_text(page.text)) for page in pages)
     logger.info(
         "UniGraph PDF read | url=%s | pdf_extractor_used=pdfplumber | pages=%s | table_pages=%s",
         url,
         len(pages),
         sum(1 for page in pages if page.table_count),
     )
-    return pages
+    return pages, stats
 
 
 def _pdf_prefetch_rejection_reason(url_info: dict[str, Any], plan: QueryPlan | None) -> str:
     if plan is None:
         return ""
+    wrong_degree_reason = _wrong_degree_pdf_candidate_reason(
+        str(url_info.get("url", "")),
+        str(url_info.get("title", "")),
+        str(url_info.get("snippet", "")),
+        plan,
+    )
+    if wrong_degree_reason:
+        return wrong_degree_reason
     page_type = str(
         url_info.get("page_type")
         or classify_page_type(
@@ -3749,29 +4051,45 @@ async def extract_pdf_content(
     debug_collector: dict[str, Any] | None = None,
 ) -> ExtractedContent | None:
     url = str(url_info["url"])
+    pipeline_entry: dict[str, Any] = {
+        "url": url,
+        "pdf_download_attempted": False,
+        "pdf_download_success": False,
+        "pdf_file_size": 0,
+        "pdf_pages_total": 0,
+        "pdf_pages_read": 0,
+        "pdf_extractor_used": "pdfplumber" if pdfplumber is not None else "unavailable",
+        "pdf_extraction_error": "",
+        "pdf_chunks_created": 0,
+        "reason_if_pdf_skipped": "",
+        "full_pdf_sent_to_llm": False,
+    }
     rejection_reason = _pdf_prefetch_rejection_reason(url_info, plan)
     if rejection_reason:
+        pipeline_entry["reason_if_pdf_skipped"] = rejection_reason
         if debug_collector is not None:
             debug_collector.setdefault("rejected_pdfs", []).append(
                 {"url": url, "reason": rejection_reason, "stage": "pre_download"}
             )
             debug_collector.setdefault("pdf_pipeline", []).append(
-                {
-                    "url": url,
-                    "pdf_extractor_used": "pdfplumber" if pdfplumber is not None else "unavailable",
-                    "status": "rejected_pre_download",
-                    "reason": rejection_reason,
-                }
+                {**pipeline_entry, "status": "rejected_pre_download", "reason": rejection_reason}
             )
         return None
 
-    def _read_pdf() -> list[ExtractedPage]:
+    def _read_pdf() -> tuple[list[ExtractedPage], dict[str, Any]]:
+        stats: dict[str, Any] = {}
+        stats["pdf_download_attempted"] = True
         path = _download_pdf_to_temp(url)
         if not path:
-            return []
+            stats["reason_if_pdf_skipped"] = "download_failed_or_not_pdf"
+            return [], stats
         try:
+            stats["pdf_download_success"] = True
+            stats["pdf_file_size"] = os.path.getsize(path)
             max_pages = _mode_limit(plan, "max_pdf_pages", MAX_PDF_PAGES) if plan else MAX_PDF_PAGES
-            return _extract_pdf_pages(path, url, plan=plan, max_pages=max_pages)
+            pages, extract_stats = _extract_pdf_pages(path, url, plan=plan, max_pages=max_pages)
+            stats.update(extract_stats)
+            return pages, stats
         finally:
             try:
                 os.unlink(path)
@@ -3779,27 +4097,32 @@ async def extract_pdf_content(
                 pass
 
     try:
-        pages = await asyncio.to_thread(_read_pdf)
+        pages, pdf_stats = await asyncio.to_thread(_read_pdf)
+        pipeline_entry.update(pdf_stats)
     except Exception as exc:
         logger.warning("UniGraph PDF extraction failed | url=%s | error=%s", url, exc)
+        pipeline_entry["pdf_extraction_error"] = str(exc)
+        pipeline_entry["reason_if_pdf_skipped"] = "pdf_extraction_exception"
+        if debug_collector is not None:
+            debug_collector.setdefault("pdf_pipeline", []).append(
+                {**pipeline_entry, "status": "failed", "reason": "pdf_extraction_exception"}
+            )
         return None
     if not pages:
+        reason = str(pipeline_entry.get("reason_if_pdf_skipped") or "no_relevant_pdf_pages_extracted")
+        pipeline_entry["reason_if_pdf_skipped"] = reason
         if debug_collector is not None:
             debug_collector.setdefault("rejected_pdfs", []).append(
-                {"url": url, "reason": "no_relevant_pdf_pages_extracted", "stage": "post_download"}
+                {"url": url, "reason": reason, "stage": "post_download"}
             )
             debug_collector.setdefault("pdf_pipeline", []).append(
-                {
-                    "url": url,
-                    "pdf_extractor_used": "pdfplumber" if pdfplumber is not None else "unavailable",
-                    "status": "rejected_post_download",
-                    "reason": "no_relevant_pdf_pages_extracted",
-                }
+                {**pipeline_entry, "status": "rejected_post_download", "reason": reason}
             )
         return None
     if debug_collector is not None:
         debug_collector.setdefault("pdf_pipeline", []).append(
             {
+                **pipeline_entry,
                 "url": url,
                 "pdf_extractor_used": "pdfplumber",
                 "status": "extracted",
@@ -3949,11 +4272,25 @@ def _chunk_debug_payload(chunk: EvidenceChunk) -> dict[str, Any]:
 def chunk_text(
     text: str, *, chunk_chars: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP
 ) -> list[str]:
-    text = _compact(text)
+    raw_text = str(text or "")
+    table_row_chunks = [
+        _compact(match.group(0))
+        for match in re.finditer(
+            r"\[Table\s+\d+\s+Row\s+\d+\].*?(?=\s*\[Table\s+\d+\s+Row\s+\d+\]|$)",
+            raw_text,
+            flags=re.I | re.S,
+        )
+    ]
+    table_row_chunks = [
+        row[:chunk_chars]
+        for row in table_row_chunks
+        if 20 <= len(row) <= max(chunk_chars * 2, 1200)
+    ]
+    text = _compact(raw_text)
     if not text:
         return []
     if len(text) <= chunk_chars:
-        return [text]
+        return list(dict.fromkeys([*table_row_chunks, text]))
     chunks: list[str] = []
     start = 0
     while start < len(text):
@@ -3968,7 +4305,7 @@ def chunk_text(
         if end >= len(text):
             break
         start = max(end - overlap, start + 1)
-    return chunks
+    return list(dict.fromkeys([*table_row_chunks, *chunks]))
 
 
 def _section_keywords(section: str, plan: QueryPlan) -> list[str]:
@@ -5096,6 +5433,7 @@ def build_evidence_packet(
 
     packet = {
         "intent": plan.intent,
+        "user_question": plan.user_intent,
         "query_mode": plan.query_mode,
         "university": plan.university,
         "program": plan.program,
@@ -5560,6 +5898,46 @@ def _raw_span_rendered(answer: str) -> bool:
     return _has_bad_final_answer_output(answer)
 
 
+def _field_requested_by_question(field_name: str, question: str) -> bool:
+    lowered = str(question or "").lower()
+    if not lowered:
+        return False
+    field_terms = [field_name.replace("_", " "), *FIELD_KEYWORDS.get(field_name, [])]
+    return any(term and term.lower() in lowered for term in field_terms)
+
+
+def _final_answer_allowed_fields(packet: dict[str, Any], question: str) -> set[str]:
+    required = packet.get("required_fields", {})
+    if isinstance(required, dict):
+        allowed = set(required.keys())
+    elif isinstance(required, list):
+        allowed = {str(item) for item in required if str(item).strip()}
+    else:
+        allowed = set()
+    intent = str(packet.get("intent", ""))
+    narrow_intents = {
+        "deadline_lookup",
+        "language_requirement_lookup",
+        "tuition_fee_lookup",
+        "document_requirement_lookup",
+        "application_portal_lookup",
+        "program_existence_lookup",
+        "standardized_test_lookup",
+        "curriculum_lookup",
+    }
+    if intent not in narrow_intents:
+        answered = packet.get("answered_fields", {})
+        if isinstance(answered, dict):
+            allowed.update(answered.keys())
+        return allowed
+    answered = packet.get("answered_fields", {})
+    if isinstance(answered, dict):
+        for field_name in answered.keys():
+            if _field_requested_by_question(str(field_name), question):
+                allowed.add(str(field_name))
+    return allowed
+
+
 def _clean_final_answer_packet(packet: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(packet, dict):
         return {}
@@ -5587,6 +5965,8 @@ def _clean_final_answer_packet(packet: dict[str, Any]) -> dict[str, Any]:
             "scope": str(entry.get("scope", "")),
         }
 
+    question = str(packet.get("user_question", ""))
+    allowed_fields = _final_answer_allowed_fields(packet, question)
     answered = packet.get("answered_fields", {})
     answered = answered if isinstance(answered, dict) else {}
     missing = packet.get("missing_fields", {})
@@ -5602,11 +5982,12 @@ def _clean_final_answer_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "answered_fields": {
             field: _clean_entry(entry)
             for field, entry in answered.items()
-            if isinstance(entry, dict)
+            if isinstance(entry, dict) and (not allowed_fields or field in allowed_fields)
         },
         "missing_fields": {
             field: _natural_missing_answer(field)
             for field in missing.keys()
+            if not allowed_fields or field in allowed_fields
         },
         "excluded_fields": packet.get("excluded_fields", []),
         "deduplicated_fields": packet.get("deduplicated_fields", {}),
@@ -5658,6 +6039,8 @@ async def generate_answer(
         for chunk in evidence_chunks:
             grouped_from_chunks.setdefault(chunk.field or chunk.section, []).append(chunk)
         packet, _packet_chunks = build_evidence_packet(grouped_from_chunks, plan)
+    if isinstance(packet, dict):
+        packet.setdefault("user_question", query)
     if not evidence_chunks and not packet.get("answered_fields"):
         missing = field_missing_reasons or {
             field: _missing_reason_for_field(field, {})
@@ -5704,6 +6087,9 @@ Rules:
 10. Use checklist only for document questions.
 11. Use table only for comparison questions.
 12. Cite the evidence beside factual claims.
+13. Treat the normalized evidence packet as already filtered. Do not add curriculum,
+funding, deadlines, fees, documents, or language sections unless those fields are
+present in answered_fields or directly requested in missing_fields.
 
 Intent formatting:
 - deadline_lookup: one short paragraph with only the deadline/application period.
@@ -6244,6 +6630,7 @@ async def research_university_question(query: str) -> ResearchResult:
         "skipped_urls": debug_collector.get("skipped_urls", []),
         "rejected_urls_with_reasons": debug_collector.get("skipped_urls", []),
         "rejected_pdfs": debug_collector.get("rejected_pdfs", []),
+        "pdf_candidates": debug_collector.get("pdf_candidates", []),
         "early_stop_triggered": debug_collector.get("early_stop_triggered", False),
         "urls_fetched": [item.url for item in extracted],
         "fetched_urls": [item.url for item in extracted],

@@ -594,6 +594,60 @@ def test_fau_language_retrieval_rejects_bachelor_module_pdf_and_research_pages()
     assert "non_student_or_research_page" in reasons
 
 
+def test_gre_pdf_selection_rejects_bsc_and_prefers_master_supporting_documents():
+    plan = service._fallback_plan("Does MSc Artificial Intelligence at FAU require GRE?")
+    rows = [
+        {
+            "query": 'site:fau.de "MSc Artificial Intelligence" "GRE"',
+            "type": "tier1_pdf",
+            "priority": 1.0,
+            "results": [
+                {
+                    "title": "[PDF] Bachelor of Science Artificial Intelligence",
+                    "link": "https://tf.fau.de/AI_BA/supporting-documents.pdf",
+                    "snippet": "Bachelor application documents GRE GMAT Artificial Intelligence",
+                },
+                {
+                    "title": "[PDF] Master/PhD Supporting Documents",
+                    "link": "https://www.ai.study.fau.eu/fileadmin/ai/Beizufuegende_Unterlagen_Master_PhD.pdf",
+                    "snippet": (
+                        "Beizufügende Unterlagen Master PhD application documents "
+                        "admission requirements GRE GMAT"
+                    ),
+                },
+            ],
+        }
+    ]
+    debug = {}
+
+    selected = service.select_and_deduplicate_urls(
+        rows,
+        plan,
+        debug_collector=debug,
+        tier="tier1c_official_pdfs",
+        allowed_domains=service.resolve_official_domains(plan),
+        allow_secondary=False,
+        allow_third_party=False,
+    )
+
+    assert [item["url"] for item in selected] == [
+        "https://www.ai.study.fau.eu/fileadmin/ai/Beizufuegende_Unterlagen_Master_PhD.pdf"
+    ]
+    assert selected[0]["document_type"] == "pdf"
+    assert selected[0]["page_type"] == "document_checklist_pdf"
+    assert selected[0]["final_degree_match"] is True
+    assert any(
+        item["url"].endswith("/AI_BA/supporting-documents.pdf")
+        and item["reason"] == "wrong_degree_level_pdf"
+        for item in debug["skipped_urls"]
+    )
+    assert any(
+        item["url"].endswith("/AI_BA/supporting-documents.pdf")
+        and item["reason_if_pdf_skipped"] == "wrong_degree_level_pdf"
+        for item in debug["pdf_candidates"]
+    )
+
+
 def test_fau_language_retrieval_accepts_master_ai_program_language_pages():
     plan = service._fallback_plan(
         "What are the IELTS requirements for MSc Artificial Intelligence at FAU?"
@@ -2624,3 +2678,55 @@ async def test_research_debug_records_pdf_pipeline_and_selected_pdf_chunks(monke
     assert result.debug_info["pdf_pipeline"][0]["full_pdf_sent_to_llm"] is False
     assert result.debug_info["selected_pdf_chunks"][0]["page_number"] == 7
     assert result.debug_info["selected_pdf_chunks"][0]["field"] == "gre_gmat_requirement"
+
+
+@pytest.mark.asyncio
+async def test_pdf_extraction_logs_download_pages_and_chunks(monkeypatch, tmp_path):
+    plan = service._fallback_plan("Does MSc Artificial Intelligence at FAU require GRE?")
+    url_info = {
+        "url": "https://www.ai.study.fau.eu/fileadmin/ai/Beizufuegende_Unterlagen_Master_PhD.pdf",
+        "title": "Master/PhD Supporting Documents",
+        "source_type": "official_university_pdf",
+        "source_quality": 0.95,
+        "query": "q",
+    }
+    debug = {}
+    fake_pdf = tmp_path / "download.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake")
+
+    monkeypatch.setattr(service, "_download_pdf_to_temp", lambda _url: str(fake_pdf))
+
+    def _fake_extract_pdf_pages(*_args, **_kwargs):
+        pages = [
+            service.ExtractedPage(
+                text="[Table 1 Row 2] MSc Artificial Intelligence | GRE | not required",
+                page_number=4,
+                extraction_method="pdfplumber",
+                table_count=1,
+            )
+        ]
+        return pages, {
+            "pdf_pages_total": 9,
+            "pdf_pages_read": 1,
+            "pdf_chunks_created": 1,
+            "pdf_extraction_error": "",
+            "reason_if_pdf_skipped": "",
+        }
+
+    monkeypatch.setattr(service, "_extract_pdf_pages", _fake_extract_pdf_pages)
+
+    extracted = await service.extract_pdf_content(
+        url_info, plan=plan, debug_collector=debug
+    )
+
+    assert extracted is not None
+    entry = debug["pdf_pipeline"][0]
+    assert entry["pdf_download_attempted"] is True
+    assert entry["pdf_download_success"] is True
+    assert entry["pdf_file_size"] > 0
+    assert entry["pdf_pages_total"] == 9
+    assert entry["pdf_pages_read"] == 1
+    assert entry["pdf_extractor_used"] == "pdfplumber"
+    assert entry["pdf_extraction_error"] == ""
+    assert entry["pdf_chunks_created"] == 1
+    assert entry["reason_if_pdf_skipped"] == ""
