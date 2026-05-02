@@ -1220,12 +1220,44 @@ def test_multi_program_discovery_intent_uses_limited_shortlist_fields():
         "Suggest German AI master's programs where IELTS 6.5 is likely accepted."
     )
 
-    assert plan.intent == "multi_program_discovery"
+    assert plan.intent == "discovery_lookup"
     assert plan.query_mode == "discovery_lookup"
     assert "program_shortlist" in plan.required_fields
     assert "english_language_requirement" in plan.required_fields
     assert "tuition_fee" in plan.excluded_fields
     assert len(plan.search_queries) <= service.QUERY_MODE_LIMITS["discovery_lookup"]["max_queries"]
+
+
+def test_general_intent_taxonomy_uses_canonical_user_question_intents():
+    assert (
+        service._fallback_plan("Compare MSc Informatics at TUM vs FAU for tuition.").intent
+        == "comparison_lookup"
+    )
+    assert (
+        service._fallback_plan("Does TU Munich offer MSc Informatics?").intent
+        == "program_existence_lookup"
+    )
+    assert (
+        service._fallback_plan("Give me an overview of MSc Informatics at TU Munich.").intent
+        == "general_program_overview"
+    )
+    assert (
+        service._fallback_plan("Is GRE required for MSc Informatics at TU Munich?").intent
+        == "standardized_test_lookup"
+    )
+
+
+def test_comparison_intent_builds_entity_specific_queries():
+    query = "Compare MSc Informatics at TUM vs MSc Artificial Intelligence at FAU for tuition."
+    plan = service._fallback_plan(query)
+    queries = service._build_search_queries(plan, query)
+    query_text = " ".join(item["query"] for item in queries)
+
+    assert plan.intent == "comparison_lookup"
+    assert plan.user_profile_details["comparison_entities"]
+    assert "MSc Informatics at TUM" in query_text
+    assert "MSc Artificial Intelligence at FAU" in query_text
+    assert all(item["type"] in {"comparison_lookup", "pdf"} for item in queries)
 
 
 def test_fast_lookup_uses_tight_query_and_url_limits():
@@ -1605,6 +1637,38 @@ async def test_deadline_evidence_is_normalized_and_deduplicated_before_answer():
     assert "not verified" not in answer.lower()
 
 
+def test_optional_missing_fields_do_not_make_required_answer_incomplete():
+    plan = service._fallback_plan(
+        "When is the winter semester application deadline for MSc Informatics at TU Munich?"
+    )
+    grouped = {
+        "application_deadline": [
+            service.EvidenceChunk(
+                text="Winter semester: 01 February - 31 May",
+                url="https://www.cit.tum.de/en/cit/studies/degree-programs/master-informatics",
+                title="Master Informatics",
+                domain="cit.tum.de",
+                source_type="official_university_page",
+                document_type="html",
+                retrieved_at="2026-05-01T00:00:00+00:00",
+                query="q",
+                score=0.95,
+                section="application_deadline",
+                field="application_deadline",
+                support_level="direct",
+                evidence_scope="program_specific",
+                scoring={"source_quality": 0.95},
+            )
+        ]
+    }
+
+    packet, _selected = service.build_evidence_packet(grouped, plan)
+
+    assert packet["field_completeness_status"] == "complete"
+    assert packet["missing_requested_fields"] == {}
+    assert "intake_or_semester" not in packet["missing_fields"]
+
+
 @pytest.mark.asyncio
 async def test_deadline_answer_formats_visa_recommended_and_compulsory_dates():
     query = "When is the winter semester application deadline for MSc Informatics at TU Munich?"
@@ -1717,6 +1781,74 @@ def test_program_specific_indirect_source_beats_faculty_general_direct_source():
     )
 
     assert service._field_priority_chunk([general_chunk, program_chunk]) is program_chunk
+
+
+def test_official_program_source_beats_daad_and_generic_sources():
+    program_chunk = service.EvidenceChunk(
+        text="MSc Data Science applicants need English language proficiency.",
+        url="https://www.uni-mannheim.de/en/academics/programs/msc-data-science/",
+        title="MSc Data Science",
+        domain="uni-mannheim.de",
+        source_type="official_university_page",
+        document_type="html",
+        retrieved_at="2026-05-01T00:00:00+00:00",
+        query="q",
+        score=0.65,
+        section="english_language_requirement",
+        field="english_language_requirement",
+        support_level="indirect",
+        evidence_scope="program_specific",
+        scoring={"source_quality": 0.9},
+    )
+    daad_chunk = service.EvidenceChunk(
+        text="DAAD MSc Data Science English B2.",
+        url="https://www2.daad.de/deutschland/studienangebote/international-programmes/en/detail/1/",
+        title="DAAD MSc Data Science",
+        domain="www2.daad.de",
+        source_type="daad",
+        document_type="html",
+        retrieved_at="2026-05-01T00:00:00+00:00",
+        query="q",
+        score=0.99,
+        section="english_language_requirement",
+        field="english_language_requirement",
+        support_level="direct",
+        evidence_scope="DAAD",
+        scoring={"source_quality": 0.95},
+    )
+    generic_chunk = service.EvidenceChunk(
+        text="Faculty language page mentions TOEFL.",
+        url="https://www.uni-mannheim.de/en/academics/language-requirements/",
+        title="Faculty Language Requirements",
+        domain="uni-mannheim.de",
+        source_type="official_university_page",
+        document_type="html",
+        retrieved_at="2026-05-01T00:00:00+00:00",
+        query="q",
+        score=0.97,
+        section="english_language_requirement",
+        field="english_language_requirement",
+        support_level="direct",
+        evidence_scope="faculty_general",
+        scoring={"source_quality": 0.95},
+    )
+
+    assert service._field_priority_chunk([daad_chunk, generic_chunk, program_chunk]) is program_chunk
+
+
+def test_document_item_extraction_covers_general_application_checklists():
+    text = (
+        "Required documents: online application, transcript of records, degree certificate, "
+        "CV, letter of motivation, proof of language proficiency, passport, APS, VPD."
+    )
+
+    items = service._extract_document_items(text)
+
+    assert "transcript" in items
+    assert "degree certificate" in items
+    assert "CV" in items
+    assert "proof of language proficiency" in items
+    assert "passport" in items
 
 
 def test_evidence_scope_rejects_wrong_program_chunks():
@@ -2417,3 +2549,78 @@ async def test_research_debug_records_final_answer_source_flags(monkeypatch):
     assert result.debug_info["final_answer_source"] == "llm_synthesis"
     assert result.debug_info["final_prompt_used"] is True
     assert result.debug_info["raw_span_rendered"] is False
+    assert "source_priority_used" in result.debug_info
+    assert result.debug_info["selected_source_scope"] == ["program_specific_official"]
+    assert result.debug_info["daad_decision"] == "not_available"
+    assert result.debug_info["generic_page_decision"] == "not_available"
+    assert "missing_requested_fields" in result.debug_info
+
+
+@pytest.mark.asyncio
+async def test_research_debug_records_pdf_pipeline_and_selected_pdf_chunks(monkeypatch):
+    query = "Is GRE required for MSc Informatics at TU Munich?"
+    plan = service._fallback_plan(query)
+    chunk = service.EvidenceChunk(
+        text="GRE or GMAT is not required for admission.",
+        url="https://www.tum.de/admission-regulations.pdf",
+        title="Admission Regulations",
+        domain="tum.de",
+        source_type="official_university_pdf",
+        document_type="pdf",
+        retrieved_at="2026-05-01T00:00:00+00:00",
+        query="q",
+        score=0.95,
+        section="gre_gmat_requirement",
+        field="gre_gmat_requirement",
+        page_number=7,
+        support_level="direct",
+        evidence_scope="program_specific",
+        row_or_section="page:7",
+        scoring={"source_quality": 0.95},
+    )
+
+    async def _fake_analyze(_query):
+        return plan
+
+    async def _fake_execute(*_args, **_kwargs):
+        return [], [], 0, {}
+
+    async def _fake_extract(*_args, debug_collector=None, **_kwargs):
+        debug_collector.setdefault("pdf_pipeline", []).append(
+            {
+                "url": "https://www.tum.de/admission-regulations.pdf",
+                "pdf_extractor_used": "pdfplumber",
+                "status": "extracted",
+                "pages_extracted": [{"page_number": 7, "table_count": 1, "chars": 120}],
+                "full_pdf_sent_to_llm": False,
+            }
+        )
+        return []
+
+    def _fake_group(*_args, **_kwargs):
+        return {"gre_gmat_requirement": [chunk]}
+
+    async def _fake_generate(*_args, answer_metadata=None, **_kwargs):
+        answer_metadata.update(
+            {
+                "final_answer_source": "llm_synthesis",
+                "final_prompt_used": True,
+                "raw_span_rendered": False,
+            }
+        )
+        return "For MSc Informatics at TUM, the retrieved official evidence says GRE or GMAT is not required."
+
+    monkeypatch.setattr(service, "analyze_query", _fake_analyze)
+    monkeypatch.setattr(service, "execute_tiered_retrieval", _fake_execute)
+    monkeypatch.setattr(service, "extract_all_contents", _fake_extract)
+    monkeypatch.setattr(service, "group_and_rank_evidence", _fake_group)
+    monkeypatch.setattr(service, "generate_answer", _fake_generate)
+
+    result = await service.research_university_question(query)
+
+    assert result.debug_info["detected_intent"] == "standardized_test_lookup"
+    assert result.debug_info["pdf_extractor_used"] in {"pdfplumber", "unavailable"}
+    assert result.debug_info["pdf_pipeline"][0]["pdf_extractor_used"] == "pdfplumber"
+    assert result.debug_info["pdf_pipeline"][0]["full_pdf_sent_to_llm"] is False
+    assert result.debug_info["selected_pdf_chunks"][0]["page_number"] == 7
+    assert result.debug_info["selected_pdf_chunks"][0]["field"] == "gre_gmat_requirement"

@@ -234,6 +234,26 @@ INTENT_CHUNK_GATES: dict[str, dict[str, tuple[str, ...]]] = {
             "documents",
         ),
     },
+    "standardized_test_lookup": {
+        "allow": (
+            "gre",
+            "gmat",
+            "standardized test",
+            "aptitude test",
+            "testas",
+            "sat",
+            "act",
+        ),
+        "exclude": (
+            "deadline",
+            "application period",
+            "tuition",
+            "semester contribution",
+            "curriculum",
+            "module handbook",
+            "documents",
+        ),
+    },
 }
 GERMAN_UNIVERSITY_FOCUS = True
 AMBIGUOUS_GERMAN_UNIVERSITIES = {
@@ -497,6 +517,15 @@ INTENT_EXTRACT_TERMS: dict[str, list[str]] = {
         "Modulhandbuch",
         "Studienplan",
     ],
+    "standardized_test_lookup": [
+        "GRE",
+        "GMAT",
+        "standardized test",
+        "aptitude test",
+        "TestAS",
+        "Graduate Record Examination",
+        "Graduate Management Admission Test",
+    ],
 }
 
 INTENT_PROFILES: dict[str, dict[str, list[str]]] = {
@@ -557,6 +586,21 @@ INTENT_PROFILES: dict[str, dict[str, list[str]]] = {
         "optional": ["semester_contribution", "applicant_category"],
         "excluded": ["ielts_score", "gpa_requirement", "curriculum_modules"],
     },
+    "standardized_test_lookup": {
+        "required": ["gre_gmat_requirement"],
+        "optional": ["admission_restrictions"],
+        "excluded": [
+            "application_deadline",
+            "tuition_fee",
+            "semester_contribution",
+            "english_language_requirement",
+            "ielts_score",
+            "toefl_score",
+            "gpa_requirement",
+            "required_application_documents",
+            "curriculum_modules",
+        ],
+    },
     "admission_requirement_lookup": {
         "required": ["academic_eligibility", "required_degree_background"],
         "optional": ["gpa_requirement", "english_language_requirement", "admission_restrictions"],
@@ -594,6 +638,47 @@ INTENT_PROFILES: dict[str, dict[str, list[str]]] = {
             "application_deadline",
         ],
     },
+    "program_existence_lookup": {
+        "required": ["general_information"],
+        "optional": ["teaching_language", "program_duration"],
+        "excluded": [
+            "application_deadline",
+            "tuition_fee",
+            "semester_contribution",
+            "ielts_score",
+            "gpa_requirement",
+            "required_application_documents",
+            "curriculum_modules",
+        ],
+    },
+    "comparison_lookup": {
+        "required": ["general_information"],
+        "optional": [
+            "teaching_language",
+            "application_deadline",
+            "tuition_fee",
+            "semester_contribution",
+            "english_language_requirement",
+            "program_duration",
+        ],
+        "excluded": [],
+    },
+    "discovery_lookup": {
+        "required": ["program_shortlist", "english_language_requirement"],
+        "optional": ["ielts_score", "toefl_score", "duolingo_score", "teaching_language"],
+        "excluded": [
+            "tuition_fee",
+            "application_deadline",
+            "required_application_documents",
+            "gpa_requirement",
+            "curriculum_modules",
+        ],
+    },
+    "general_program_overview": {
+        "required": ["teaching_language", "program_duration"],
+        "optional": ["tuition_fee", "application_deadline"],
+        "excluded": ["required_application_documents"],
+    },
     "multi_program_discovery": {
         "required": ["program_shortlist", "english_language_requirement"],
         "optional": ["ielts_score", "toefl_score", "duolingo_score", "teaching_language"],
@@ -615,6 +700,14 @@ INTENT_PROFILES: dict[str, dict[str, list[str]]] = {
         "optional": [],
         "excluded": [],
     },
+}
+
+INTENT_ALIASES = {
+    "multi_program_discovery": "discovery_lookup",
+    "program_overview_lookup": "general_program_overview",
+    "general_university_question": "general_program_overview",
+    "admission_requirement_lookup": "eligibility_check",
+    "application_process_lookup": "application_portal_lookup",
 }
 
 KNOWN_UNIVERSITIES: dict[str, dict[str, Any]] = {
@@ -746,7 +839,7 @@ class QueryPlan:
     country: str = ""
     degree_level: str = ""
     user_intent: str = ""
-    intent: str = "general_university_question"
+    intent: str = "general_program_overview"
     required_info: list[str] = field(default_factory=list)
     required_fields: list[str] = field(default_factory=list)
     optional_fields: list[str] = field(default_factory=list)
@@ -767,6 +860,8 @@ class QueryPlan:
 class ExtractedPage:
     text: str
     page_number: int | None = None
+    extraction_method: str = ""
+    table_count: int = 0
 
 
 @dataclass
@@ -918,6 +1013,8 @@ def _query_mentions_language_requirement(query: str) -> bool:
 
 def _normalize_field_name(value: Any) -> str:
     normalized = _compact(value).lower().replace("/", "_").replace("-", "_").replace(" ", "_")
+    if any(term in normalized for term in ("gre", "gmat", "standardized", "standardised", "testas")):
+        return "gre_gmat_requirement"
     if any(term in normalized for term in ("deadline", "bewerbungsfrist", "bewerbungszeitraum")):
         if "summer" in normalized:
             return "other_semester_deadline"
@@ -986,6 +1083,8 @@ def _field_terms(field_name: str, plan: QueryPlan | None = None) -> list[str]:
         terms += INTENT_EXTRACT_TERMS["application_portal_lookup"]
     elif field_name == "curriculum_modules":
         terms += INTENT_EXTRACT_TERMS["curriculum_lookup"]
+    elif field_name == "gre_gmat_requirement":
+        terms += INTENT_EXTRACT_TERMS["standardized_test_lookup"]
     if plan is not None:
         terms += plan.keywords + plan.german_keywords
     return list(dict.fromkeys([term.lower() for term in terms if _compact(term)]))
@@ -1033,9 +1132,31 @@ def _detect_degree_level(query: str) -> str:
     return ""
 
 
+def _comparison_entities_from_query(query: str) -> list[str]:
+    text = _compact(query)
+    if not re.search(r"\b(compare|comparison|versus|vs\.?|between)\b", text, re.I):
+        return []
+    normalized = re.sub(r"\bversus\b|\bvs\.?\b", " vs ", text, flags=re.I)
+    pieces = re.split(r"\s+vs\s+|\s+versus\s+|\s+and\s+", normalized, flags=re.I)
+    entities: list[str] = []
+    for piece in pieces:
+        candidate = re.sub(r"^\s*(?:compare|comparison of|between)\s+", "", piece, flags=re.I)
+        candidate = re.sub(
+            r"\b(?:for|on)\s+(?:tuition|fees?|language|deadline|documents?|eligibility|curriculum|gre|gmat).*$",
+            "",
+            candidate,
+            flags=re.I,
+        )
+        candidate = _compact(candidate.strip(" ?.,;:"))
+        if re.search(r"\b(university|tu |tum|fau|rwth|kit|msc|master|bsc|bachelor|program)\b", candidate, re.I):
+            entities.append(candidate)
+    return list(dict.fromkeys(entity for entity in entities if len(entity) >= 5))[:4]
+
+
 def _infer_query_mode(query: str, intent: str, required_fields: list[str]) -> str:
     lowered = str(query or "").lower()
-    if intent == "multi_program_discovery" or re.search(
+    intent = _canonical_intent(intent)
+    if intent in {"discovery_lookup", "comparison_lookup"} or re.search(
         r"\b(suggest|recommend|shortlist|compare|which programs?|which universities?)\b",
         lowered,
     ):
@@ -1043,8 +1164,8 @@ def _infer_query_mode(query: str, intent: str, required_fields: list[str]) -> st
     if intent in {
         "eligibility_check",
         "document_requirement_lookup",
-        "admission_requirement_lookup",
-        "program_overview_lookup",
+        "general_program_overview",
+        "program_existence_lookup",
     }:
         return "research_lookup"
     if len(required_fields or []) >= 4:
@@ -1192,10 +1313,19 @@ def _weak_unconfigured_subdomain_reason(
 
 def _infer_intent(query: str) -> str:
     lowered = query.lower()
+    if re.search(r"\b(compare|comparison|versus|vs\.?|better between)\b", lowered):
+        return "comparison_lookup"
+    if re.search(r"\b(gre|gmat|standardi[sz]ed test|testas|aptitude test)\b", lowered):
+        return "standardized_test_lookup"
+    if re.search(
+        r"\b(does .{0,80} offer|is there (?:a|an)|available at|program exist|programme exist)\b",
+        lowered,
+    ):
+        return "program_existence_lookup"
     if re.search(r"\b(suggest|recommend|find|shortlist|which)\b", lowered) and re.search(
         r"\b(programs?|masters?|master's|msc)\b", lowered
     ):
-        return "multi_program_discovery"
+        return "discovery_lookup"
     if re.search(r"\b(can i apply|eligible|eligibility|am i eligible|profile|gpa)\b", lowered):
         return "eligibility_check"
     if re.search(r"\b(deadline|application period|intake|bewerbungsfrist)\b", lowered):
@@ -1220,15 +1350,20 @@ def _infer_intent(query: str) -> str:
     ):
         return "language_requirement_lookup"
     if re.search(r"\b(admission requirements?|requirements?|zulassungsvoraussetzungen)\b", lowered):
-        return "admission_requirement_lookup"
+        return "eligibility_check"
     if re.search(r"\b(duration|overview|how long|semesters?)\b", lowered):
-        return "program_overview_lookup"
-    return "general_university_question"
+        return "general_program_overview"
+    return "general_program_overview"
+
+
+def _canonical_intent(intent: str) -> str:
+    cleaned = _compact(intent).lower()
+    return INTENT_ALIASES.get(cleaned, cleaned)
 
 
 def _intent_profile(query: str) -> dict[str, Any]:
-    intent = _infer_intent(query)
-    profile = INTENT_PROFILES.get(intent, INTENT_PROFILES["general_university_question"])
+    intent = _canonical_intent(_infer_intent(query))
+    profile = INTENT_PROFILES.get(intent, INTENT_PROFILES["general_program_overview"])
     required = list(profile["required"])
     optional = list(profile["optional"])
     lowered = query.lower()
@@ -1306,6 +1441,27 @@ def _build_search_queries(plan: QueryPlan, query: str) -> list[dict[str, Any]]:
         field.replace("_", " ")
         for field in (plan.required_fields or plan.required_info or ["admission requirements"])[:3]
     )
+    if plan.intent == "comparison_lookup":
+        comparison_queries: list[dict[str, Any]] = []
+        entities = plan.user_profile_details.get("comparison_entities", [])
+        if not isinstance(entities, list) or not entities:
+            entities = _comparison_entities_from_query(query) or [target]
+        for entity in [_compact(item) for item in entities if _compact(item)][:4]:
+            comparison_queries.extend(
+                [
+                    {
+                        "query": f"{entity} {field_phrase} official program admission",
+                        "type": "comparison_lookup",
+                        "priority": 1.0,
+                    },
+                    {
+                        "query": f"{entity} {field_phrase} official university filetype:pdf",
+                        "type": "pdf",
+                        "priority": 0.86,
+                    },
+                ]
+            )
+        return comparison_queries[: _mode_limit(plan, "max_queries", MAX_QUERIES)]
     queries = [
         {
             "query": f"{target} {field_phrase} official",
@@ -1329,7 +1485,7 @@ def _build_search_queries(plan: QueryPlan, query: str) -> list[dict[str, Any]]:
         {"query": f"{target} {field_phrase} filetype:pdf", "type": "pdf", "priority": 0.82},
         {"query": f"{target} {field_phrase} DAAD", "type": "daad", "priority": 0.7},
     ]
-    if plan.intent == "multi_program_discovery":
+    if plan.intent == "discovery_lookup":
         queries = [
             {
                 "query": f"Germany AI master's IELTS 6.5 English language requirements official university",
@@ -1370,6 +1526,8 @@ def _field_query_keywords(plan: QueryPlan) -> list[str]:
         terms.extend(["tuition fees", "non-EU", "semester fee", "Semesterbeitrag"])
     elif plan.intent == "application_portal_lookup":
         terms.extend(["application portal", "apply online", "uni-assist", "VPD"])
+    elif plan.intent == "standardized_test_lookup":
+        terms.extend(["GRE", "GMAT", "standardized test", "TestAS"])
     for field_name in fields[:3]:
         field_terms = FIELD_KEYWORDS.get(field_name, [field_name.replace("_", " ")])
         terms.extend(field_terms[:3])
@@ -1400,6 +1558,8 @@ def _broadened_field_keywords(plan: QueryPlan, *, pdf: bool = False) -> list[str
         ]
     elif plan.intent == "tuition_fee_lookup":
         terms = ["tuition fee", "semester contribution", "Studiengebühren", "Semesterbeitrag"]
+    elif plan.intent == "standardized_test_lookup":
+        terms = ["GRE", "GMAT", "standardized test", "aptitude test", "TestAS"]
     else:
         terms = [*_field_query_keywords(plan), "FAQ", "admission", "application"]
     if pdf:
@@ -1638,6 +1798,9 @@ def _fallback_plan(query: str) -> QueryPlan:
         planner_type="heuristic",
         answer_shape=_normalize_answer_shape("", profile["intent"]),
     )
+    comparison_entities = _comparison_entities_from_query(query)
+    if comparison_entities:
+        plan.user_profile_details["comparison_entities"] = comparison_entities
     _apply_current_question_context(plan, query)
     return _with_german_fau_focus(plan, query)
 
@@ -1690,11 +1853,8 @@ def _normalize_plan(payload: dict[str, Any], query: str) -> QueryPlan:
     llm_intent = _compact(
         payload.get("detected_intent") or payload.get("intent") or payload.get("user_intent")
     ).lower()
-    intent = (
-        deterministic_intent
-        if deterministic_intent != "general_university_question"
-        else llm_intent
-    )
+    llm_intent = _canonical_intent(llm_intent)
+    intent = deterministic_intent if deterministic_intent != "general_program_overview" else llm_intent
     if intent not in INTENT_PROFILES:
         intent = deterministic_intent
 
@@ -1733,6 +1893,14 @@ def _normalize_plan(payload: dict[str, Any], query: str) -> QueryPlan:
         planner_type="llm",
         answer_shape=_normalize_answer_shape(payload.get("answer_shape"), intent),
     )
+    comparison_entities = payload.get("comparison_entities")
+    if not isinstance(comparison_entities, list):
+        comparison_entities = _comparison_entities_from_query(query)
+    comparison_entities = [
+        _compact(item) for item in comparison_entities if _compact(item)
+    ][:4]
+    if plan.intent == "comparison_lookup" and comparison_entities:
+        plan.user_profile_details["comparison_entities"] = comparison_entities
     _apply_current_question_context(plan, query)
     if _is_germany_plan(plan):
         plan.german_keywords = list(dict.fromkeys([*plan.german_keywords, *GERMAN_SEARCH_TERMS]))[
@@ -1762,11 +1930,11 @@ You may also include university_short, country, user_intent, intent,
 user_profile_details, keywords, german_keywords, search_queries, and
 priority_sources for retrieval.
 
-Classify intent as one of: language_requirement_lookup, deadline_lookup,
-eligibility_check, document_requirement_lookup, tuition_fee_lookup,
-admission_requirement_lookup, program_overview_lookup, curriculum_lookup,
-application_process_lookup, application_portal_lookup, multi_program_discovery,
-general_university_question. Put the same value in detected_intent and intent.
+Classify intent as one of: deadline_lookup, language_requirement_lookup,
+tuition_fee_lookup, document_requirement_lookup, eligibility_check,
+application_portal_lookup, program_existence_lookup, standardized_test_lookup,
+curriculum_lookup, comparison_lookup, discovery_lookup, general_program_overview.
+Put the same value in detected_intent and intent.
 
 Required fields are facts that must be answered. Optional fields are useful only
 when directly relevant. Excluded fields must not appear in the final answer.
@@ -2320,6 +2488,58 @@ PAGE_TYPES_BY_INTENT: dict[str, set[str]] = {
         "exact_daad_listing",
     },
     "curriculum_lookup": {"program_page", "curriculum_page", "module_handbook"},
+    "standardized_test_lookup": {
+        "program_page",
+        "admissions_page",
+        "application_page",
+        "program_application_page",
+        "program_faq_page",
+        "official_policy_pdf",
+        "document_checklist_pdf",
+        "exact_daad_listing",
+    },
+    "eligibility_check": {
+        "program_page",
+        "admissions_page",
+        "application_page",
+        "program_application_page",
+        "program_faq_page",
+        "document_checklist_pdf",
+        "official_policy_pdf",
+        "exact_daad_listing",
+    },
+    "program_existence_lookup": {
+        "program_page",
+        "admissions_page",
+        "program_faq_page",
+        "exact_daad_listing",
+    },
+    "comparison_lookup": {
+        "program_page",
+        "admissions_page",
+        "application_page",
+        "program_application_page",
+        "program_faq_page",
+        "dates_deadlines_page",
+        "fee_page",
+        "language_requirement_page",
+        "exact_daad_listing",
+    },
+    "discovery_lookup": {
+        "program_page",
+        "admissions_page",
+        "application_page",
+        "program_faq_page",
+        "exact_daad_listing",
+    },
+    "general_program_overview": {
+        "program_page",
+        "admissions_page",
+        "application_page",
+        "program_faq_page",
+        "curriculum_page",
+        "exact_daad_listing",
+    },
 }
 
 HARD_REJECT_PAGE_TYPES = {
@@ -2513,7 +2733,7 @@ def _page_type_rejection_reason(page_type: str, plan: QueryPlan) -> str:
         return "module_handbook_not_requested"
     if page_type == "curriculum_page" and plan.intent not in {
         "curriculum_lookup",
-        "program_overview_lookup",
+        "general_program_overview",
     }:
         return "curriculum_page_not_requested"
     allowed = PAGE_TYPES_BY_INTENT.get(plan.intent)
@@ -2806,8 +3026,8 @@ def _student_page_rejection_reason(url: str, title: str, snippet: str, plan: Que
         "tuition_fee_lookup",
         "application_portal_lookup",
         "document_requirement_lookup",
-        "admission_requirement_lookup",
         "eligibility_check",
+        "program_existence_lookup",
     }
     if plan.intent in narrow_student_intents:
         if any(
@@ -3124,6 +3344,9 @@ def select_and_deduplicate_urls(
                 "document_requirement_lookup",
                 "application_portal_lookup",
                 "curriculum_lookup",
+                "eligibility_check",
+                "standardized_test_lookup",
+                "program_existence_lookup",
             }:
                 likely_answer_page = (
                     plan.intent == "language_requirement_lookup"
@@ -3479,8 +3702,20 @@ def _extract_pdf_pages(
             if page_text:
                 if plan is not None and index > 2 and not _pdf_page_has_signal(page_text, plan):
                     continue
-                pages.append(ExtractedPage(text=page_text, page_number=index))
-    logger.info("UniGraph PDF read | url=%s | pages=%s", url, len(pages))
+                pages.append(
+                    ExtractedPage(
+                        text=page_text,
+                        page_number=index,
+                        extraction_method="pdfplumber",
+                        table_count=len(tables),
+                    )
+                )
+    logger.info(
+        "UniGraph PDF read | url=%s | pdf_extractor_used=pdfplumber | pages=%s | table_pages=%s",
+        url,
+        len(pages),
+        sum(1 for page in pages if page.table_count),
+    )
     return pages
 
 
@@ -3520,6 +3755,14 @@ async def extract_pdf_content(
             debug_collector.setdefault("rejected_pdfs", []).append(
                 {"url": url, "reason": rejection_reason, "stage": "pre_download"}
             )
+            debug_collector.setdefault("pdf_pipeline", []).append(
+                {
+                    "url": url,
+                    "pdf_extractor_used": "pdfplumber" if pdfplumber is not None else "unavailable",
+                    "status": "rejected_pre_download",
+                    "reason": rejection_reason,
+                }
+            )
         return None
 
     def _read_pdf() -> list[ExtractedPage]:
@@ -3545,7 +3788,32 @@ async def extract_pdf_content(
             debug_collector.setdefault("rejected_pdfs", []).append(
                 {"url": url, "reason": "no_relevant_pdf_pages_extracted", "stage": "post_download"}
             )
+            debug_collector.setdefault("pdf_pipeline", []).append(
+                {
+                    "url": url,
+                    "pdf_extractor_used": "pdfplumber" if pdfplumber is not None else "unavailable",
+                    "status": "rejected_post_download",
+                    "reason": "no_relevant_pdf_pages_extracted",
+                }
+            )
         return None
+    if debug_collector is not None:
+        debug_collector.setdefault("pdf_pipeline", []).append(
+            {
+                "url": url,
+                "pdf_extractor_used": "pdfplumber",
+                "status": "extracted",
+                "pages_extracted": [
+                    {
+                        "page_number": page.page_number,
+                        "table_count": page.table_count,
+                        "chars": len(page.text),
+                    }
+                    for page in pages
+                ],
+                "full_pdf_sent_to_llm": False,
+            }
+        )
     return ExtractedContent(
         url=url,
         title=str(url_info.get("title", "")),
@@ -4387,28 +4655,62 @@ def fan_in_evidence(grouped: dict[str, list[EvidenceChunk]]) -> list[EvidenceChu
 
 
 SOURCE_SCOPE_PRIORITY = {
-    "program_specific_direct": 7,
-    "program_specific_indirect": 6,
-    "admissions_general": 5,
-    "faculty_general": 4,
-    "university_general": 3,
-    "DAAD_exact_program": 2,
-    "DAAD": 3,
-    "third_party": 1,
+    "program_specific_official": 90,
+    "program_specific_application_or_admission_page": 85,
+    "program_specific_FAQ": 80,
+    "official_policy_or_checklist_PDF": 75,
+    "faculty_or_department_general_page": 60,
+    "university_general_page": 50,
+    "DAAD_exact_program_page": 40,
+    "uni_assist_if_relevant": 30,
+    "third_party_only_if_no_official_source": 10,
+    # Backward-compatible keys from older debug payloads/tests.
+    "program_specific_direct": 90,
+    "program_specific_indirect": 85,
+    "admissions_general": 55,
+    "faculty_general": 60,
+    "university_general": 50,
+    "DAAD_exact_program": 40,
+    "DAAD": 35,
+    "third_party": 10,
     "unrelated": 0,
 }
 
 
 def _source_scope_key(chunk: EvidenceChunk) -> str:
-    if chunk.evidence_scope == "program_specific":
-        return (
-            "program_specific_direct"
-            if chunk.support_level == "direct"
-            else "program_specific_indirect"
-        )
-    if chunk.evidence_scope == "DAAD":
-        return "DAAD_exact_program" if _target_program_tokens_from_text(chunk.text) else "DAAD"
     lowered = f"{chunk.url} {chunk.title} {chunk.text}".lower()
+    page_type = classify_page_type(chunk.url, chunk.title, chunk.text[:600])
+    if chunk.evidence_scope == "program_specific":
+        if page_type in {"program_application_page", "admissions_page", "application_page"}:
+            return "program_specific_application_or_admission_page"
+        if page_type in {"program_faq_page", "faq_page"}:
+            return "program_specific_FAQ"
+        return "program_specific_official"
+    if chunk.document_type == "pdf" and chunk.source_type == "official_university_pdf":
+        if page_type in {"document_checklist_pdf", "official_policy_pdf"} or any(
+            term in lowered
+            for term in (
+                "required documents",
+                "application documents",
+                "bewerbungsunterlagen",
+                "beizufügende unterlagen",
+                "selection regulations",
+                "admission regulations",
+            )
+        ):
+            return "official_policy_or_checklist_PDF"
+    if chunk.evidence_scope == "DAAD":
+        return "DAAD_exact_program_page" if _target_program_tokens_from_text(chunk.text) else "DAAD"
+    if chunk.source_type == "uni_assist":
+        return "uni_assist_if_relevant"
+    if chunk.evidence_scope == "third_party" or chunk.source_type not in {
+        "official_university_page",
+        "official_university_pdf",
+        "daad",
+        "uni_assist",
+        "government_or_eu",
+    }:
+        return "third_party_only_if_no_official_source"
     if chunk.evidence_scope in {"faculty_general", "university_general"} and any(
         term in lowered
         for term in (
@@ -4422,7 +4724,15 @@ def _source_scope_key(chunk: EvidenceChunk) -> str:
             "deadline",
         )
     ):
-        return "admissions_general"
+        return (
+            "faculty_or_department_general_page"
+            if chunk.evidence_scope == "faculty_general"
+            else "university_general_page"
+        )
+    if chunk.evidence_scope == "faculty_general":
+        return "faculty_or_department_general_page"
+    if chunk.evidence_scope == "university_general":
+        return "university_general_page"
     return chunk.evidence_scope or "unrelated"
 
 
@@ -4438,6 +4748,19 @@ def _field_priority_chunk(rows: list[EvidenceChunk]) -> EvidenceChunk | None:
     usable = [row for row in rows if row.support_level in {"direct", "indirect"}]
     if not usable:
         return None
+    official_university_rows = [
+        row
+        for row in usable
+        if row.source_type in {"official_university_page", "official_university_pdf"}
+    ]
+    if official_university_rows:
+        usable = official_university_rows
+    elif any(row.source_type in {"daad", "uni_assist", "government_or_eu"} for row in usable):
+        usable = [
+            row
+            for row in usable
+            if row.source_type in {"daad", "uni_assist", "government_or_eu"}
+        ]
     usable.sort(
         key=lambda row: (
             SOURCE_SCOPE_PRIORITY.get(_source_scope_key(row), 0),
@@ -4532,14 +4855,34 @@ def _extract_document_items(text: str) -> list[str]:
     candidates = [
         "online application",
         "STiNE",
+        "application form",
+        "signed application",
         "transcript",
+        "transcript of records",
+        "academic transcript",
         "degree certificate",
+        "diploma",
+        "graduation certificate",
         "CV",
+        "curriculum vitae",
         "motivation letter",
+        "letter of motivation",
+        "statement of purpose",
+        "recommendation letter",
+        "letter of recommendation",
         "language certificate",
         "language proof",
+        "proof of language proficiency",
+        "passport",
+        "identity card",
+        "ID card",
+        "portfolio",
+        "essay",
         "APS",
         "VPD",
+        "uni-assist",
+        "proof of payment",
+        "application fee",
     ]
     items: list[str] = []
     for item in candidates:
@@ -4764,6 +5107,9 @@ def build_evidence_packet(
         "answered_fields": answered_fields,
         "deduplicated_fields": deduplicated_fields,
         "missing_fields": missing_fields,
+        "missing_requested_fields": {
+            field: reason for field, reason in missing_fields.items() if field in required_fields
+        },
         "excluded_fields": excluded_fields,
         "conflicting_fields": conflicting_fields,
         "field_completeness_status": (
@@ -4778,6 +5124,26 @@ def build_evidence_packet(
             else "missing"
         ),
         "source_set_selected": source_set,
+        "source_priority_used": [
+            {
+                "scope": source.get("scope", ""),
+                "priority": SOURCE_SCOPE_PRIORITY.get(str(source.get("scope", "")), 0),
+                "url": source.get("url", ""),
+                "source_type": source.get("source_type", ""),
+                "fields_supported": source.get("fields_supported", []),
+            }
+            for source in source_set
+        ],
+        "selected_source_scope": list(
+            dict.fromkeys(str(source.get("scope", "")) for source in source_set if source.get("scope"))
+        ),
+        "selected_source_type": list(
+            dict.fromkeys(
+                str(source.get("source_type", ""))
+                for source in source_set
+                if source.get("source_type")
+            )
+        ),
     }
     packet["normalized_evidence_packet"] = {
         "answered_fields": answered_fields,
@@ -4786,10 +5152,64 @@ def build_evidence_packet(
             for field, reason in missing_fields.items()
             if field in required_fields
         },
+        "missing_requested_fields": {
+            field: reason
+            for field, reason in missing_fields.items()
+            if field in required_fields
+        },
         "deduplicated_fields": deduplicated_fields,
         "excluded_fields": excluded_fields,
     }
     return packet, selected_chunks[:MAX_EVIDENCE_CHUNKS]
+
+
+def _source_usage_decisions(
+    grouped: dict[str, list[EvidenceChunk]], selected: list[EvidenceChunk]
+) -> dict[str, Any]:
+    all_rows = [row for rows in grouped.values() for row in rows]
+    selected_urls = {row.url for row in selected}
+    official_selected = any(
+        row.source_type in {"official_university_page", "official_university_pdf"}
+        for row in selected
+    )
+    program_specific_available = any(
+        row.evidence_scope == "program_specific"
+        and row.source_type in {"official_university_page", "official_university_pdf"}
+        for row in all_rows
+    )
+    daad_rows = [row for row in all_rows if row.source_type == "daad" or row.evidence_scope == "DAAD"]
+    generic_rows = [
+        row
+        for row in all_rows
+        if row.evidence_scope in {"faculty_general", "university_general", "admissions_general"}
+        and row.source_type in {"official_university_page", "official_university_pdf"}
+    ]
+    daad_used = any(row.url in selected_urls for row in daad_rows)
+    generic_used = any(row.url in selected_urls for row in generic_rows)
+    if not daad_rows:
+        daad_decision = "not_available"
+    elif daad_used:
+        daad_decision = (
+            "used_because_no_official_university_answered_requested_field"
+            if not official_selected
+            else "used_as_complementary_evidence"
+        )
+    else:
+        daad_decision = "skipped_because_official_university_evidence_available"
+    if not generic_rows:
+        generic_decision = "not_available"
+    elif generic_used:
+        generic_decision = (
+            "used_because_program_specific_evidence_not_available"
+            if not program_specific_available
+            else "used_as_complementary_evidence"
+        )
+    else:
+        generic_decision = "skipped_because_program_specific_evidence_available"
+    return {
+        "daad_decision": daad_decision,
+        "generic_page_decision": generic_decision,
+    }
 
 
 def _evidence_context(chunks: list[EvidenceChunk]) -> str:
@@ -5088,6 +5508,8 @@ def _natural_missing_answer(field_name: str) -> str:
         )
     if field_name in {"tuition_fee", "semester_contribution", "tuition_or_semester_fee"}:
         return "The retrieved official evidence does not state the fee amount."
+    if field_name == "gre_gmat_requirement":
+        return "The retrieved official evidence does not state a specific GRE or GMAT requirement."
     return "The retrieved official evidence does not state this requested detail."
 
 
@@ -5288,6 +5710,7 @@ Intent formatting:
 - language_requirement_lookup: one short paragraph with only language/IELTS/TOEFL/CEFR info.
 - tuition_fee_lookup: one short paragraph with only tuition/semester fee.
 - document_requirement_lookup: checklist.
+- standardized_test_lookup: one short paragraph with only GRE/GMAT/standardized-test requirements.
 - comparison_lookup: table.
 
 Example:
@@ -5431,6 +5854,12 @@ def _answer_shape(plan: QueryPlan) -> dict[str, Any]:
             "include_only": ["tuition fee", "semester contribution", "fee category", "exemptions"],
             "avoid_sections": True,
         }
+    if plan.intent == "standardized_test_lookup":
+        return {
+            "style": "brief_standardized_test_answer",
+            "include_only": ["GRE", "GMAT", "standardized-test requirement"],
+            "avoid_sections": True,
+        }
     if plan.intent == "application_portal_lookup":
         return {
             "style": "brief_application_method_answer",
@@ -5464,11 +5893,23 @@ def _answer_shape(plan: QueryPlan) -> dict[str, Any]:
             ],
             "avoid_guaranteeing_admission": True,
         }
-    if plan.intent == "multi_program_discovery":
+    if plan.intent == "discovery_lookup":
         return {
             "style": "shortlist",
             "include_phrase": "based on the programs verified in this search",
             "max_programs": 5,
+        }
+    if plan.intent == "comparison_lookup":
+        return {
+            "style": "concise_table",
+            "include_only": plan.required_fields or plan.required_info,
+            "avoid_unrequested_fields": True,
+        }
+    if plan.intent == "program_existence_lookup":
+        return {
+            "style": "brief_existence_answer",
+            "include_only": ["whether the requested program exists", "program-specific source"],
+            "avoid_sections": True,
         }
     return {"style": "adaptive", "include_only": plan.required_fields or plan.required_info}
 
@@ -5620,6 +6061,7 @@ async def research_university_question(query: str) -> ResearchResult:
     retrieval_duration = time.perf_counter() - retrieval_started
     grouped = group_and_rank_evidence(extracted, plan, debug_collector=debug_collector)
     evidence_packet, evidence = build_evidence_packet(grouped, plan)
+    source_decisions = _source_usage_decisions(grouped, evidence)
     field_completeness = evidence_packet.get("field_completeness_status", "missing")
     packet_required = evidence_packet.get("required_fields", {})
     packet_required = packet_required if isinstance(packet_required, dict) else {}
@@ -5663,6 +6105,31 @@ async def research_university_question(query: str) -> ResearchResult:
         "UniGraph normalized evidence packet | normalized_evidence_packet=%s | deduplicated_fields=%s",
         evidence_packet.get("normalized_evidence_packet", {}),
         evidence_packet.get("deduplicated_fields", {}),
+    )
+    logger.info(
+        "UniGraph intent/source summary | detected_intent=%s | required_fields=%s | optional_fields=%s | excluded_fields=%s | source_priority_used=%s | selected_source_type=%s | selected_source_scope=%s | daad_decision=%s | generic_page_decision=%s | pdf_extractor_used=%s | selected_pdf_chunks=%s | fields_answered=%s | missing_requested_fields=%s | final_answer_shape=%s",
+        plan.intent,
+        plan.required_fields or plan.required_info,
+        plan.optional_fields,
+        plan.excluded_fields,
+        evidence_packet.get("source_priority_used", []),
+        evidence_packet.get("selected_source_type", []),
+        evidence_packet.get("selected_source_scope", []),
+        source_decisions.get("daad_decision", ""),
+        source_decisions.get("generic_page_decision", ""),
+        "pdfplumber" if pdfplumber is not None else "unavailable",
+        [
+            {
+                "url": chunk.url,
+                "page_number": chunk.page_number,
+                "field": chunk.field or chunk.section,
+            }
+            for chunk in evidence
+            if chunk.document_type == "pdf"
+        ],
+        fields_answered + fields_partially_answered,
+        evidence_packet.get("missing_requested_fields", {}),
+        _answer_shape(plan),
     )
     confidence = _confidence(evidence, fields_not_verified)
     field_confidence = _field_level_confidence(query, plan, grouped)
@@ -5792,6 +6259,21 @@ async def research_university_question(query: str) -> ResearchResult:
             len(chunk_text(page.text)) for item in extracted for page in item.pages
         ),
         "chunks_created_detail": chunks_created_detail,
+        "pdf_extractor_used": "pdfplumber" if pdfplumber is not None else "unavailable",
+        "pdf_pipeline": debug_collector.get("pdf_pipeline", []),
+        "selected_pdf_chunks": [
+            {
+                "url": chunk.url,
+                "title": chunk.title,
+                "page_number": chunk.page_number,
+                "field": chunk.field or chunk.section,
+                "scope": _source_scope_key(chunk),
+                "row_or_section": chunk.row_or_section,
+                "text": chunk.text[:700],
+            }
+            for chunk in evidence
+            if chunk.document_type == "pdf"
+        ],
         "grouped_evidence_by_requested_section": {
             section: {
                 "chunk_count": len(rows),
@@ -5806,9 +6288,15 @@ async def research_university_question(query: str) -> ResearchResult:
         "selected_chunks": [_chunk_debug_payload(chunk) for chunk in evidence],
         "evidence_selected_count": len(evidence),
         "source_set_selected": evidence_packet.get("source_set_selected", []),
+        "source_priority_used": evidence_packet.get("source_priority_used", []),
+        "selected_source_type": evidence_packet.get("selected_source_type", []),
+        "selected_source_scope": evidence_packet.get("selected_source_scope", []),
+        "daad_decision": source_decisions.get("daad_decision", ""),
+        "generic_page_decision": source_decisions.get("generic_page_decision", ""),
         "field_completeness_status": field_completeness,
         "answered_fields": evidence_packet.get("answered_fields", {}),
         "missing_fields": evidence_packet.get("missing_fields", {}),
+        "missing_requested_fields": evidence_packet.get("missing_requested_fields", {}),
         "normalized_evidence_packet": evidence_packet.get("normalized_evidence_packet", {}),
         "deduplicated_fields": evidence_packet.get("deduplicated_fields", {}),
         "conflicting_fields": evidence_packet.get("conflicting_fields", {}),
@@ -5866,6 +6354,7 @@ async def research_university_question(query: str) -> ResearchResult:
             for chunk in evidence
         ],
         "final_answer_shape": _answer_shape(plan),
+        "comparison_entities": plan.user_profile_details.get("comparison_entities", []),
         "answer_formatter_used": answer_formatter_used,
         "final_answer_source": answer_metadata.get("final_answer_source", ""),
         "final_prompt_used": bool(answer_metadata.get("final_prompt_used", False)),
